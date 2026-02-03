@@ -1,11 +1,28 @@
 """Configuration management for Dharvis."""
 
+import base64
 import os
 from pathlib import Path
 from dotenv import load_dotenv
 
 # Load environment variables from .env file
 load_dotenv()
+
+
+def _setup_google_token():
+    """Decode base64 Google Calendar token from env var if present."""
+    token_base64 = os.getenv("GOOGLE_CALENDAR_TOKEN_BASE64")
+    if token_base64:
+        token_path = Path(os.getenv("GOOGLE_CALENDAR_TOKEN_PATH", "./token.json"))
+        try:
+            token_data = base64.b64decode(token_base64)
+            token_path.write_bytes(token_data)
+        except Exception as e:
+            print(f"Warning: Failed to decode GOOGLE_CALENDAR_TOKEN_BASE64: {e}")
+
+
+# Setup Google token from base64 env var if present
+_setup_google_token()
 
 
 class Config:
