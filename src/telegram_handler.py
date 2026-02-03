@@ -12,11 +12,11 @@ from telegram.ext import (
     filters,
 )
 
-from src.claude_agent import ActionType, AgentResponse, ClaudeAgent
-from src.config import config
-from src.database import Database
-from src.calendar_service import CalendarService
-from src.utils import (
+from claude_agent import ActionType, AgentResponse, ClaudeAgent
+from config import config
+from database import Database
+from calendar_service import CalendarService
+from utils import (
     format_datetime_for_display,
     format_events_list,
     format_tasks_list,

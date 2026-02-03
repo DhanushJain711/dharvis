@@ -5,8 +5,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from src.config import config
-from src.utils import format_datetime_iso, get_current_time
+from config import config
+from utils import format_datetime_iso, get_current_time
 
 
 class Database:

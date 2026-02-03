@@ -5,11 +5,11 @@ import logging
 import signal
 import sys
 
-from src.config import config
-from src.database import Database
-from src.claude_agent import ClaudeAgent
-from src.calendar_service import CalendarService
-from src.telegram_handler import TelegramHandler
+from config import config
+from database import Database
+from claude_agent import ClaudeAgent
+from calendar_service import CalendarService
+from telegram_handler import TelegramHandler
 
 # Configure logging
 logging.basicConfig(

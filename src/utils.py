@@ -4,7 +4,7 @@ from datetime import datetime, timedelta
 from typing import Any
 import pytz
 
-from src.config import config
+from config import config
 
 
 def get_current_time(timezone: str | None = None) -> datetime:

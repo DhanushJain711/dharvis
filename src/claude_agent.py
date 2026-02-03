@@ -8,8 +8,8 @@ from typing import Any
 
 from anthropic import Anthropic
 
-from src.config import config
-from src.utils import (
+from config import config
+from utils import (
     format_datetime_for_display,
     format_events_list,
     format_tasks_list,

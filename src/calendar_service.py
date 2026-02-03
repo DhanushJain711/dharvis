@@ -11,8 +11,8 @@ from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 
-from src.config import config
-from src.utils import format_datetime_iso, get_current_time, get_day_range
+from config import config
+from utils import format_datetime_iso, get_current_time, get_day_range
 
 logger = logging.getLogger(__name__)
 
