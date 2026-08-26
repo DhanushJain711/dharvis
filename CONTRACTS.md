@@ -135,6 +135,9 @@ Every Store connection enables `PRAGMA foreign_keys = ON`. `apply_schedule_decis
 ## Calendar (`src.calendar_service`)
 
 ```python
+CalendarError(RuntimeError)
+CalendarReconnectRequiredError(CalendarError)
+CalendarReconnectRequired = CalendarReconnectRequiredError
 CalendarService(credentials_path: Path | None = None, token_path: Path | None = None, calendar_id: str | None = None)
 CalendarService.is_available() -> bool
 CalendarService.list_events(start: datetime, end: datetime) -> list[CalendarRecord]  # async
@@ -142,15 +145,18 @@ CalendarService.get_events_between(start: datetime, end: datetime) -> list[Calen
 CalendarService.get_today_events() -> list[CalendarRecord]  # async
 CalendarService.get_upcoming_events(days: int = 7) -> list[CalendarRecord]  # async
 CalendarService.check_availability(start: datetime, end: datetime) -> bool  # async
-CalendarService.create_event(event: CalendarRecord) -> CalendarRecord  # async
+CalendarService.create_event(event: CalendarRecord, reasoning: str | None = None) -> CalendarRecord  # async
 CalendarService.update_event(gcal_event_id: str, changes: CalendarRecord) -> CalendarRecord  # async
 CalendarService.delete_event(gcal_event_id: str) -> None  # async
-CalendarService.create_work_block(task_id: int, title: str, start: datetime, end: datetime) -> str  # async
-CalendarService.update_work_block(gcal_event_id: str, title: str, start: datetime, end: datetime) -> None  # async
+CalendarService.clear_kalendra_range(start: datetime, end: datetime) -> None  # async
+CalendarService.create_work_block(task_id: int, title: str, start: datetime, end: datetime, reasoning: str | None = None) -> str  # async
+CalendarService.update_work_block(gcal_event_id: str, title: str, start: datetime, end: datetime, reasoning: str | None = None) -> None  # async
 CalendarService.delete_work_block(gcal_event_id: str) -> None  # async
 run_oauth_flow(credentials_path: Path | None = None, token_path: Path | None = None) -> bool
 create_calendar_service() -> CalendarService  # async
 ```
+
+OAuth uses the read/write Calendar scope. Reads cover every visible calendar and cache complete results in memory for 60 seconds. Writes are restricted to marked, application-owned events on a dedicated secondary calendar named `Kalendra`; its ID is persisted beside the OAuth token, and primary-calendar events are never mutated. Creating a block requires a nonblank rationale, supplied as `reasoning` or `event["reasoning"]`, which is rendered in the Google event description. `clear_kalendra_range` deletes only marked Kalendra blocks. Credential refresh is transparent; absent, invalid, rejected, or unrefreshable credentials raise `CalendarReconnectRequiredError` so callers can request reconnection.
 
 Every returned `start_time` and `end_time` is UTC-aware ISO-8601 text. Google `dateTime` offsets are converted to UTC; all-day `date` values become the UTC instants for local midnight boundaries. Event end times are required and later than starts.
 
@@ -158,12 +164,20 @@ Every returned `start_time` and `end_time` is UTC-aware ISO-8601 text. Google `d
 
 ```python
 ScheduleBlock(start: datetime, end: datetime, title: str, source: ScheduleSource, source_id: str, metadata: dict[str, Any])
-FreeBlock(start: datetime, end: datetime)
+FreeBlock(start: datetime, end: datetime, after: str | None = None, before: str | None = None)
+FreeBlock.after_title: str | None
+FreeBlock.before_title: str | None
+CalendarQueryIncompleteError(CalendarError)
+compute_free_blocks(start: datetime, end: datetime, min_minutes: int, constraints: Any) -> list[FreeBlock]
+is_free(start: datetime, end: datetime, constraints: Any) -> bool
+next_free_block(after: datetime, min_minutes: int, constraints: Any, *, search_end: datetime) -> FreeBlock | None
 query_schedule(store: Store, calendar: CalendarService, start: datetime, end: datetime) -> list[ScheduleBlock]  # async
 merge_blocks(blocks: list[ScheduleBlock]) -> list[ScheduleBlock]
 find_free_blocks(store: Store, calendar: CalendarService, start: datetime, end: datetime, min_minutes: int) -> list[FreeBlock]  # async
 has_conflict(blocks: list[ScheduleBlock], start: datetime, end: datetime) -> bool
 ```
+
+`compute_free_blocks` is deterministic and accepts mapping- or object-style constraints. Busy values may be supplied as `busy_intervals`, `busy_blocks`, or `busy`; waking and quiet hours accept clock pairs or `{start, end}` mappings; `timezone` selects the IANA zone; and `buffer_minutes` defaults to 15. It merges overlapping buffered busy intervals, respects cross-midnight waking and quiet hours, interprets all-day boundaries at local midnight, and constructs each local day independently so DST transitions retain their real elapsed length. Free blocks identify their adjacent blockers through `after` and `before` (also exposed by the compatibility properties `after_title` and `before_title`).
 
 ## Agent and history (`src.agent`, `src.history`)
 

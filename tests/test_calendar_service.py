@@ -1,387 +1,487 @@
-"""Tests for the calendar service module."""
+"""Behavioral tests for the read/write Google Calendar boundary."""
 
-import json
-from datetime import datetime, timedelta
+from __future__ import annotations
+
+from datetime import UTC, datetime
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
-import pytz
+from google.auth.exceptions import RefreshError
+from googleapiclient.errors import HttpError
 
-from src.calendar_service import CalendarService
+from src.calendar_service import (
+    CALENDAR_OWNERSHIP_MARKER,
+    CACHE_TTL_SECONDS,
+    CalendarError,
+    CalendarReconnectRequiredError,
+    CalendarService,
+    SCOPES,
+    WORK_BLOCK_MARKER_KEY,
+    WORK_BLOCK_MARKER_VALUE,
+)
 
 
-class TestCalendarService:
-    """Tests for the CalendarService class."""
+class Request:
+    """Small executable request used by the fake Google resources."""
 
-    def test_init(self):
-        """Test service initialization."""
-        service = CalendarService(
-            credentials_path=Path("/fake/credentials.json"),
-            token_path=Path("/fake/token.json"),
+    def __init__(self, value=None, error: Exception | None = None):
+        self.value = value
+        self.error = error
+
+    def execute(self):
+        if self.error is not None:
+            raise self.error
+        return self.value
+
+
+def google_event(
+    event_id: str,
+    title: str,
+    start: str = "2026-08-26T15:00:00+00:00",
+    end: str = "2026-08-26T16:00:00+00:00",
+    *,
+    marked: bool = False,
+    description: str | None = None,
+) -> dict:
+    event = {
+        "id": event_id,
+        "summary": title,
+        "start": {"dateTime": start},
+        "end": {"dateTime": end},
+    }
+    if description is not None:
+        event["description"] = description
+    if marked:
+        event["extendedProperties"] = {
+            "private": {WORK_BLOCK_MARKER_KEY: WORK_BLOCK_MARKER_VALUE}
+        }
+    return event
+
+
+def connected_service(tmp_path: Path, google: MagicMock) -> CalendarService:
+    service = CalendarService(token_path=tmp_path / "token.json")
+    credentials = MagicMock()
+    credentials.expired = False
+    credentials.valid = True
+    service._credentials = credentials
+    service._service = google
+    service._kalendra_calendar_id = None
+    return service
+
+
+def calendar_list(google: MagicMock, pages: dict[str | None, dict]) -> MagicMock:
+    resource = MagicMock()
+    resource.list.side_effect = lambda pageToken=None: Request(pages[pageToken])
+    google.calendarList.return_value = resource
+    return resource
+
+
+def event_resource(google: MagicMock) -> MagicMock:
+    resource = MagicMock()
+    google.events.return_value = resource
+    return resource
+
+
+def owned_calendar(calendar_id: str = "kalendra-id") -> dict:
+    return {
+        "id": calendar_id,
+        "summary": "Kalendra",
+        "description": f"Bot work blocks\n{CALENDAR_OWNERSHIP_MARKER}",
+        "primary": False,
+    }
+
+
+RANGE_START = datetime(2026, 8, 26, tzinfo=UTC)
+RANGE_END = datetime(2026, 8, 27, tzinfo=UTC)
+
+
+def test_calendar_uses_read_write_scope():
+    assert SCOPES == ["https://www.googleapis.com/auth/calendar"]
+
+
+def test_is_available_without_token(tmp_path: Path):
+    service = CalendarService(token_path=tmp_path / "missing.json")
+
+    assert service.is_available() is False
+
+
+@patch("src.calendar_service.build")
+@patch("src.calendar_service.Credentials")
+def test_is_available_builds_with_valid_credentials(
+    credentials_class: MagicMock, build: MagicMock, tmp_path: Path
+):
+    token = tmp_path / "token.json"
+    token.write_text("{}", encoding="utf-8")
+    credentials = MagicMock(expired=False, valid=True)
+    credentials_class.from_authorized_user_file.return_value = credentials
+
+    assert CalendarService(token_path=token).is_available() is True
+    credentials_class.from_authorized_user_file.assert_called_once_with(str(token), SCOPES)
+    build.assert_called_once_with(
+        "calendar", "v3", credentials=credentials, cache_discovery=False
+    )
+
+
+def test_format_event_normalizes_offsets_and_all_day_dst_boundaries():
+    service = CalendarService()
+
+    timed = service._format_event(
+        google_event(
+            "meeting",
+            "Meeting",
+            "2026-08-26T10:00:00-05:00",
+            "2026-08-26T11:00:00-05:00",
         )
-
-        assert service.credentials_path == Path("/fake/credentials.json")
-        assert service.token_path == Path("/fake/token.json")
-
-    def test_is_available_no_credentials(self):
-        """Test availability check with no credentials."""
-        service = CalendarService(
-            credentials_path=Path("/fake/credentials.json"),
-            token_path=Path("/nonexistent/token.json"),
-        )
-
-        # Should return False when token doesn't exist
-        assert not service.is_available()
-
-    @patch("src.calendar_service.Credentials")
-    @patch("src.calendar_service.build")
-    def test_is_available_with_credentials(self, mock_build, mock_creds_class):
-        """Test availability check with valid credentials."""
-        # Set up mock credentials - must set valid=True and expired=False
-        mock_creds = MagicMock()
-        mock_creds.valid = True
-        mock_creds.expired = False
-        mock_creds_class.from_authorized_user_file.return_value = mock_creds
-
-        # Create temp token file
-        import tempfile
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
-            f.write('{"token": "test"}')
-            token_path = Path(f.name)
-
-        try:
-            service = CalendarService(
-                credentials_path=Path("/fake/credentials.json"),
-                token_path=token_path,
-            )
-
-            assert service.is_available()
-        finally:
-            token_path.unlink(missing_ok=True)
-
-
-class TestEventFormatting:
-    """Tests for event formatting."""
-
-    def test_format_event_basic(self):
-        """Test formatting a basic event."""
-        service = CalendarService()
-
-        gcal_event = {
-            "id": "event123",
-            "summary": "Team Meeting",
-            "start": {"dateTime": "2024-01-20T14:00:00-06:00"},
-            "end": {"dateTime": "2024-01-20T15:00:00-06:00"},
+    )
+    spring = service._format_event(
+        {
+            "id": "spring",
+            "summary": "Spring day",
+            "start": {"date": "2026-03-08"},
+            "end": {"date": "2026-03-09"},
         }
-
-        formatted = service._format_event(gcal_event)
-
-        assert formatted["id"] == "event123"
-        assert formatted["title"] == "Team Meeting"
-        assert formatted["start_time"] == "2024-01-20T20:00:00+00:00"
-        assert formatted["end_time"] == "2024-01-20T21:00:00+00:00"
-        assert formatted["source"] == "gcal"
-
-    def test_format_event_with_location(self):
-        """Test formatting an event with location."""
-        service = CalendarService()
-
-        gcal_event = {
-            "id": "event123",
-            "summary": "Coffee Meeting",
-            "start": {"dateTime": "2024-01-20T14:00:00-06:00"},
-            "end": {"dateTime": "2024-01-20T15:00:00-06:00"},
-            "location": "Starbucks",
+    )
+    fall = service._format_event(
+        {
+            "id": "fall",
+            "summary": "Fall day",
+            "start": {"date": "2026-11-01"},
+            "end": {"date": "2026-11-02"},
         }
+    )
 
-        formatted = service._format_event(gcal_event)
-
-        assert formatted["location"] == "Starbucks"
-
-    def test_format_event_with_description(self):
-        """Test formatting an event with description."""
-        service = CalendarService()
-
-        gcal_event = {
-            "id": "event123",
-            "summary": "Planning Meeting",
-            "start": {"dateTime": "2024-01-20T14:00:00-06:00"},
-            "description": "Discuss Q1 goals",
-        }
-
-        formatted = service._format_event(gcal_event)
-
-        assert formatted["description"] == "Discuss Q1 goals"
-
-    def test_format_event_all_day(self):
-        """Test formatting an all-day event."""
-        service = CalendarService()
-
-        gcal_event = {
-            "id": "event123",
-            "summary": "Holiday",
-            "start": {"date": "2024-01-20"},
-            "end": {"date": "2024-01-21"},
-        }
-
-        formatted = service._format_event(gcal_event)
-
-        assert formatted["start_time"] == "2024-01-20T06:00:00+00:00"
-        assert formatted["end_time"] == "2024-01-21T06:00:00+00:00"
-
-    def test_format_event_missing_summary(self):
-        """Test formatting an event with missing summary."""
-        service = CalendarService()
-
-        gcal_event = {
-            "id": "event123",
-            "start": {"dateTime": "2024-01-20T14:00:00-06:00"},
-        }
-
-        formatted = service._format_event(gcal_event)
-
-        assert formatted["title"] == "Untitled Event"
+    assert timed["start_time"] == "2026-08-26T15:00:00+00:00"
+    assert timed["end_time"] == "2026-08-26T16:00:00+00:00"
+    assert spring["start_time"] == "2026-03-08T06:00:00+00:00"
+    assert spring["end_time"] == "2026-03-09T05:00:00+00:00"
+    assert fall["start_time"] == "2026-11-01T05:00:00+00:00"
+    assert fall["end_time"] == "2026-11-02T06:00:00+00:00"
 
 
-class TestEventFetching:
-    """Tests for event fetching with mocked API."""
+@pytest.mark.asyncio
+async def test_list_events_reads_every_calendar_and_paginates_every_resource(
+    tmp_path: Path,
+):
+    google = MagicMock()
+    calendar_api = calendar_list(
+        google,
+        {
+            None: {"items": [{"id": "primary"}], "nextPageToken": "cal-2"},
+            "cal-2": {"items": [{"id": "school"}]},
+        },
+    )
+    events = event_resource(google)
+    pages = {
+        ("primary", None): {
+            "items": [google_event("late", "Late", "2026-08-26T18:00:00Z", "2026-08-26T19:00:00Z")],
+            "nextPageToken": "event-2",
+        },
+        ("primary", "event-2"): {
+            "items": [google_event("early", "Early", "2026-08-26T13:00:00Z", "2026-08-26T14:00:00Z")]
+        },
+        ("school", None): {
+            "items": [google_event("class", "Class", "2026-08-26T15:00:00Z", "2026-08-26T16:00:00Z")]
+        },
+    }
+    events.list.side_effect = lambda **kwargs: Request(
+        pages[(kwargs["calendarId"], kwargs["pageToken"])]
+    )
+    service = connected_service(tmp_path, google)
 
-    @pytest.mark.asyncio
-    async def test_get_today_events_no_service(self):
-        """Test getting today's events when service unavailable."""
-        service = CalendarService(
-            credentials_path=Path("/fake/credentials.json"),
-            token_path=Path("/nonexistent/token.json"),
-        )
+    result = await service.list_events(RANGE_START, RANGE_END)
 
-        events = await service.get_today_events()
+    assert [(item["id"], item["calendar_id"]) for item in result] == [
+        ("early", "primary"),
+        ("class", "school"),
+        ("late", "primary"),
+    ]
+    assert [call.kwargs["pageToken"] for call in calendar_api.list.call_args_list] == [
+        None,
+        "cal-2",
+    ]
+    assert len(events.list.call_args_list) == 3
+    assert all(call.kwargs["singleEvents"] is True for call in events.list.call_args_list)
 
-        assert events == []
 
-    @pytest.mark.asyncio
-    @patch("src.calendar_service.build")
-    @patch("src.calendar_service.Credentials")
-    async def test_get_events_between_success(self, mock_creds_class, mock_build):
-        """Test successful event fetching."""
-        # Set up mock credentials
-        mock_creds = MagicMock()
-        mock_creds.valid = True
-        mock_creds.expired = False
-        mock_creds_class.from_authorized_user_file.return_value = mock_creds
+@pytest.mark.asyncio
+async def test_list_events_cache_is_60_seconds_and_returns_defensive_copies(
+    tmp_path: Path,
+):
+    google = MagicMock()
+    calendar_list(google, {None: {"items": [{"id": "primary"}]}})
+    events = event_resource(google)
+    events.list.return_value = Request({"items": [google_event("one", "Original")]})
+    service = connected_service(tmp_path, google)
 
-        # Set up mock service
-        mock_service = MagicMock()
-        mock_events = MagicMock()
-        mock_list = MagicMock()
-        mock_list.execute.return_value = {
+    with patch(
+        "src.calendar_service.monotonic",
+        side_effect=[100.0, 159.9, 160.1, 160.1],
+    ):
+        first = await service.list_events(RANGE_START, RANGE_END)
+        first[0]["title"] = "mutated by caller"
+        second = await service.list_events(RANGE_START, RANGE_END)
+        third = await service.list_events(RANGE_START, RANGE_END)
+
+    assert second[0]["title"] == "Original"
+    assert third[0]["title"] == "Original"
+    assert events.list.call_count == 2
+    assert CACHE_TTL_SECONDS == 60.0
+
+
+@pytest.mark.asyncio
+async def test_partial_reads_are_not_cached(tmp_path: Path):
+    google = MagicMock()
+    calendar_list(google, {None: {"items": [{"id": "primary"}]}})
+    events = event_resource(google)
+    events.list.side_effect = [
+        Request(
+            {
+                "items": [
+                    google_event("valid", "Valid"),
+                    {"id": "broken", "summary": "Broken", "start": {}},
+                ]
+            }
+        ),
+        Request({"items": []}),
+    ]
+    service = connected_service(tmp_path, google)
+
+    first = await service.list_events(RANGE_START, RANGE_END)
+    second = await service.list_events(RANGE_START, RANGE_END)
+
+    assert [item["id"] for item in first] == ["valid"]
+    assert second == []
+    assert events.list.call_count == 2
+
+
+@pytest.mark.asyncio
+async def test_server_error_marks_read_incomplete_and_availability_false(tmp_path: Path):
+    google = MagicMock()
+    calendar_list(google, {None: {"items": [{"id": "primary"}]}})
+    events = event_resource(google)
+    events.list.return_value = Request(
+        error=HttpError(resp=SimpleNamespace(status=500, reason="error"), content=b"error")
+    )
+    service = connected_service(tmp_path, google)
+
+    assert await service.list_events(RANGE_START, RANGE_END) == []
+    assert service._last_query_complete is False
+    assert await service.check_availability(RANGE_START, RANGE_END) is False
+
+
+def test_expired_token_refreshes_transparently_and_is_persisted_private(tmp_path: Path):
+    token = tmp_path / "token.json"
+    token.write_text("old", encoding="utf-8")
+    service = CalendarService(token_path=token)
+    credentials = MagicMock()
+    credentials.expired = True
+    credentials.refresh_token = "refresh-token"
+    credentials.valid = True
+    credentials.to_json.return_value = '{"token":"new"}'
+    service._credentials = credentials
+
+    assert service._get_credentials() is credentials
+    credentials.refresh.assert_called_once()
+    assert token.read_text(encoding="utf-8") == '{"token":"new"}'
+    assert token.stat().st_mode & 0o777 == 0o600
+
+
+@pytest.mark.parametrize("failure", [RefreshError("bad refresh"), OSError("offline")])
+def test_refresh_failure_raises_typed_reconnect_error(tmp_path: Path, failure: Exception):
+    token = tmp_path / "token.json"
+    token.write_text("old", encoding="utf-8")
+    service = CalendarService(token_path=token)
+    credentials = MagicMock()
+    credentials.expired = True
+    credentials.refresh_token = "refresh-token"
+    credentials.valid = False
+    credentials.refresh.side_effect = failure
+    service._credentials = credentials
+
+    with pytest.raises(CalendarReconnectRequiredError, match="reconnect"):
+        service._get_credentials()
+
+
+@pytest.mark.asyncio
+async def test_http_auth_rejection_raises_typed_reconnect_error(tmp_path: Path):
+    google = MagicMock()
+    calendar_list(google, {None: {"items": [{"id": "primary"}]}})
+    events = event_resource(google)
+    events.list.return_value = Request(
+        error=HttpError(resp=SimpleNamespace(status=401, reason="unauthorized"), content=b"")
+    )
+    service = connected_service(tmp_path, google)
+
+    with pytest.raises(CalendarReconnectRequiredError, match="reconnect"):
+        await service.list_events(RANGE_START, RANGE_END)
+
+
+@pytest.mark.asyncio
+async def test_first_create_makes_secondary_calendar_persists_id_and_never_writes_primary(
+    tmp_path: Path,
+):
+    google = MagicMock()
+    calendar_list(
+        google,
+        {
+            None: {
+                "items": [
+                    {"id": "primary", "summary": "Personal", "primary": True},
+                    {"id": "lookalike", "summary": "Kalendra", "primary": False},
+                ]
+            }
+        },
+    )
+    calendars = MagicMock()
+    calendars.insert.return_value = Request({"id": "kalendra-secondary", "primary": False})
+    google.calendars.return_value = calendars
+    events = event_resource(google)
+    events.insert.side_effect = lambda **kwargs: Request({"id": "block-1", **kwargs["body"]})
+    service = connected_service(tmp_path, google)
+
+    result = await service.create_event(
+        {
+            "title": "Math pset",
+            "description": "Chapter 6",
+            "start_time": datetime(2026, 8, 26, 15, tzinfo=UTC),
+            "end_time": datetime(2026, 8, 26, 16, tzinfo=UTC),
+        },
+        reasoning="the only gap between class and practice",
+    )
+
+    assert result["calendar_id"] == "kalendra-secondary"
+    calendar_body = calendars.insert.call_args.kwargs["body"]
+    assert calendar_body["summary"] == "Kalendra"
+    assert CALENDAR_OWNERSHIP_MARKER in calendar_body["description"]
+    insert = events.insert.call_args
+    assert insert.kwargs["calendarId"] == "kalendra-secondary"
+    assert insert.kwargs["calendarId"] != "primary"
+    assert insert.kwargs["body"]["description"] == (
+        "Chapter 6\n\nScheduling rationale: the only gap between class and practice"
+    )
+    assert insert.kwargs["body"]["extendedProperties"]["private"] == {
+        WORK_BLOCK_MARKER_KEY: WORK_BLOCK_MARKER_VALUE
+    }
+    assert service.kalendra_id_path.read_text(encoding="utf-8").strip() == "kalendra-secondary"
+    assert service.kalendra_id_path.stat().st_mode & 0o777 == 0o600
+
+
+@pytest.mark.asyncio
+async def test_persisted_owned_calendar_is_reused_without_creating_another(tmp_path: Path):
+    token = tmp_path / "token.json"
+    id_path = token.with_name(f"{token.name}.kalendra-calendar-id")
+    id_path.write_text("existing-kalendra\n", encoding="utf-8")
+    google = MagicMock()
+    calendar_list(google, {None: {"items": [owned_calendar("existing-kalendra")]}})
+    events = event_resource(google)
+    events.insert.side_effect = lambda **kwargs: Request({"id": "new", **kwargs["body"]})
+    service = connected_service(tmp_path, google)
+    service._kalendra_calendar_id = service._read_persisted_kalendra_id()
+
+    await service.create_event(
+        {
+            "title": "Work",
+            "start_time": RANGE_START,
+            "end_time": RANGE_START.replace(hour=1),
+        },
+        "morning focus window",
+    )
+
+    google.calendars.return_value.insert.assert_not_called()
+    assert events.insert.call_args.kwargs["calendarId"] == "existing-kalendra"
+
+
+@pytest.mark.asyncio
+async def test_update_and_delete_target_only_marked_kalendra_events(tmp_path: Path):
+    google = MagicMock()
+    calendar_list(google, {None: {"items": [owned_calendar()]}})
+    events = event_resource(google)
+    current = google_event("block", "Old", marked=True, description="old rationale")
+    events.get.return_value = Request(current)
+    events.patch.side_effect = lambda **kwargs: Request(
+        {**current, **kwargs["body"], "id": kwargs["eventId"]}
+    )
+    events.delete.return_value = Request(None)
+    service = connected_service(tmp_path, google)
+
+    updated = await service.update_event(
+        "block",
+        {
+            "title": "New",
+            "reasoning": "moved after the lecture",
+            "start_time": datetime(2026, 8, 26, 17, tzinfo=UTC),
+            "end_time": datetime(2026, 8, 26, 18, tzinfo=UTC),
+        },
+    )
+    await service.delete_event("block")
+
+    assert updated["title"] == "New"
+    patch_call = events.patch.call_args
+    assert patch_call.kwargs["calendarId"] == "kalendra-id"
+    assert "Scheduling rationale: moved after the lecture" in patch_call.kwargs["body"]["description"]
+    delete_call = events.delete.call_args
+    assert delete_call.kwargs == {"calendarId": "kalendra-id", "eventId": "block"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["update", "delete"])
+async def test_mutations_refuse_unmarked_events(tmp_path: Path, operation: str):
+    google = MagicMock()
+    calendar_list(google, {None: {"items": [owned_calendar()]}})
+    events = event_resource(google)
+    events.get.return_value = Request(google_event("real", "User event", marked=False))
+    service = connected_service(tmp_path, google)
+
+    with pytest.raises(CalendarError, match="not owned"):
+        if operation == "update":
+            await service.update_event("real", {"title": "Changed"})
+        else:
+            await service.delete_event("real")
+    events.patch.assert_not_called()
+    events.delete.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_clear_range_paginates_and_deletes_only_marked_events(tmp_path: Path):
+    google = MagicMock()
+    calendar_list(google, {None: {"items": [owned_calendar()]}})
+    events = event_resource(google)
+    pages = {
+        None: {
             "items": [
-                {
-                    "id": "event1",
-                    "summary": "Meeting 1",
-                    "start": {"dateTime": "2024-01-20T10:00:00-06:00"},
-                    "end": {"dateTime": "2024-01-20T11:00:00-06:00"},
-                },
-                {
-                    "id": "event2",
-                    "summary": "Meeting 2",
-                    "start": {"dateTime": "2024-01-20T14:00:00-06:00"},
-                    "end": {"dateTime": "2024-01-20T15:00:00-06:00"},
-                },
-            ]
-        }
-        mock_events.list.return_value = mock_list
-        mock_service.events.return_value = mock_events
-        mock_build.return_value = mock_service
+                google_event("owned-1", "Owned", marked=True),
+                google_event("user-1", "Not ours", marked=False),
+            ],
+            "nextPageToken": "next",
+        },
+        "next": {"items": [google_event("owned-2", "Owned too", marked=True)]},
+    }
+    events.list.side_effect = lambda **kwargs: Request(pages[kwargs["pageToken"]])
+    events.delete.return_value = Request(None)
+    service = connected_service(tmp_path, google)
 
-        # Create temp token file
-        import tempfile
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
-            f.write('{"token": "test"}')
-            token_path = Path(f.name)
+    await service.clear_kalendra_range(RANGE_START, RANGE_END)
 
-        try:
-            service = CalendarService(
-                credentials_path=Path("/fake/credentials.json"),
-                token_path=token_path,
-            )
+    assert [call.kwargs["pageToken"] for call in events.list.call_args_list] == [None, "next"]
+    assert {call.kwargs["eventId"] for call in events.delete.call_args_list} == {
+        "owned-1",
+        "owned-2",
+    }
+    assert all(call.kwargs["calendarId"] == "kalendra-id" for call in events.delete.call_args_list)
 
-            tz = pytz.timezone("America/Chicago")
-            start = datetime(2024, 1, 20, 0, 0, 0, tzinfo=tz)
-            end = datetime(2024, 1, 20, 23, 59, 59, tzinfo=tz)
 
-            events = await service.get_events_between(start, end)
+@pytest.mark.asyncio
+async def test_create_requires_nonblank_reasoning_before_google_insert(tmp_path: Path):
+    google = MagicMock()
+    calendar_list(google, {None: {"items": [owned_calendar()]}})
+    events = event_resource(google)
+    service = connected_service(tmp_path, google)
 
-            assert len(events) == 2
-            assert events[0]["title"] == "Meeting 1"
-            assert events[1]["title"] == "Meeting 2"
-        finally:
-            token_path.unlink(missing_ok=True)
-
-    @pytest.mark.asyncio
-    @patch("src.calendar_service.build")
-    @patch("src.calendar_service.Credentials")
-    async def test_get_events_api_error(self, mock_creds_class, mock_build):
-        """Test handling of API errors."""
-        from googleapiclient.errors import HttpError
-
-        # Set up mock credentials
-        mock_creds = MagicMock()
-        mock_creds.valid = True
-        mock_creds.expired = False
-        mock_creds_class.from_authorized_user_file.return_value = mock_creds
-
-        # Set up mock service that raises an error
-        mock_service = MagicMock()
-        mock_events = MagicMock()
-        mock_list = MagicMock()
-        mock_list.execute.side_effect = HttpError(
-            resp=MagicMock(status=500), content=b"Server Error"
+    with pytest.raises(ValueError, match="reasoning"):
+        await service.create_event(
+            {"title": "Opaque", "start_time": RANGE_START, "end_time": RANGE_END},
+            "   ",
         )
-        mock_events.list.return_value = mock_list
-        mock_service.events.return_value = mock_events
-        mock_build.return_value = mock_service
-
-        # Create temp token file
-        import tempfile
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
-            f.write('{"token": "test"}')
-            token_path = Path(f.name)
-
-        try:
-            service = CalendarService(
-                credentials_path=Path("/fake/credentials.json"),
-                token_path=token_path,
-            )
-
-            tz = pytz.timezone("America/Chicago")
-            start = datetime(2024, 1, 20, 0, 0, 0, tzinfo=tz)
-            end = datetime(2024, 1, 20, 23, 59, 59, tzinfo=tz)
-
-            events = await service.get_events_between(start, end)
-
-            # Should return empty list on error
-            assert events == []
-        finally:
-            token_path.unlink(missing_ok=True)
-
-
-class TestAvailabilityCheck:
-    """Tests for availability checking."""
-
-    @pytest.mark.asyncio
-    @patch("src.calendar_service.build")
-    @patch("src.calendar_service.Credentials")
-    async def test_check_availability_free(self, mock_creds_class, mock_build):
-        """Test checking availability when slot is free."""
-        # Set up mock credentials
-        mock_creds = MagicMock()
-        mock_creds.valid = True
-        mock_creds.expired = False
-        mock_creds_class.from_authorized_user_file.return_value = mock_creds
-
-        # Set up mock service with no events
-        mock_service = MagicMock()
-        mock_events = MagicMock()
-        mock_list = MagicMock()
-        mock_list.execute.return_value = {"items": []}
-        mock_events.list.return_value = mock_list
-        mock_service.events.return_value = mock_events
-        mock_build.return_value = mock_service
-
-        # Create temp token file
-        import tempfile
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
-            f.write('{"token": "test"}')
-            token_path = Path(f.name)
-
-        try:
-            service = CalendarService(
-                credentials_path=Path("/fake/credentials.json"),
-                token_path=token_path,
-            )
-
-            tz = pytz.timezone("America/Chicago")
-            start = datetime(2024, 1, 20, 14, 0, 0, tzinfo=tz)
-            end = datetime(2024, 1, 20, 15, 0, 0, tzinfo=tz)
-
-            is_available = await service.check_availability(start, end)
-
-            assert is_available is True
-        finally:
-            token_path.unlink(missing_ok=True)
-
-    @pytest.mark.asyncio
-    async def test_malformed_event_is_skipped_without_discarding_valid_events(self):
-        service = CalendarService(token_path=Path("/nonexistent/token.json"))
-        mock_service = MagicMock()
-        mock_service.events().list().execute.return_value = {
-            "items": [
-                {
-                    "id": "valid",
-                    "summary": "Valid",
-                    "start": {"dateTime": "2026-08-26T10:00:00-05:00"},
-                    "end": {"dateTime": "2026-08-26T11:00:00-05:00"},
-                },
-                {"id": "malformed", "summary": "Broken", "start": {}},
-            ]
-        }
-        service._service = mock_service
-        start = datetime(2026, 8, 26, 0, 0, tzinfo=pytz.UTC)
-        end = datetime(2026, 8, 27, 0, 0, tzinfo=pytz.UTC)
-
-        events = await service.list_events(start, end)
-
-        assert [event["id"] for event in events] == ["valid"]
-        assert service._last_query_complete is False
-
-    @pytest.mark.asyncio
-    @patch("src.calendar_service.build")
-    @patch("src.calendar_service.Credentials")
-    async def test_check_availability_busy(self, mock_creds_class, mock_build):
-        """Test checking availability when slot is busy."""
-        # Set up mock credentials
-        mock_creds = MagicMock()
-        mock_creds.valid = True
-        mock_creds.expired = False
-        mock_creds_class.from_authorized_user_file.return_value = mock_creds
-
-        # Set up mock service with an event
-        mock_service = MagicMock()
-        mock_events = MagicMock()
-        mock_list = MagicMock()
-        mock_list.execute.return_value = {
-            "items": [
-                {
-                    "id": "event1",
-                    "summary": "Existing Meeting",
-                    "start": {"dateTime": "2024-01-20T14:00:00-06:00"},
-                    "end": {"dateTime": "2024-01-20T15:00:00-06:00"},
-                }
-            ]
-        }
-        mock_events.list.return_value = mock_list
-        mock_service.events.return_value = mock_events
-        mock_build.return_value = mock_service
-
-        # Create temp token file
-        import tempfile
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
-            f.write('{"token": "test"}')
-            token_path = Path(f.name)
-
-        try:
-            service = CalendarService(
-                credentials_path=Path("/fake/credentials.json"),
-                token_path=token_path,
-            )
-
-            tz = pytz.timezone("America/Chicago")
-            start = datetime(2024, 1, 20, 14, 0, 0, tzinfo=tz)
-            end = datetime(2024, 1, 20, 15, 0, 0, tzinfo=tz)
-
-            is_available = await service.check_availability(start, end)
-
-            assert is_available is False
-        finally:
-            token_path.unlink(missing_ok=True)
+    events.insert.assert_not_called()
