@@ -1,3 +1,3 @@
-"""Dharvis - Claude-powered Telegram bot for managing tasks and calendar events."""
+"""Dharvis stateful personal-assistant package."""
 
-__version__ = "1.0.0"
+__version__ = "0.2.0"

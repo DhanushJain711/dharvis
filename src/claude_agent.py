@@ -8,8 +8,8 @@ from typing import Any
 
 from anthropic import Anthropic
 
-from config import config
-from utils import (
+from .config import config
+from .utils import (
     format_datetime_for_display,
     format_events_list,
     format_tasks_list,
@@ -45,7 +45,7 @@ class AgentResponse:
 class ClaudeAgent:
     """Claude-powered agent for processing natural language requests."""
 
-    def __init__(self, api_key: str | None = None):
+    def __init__(self, api_key: str | None = None) -> None:
         """Initialize the Claude agent.
 
         Args:

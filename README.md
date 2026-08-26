@@ -1,6 +1,12 @@
 # Dharvis
 
-A Claude-powered Telegram bot for managing tasks and calendar events through natural language.
+A stateful, OpenAI-powered Telegram personal assistant foundation for tasks,
+calendar events, scheduling decisions, facts, goals, and proactive planning.
+
+The public contracts for parallel implementation work are indexed in
+[`CONTRACTS.md`](CONTRACTS.md). The OpenAI function schemas in `src/tools.py`
+are the authoritative tool definitions, and `src/schema.sql` is the only
+canonical database schema.
 
 ## Features
 
@@ -26,14 +32,28 @@ pip install -r requirements.txt
 cp .env.example .env
 ```
 
-Edit `.env` with your credentials:
+Edit `.env` with your credentials and local-time policy:
 
 ```
 TELEGRAM_BOT_TOKEN=your_telegram_bot_token
-ANTHROPIC_API_KEY=your_anthropic_api_key
 ALLOWED_USER_ID=your_telegram_user_id
+OPENAI_API_KEY=your_openai_api_key
+AGENT_MODEL_ID=gpt-5-mini
+SCHEDULER_MODEL_ID=gpt-5-mini
+FACTS_MODEL_ID=gpt-5-mini
+OPENAI_REASONING_EFFORT=medium
 USER_TIMEZONE=America/Chicago
+QUIET_HOURS_START=22:00
+QUIET_HOURS_END=07:00
+DAILY_BRIEF_TIME=07:30
+DAILY_DEBRIEF_TIME=20:30
+REASONING_VERBOSITY=brief
+KALENDRA_CALENDAR_NAME=Kalendra
 ```
+
+Additional deployment and tuning settings are centralized in `src/config.py`,
+including Google Calendar credential/token paths and IDs, database path,
+Telegram polling timeout, history limits, and scheduler defaults.
 
 ### 3. Create Telegram Bot
 
@@ -49,6 +69,13 @@ Message [@userinfobot](https://t.me/userinfobot) to get your user ID, then add i
 
 ```bash
 python -m src.main
+```
+
+To validate configuration, initialize the schema, and build the Telegram
+application without starting network polling:
+
+```bash
+python -m src.main --check
 ```
 
 ## Usage Examples
@@ -118,17 +145,23 @@ dharvis/
 │   ├── __init__.py
 │   ├── main.py              # Entry point
 │   ├── config.py            # Environment configuration
-│   ├── database.py          # SQLite persistence
+│   ├── schema.sql           # Canonical database schema
+│   ├── migrate.py           # Idempotent schema runner
+│   ├── store.py             # Stateful persistence contract
+│   ├── tools.py             # Authoritative OpenAI tool schemas
+│   ├── timeutil.py          # Timezone-aware date handling
+│   ├── agent.py             # Stateful agent contract
 │   ├── telegram_handler.py  # Telegram bot handlers
-│   ├── claude_agent.py      # Claude API integration
 │   ├── calendar_service.py  # Google Calendar API
-│   └── utils.py             # Date/time utilities
+│   └── ...                  # Scheduler, jobs, facts, history, free/busy
 ├── tests/
 │   ├── test_database.py
 │   ├── test_claude_agent.py
 │   └── test_calendar_service.py
 ├── scripts/
 │   └── setup_gcal_auth.py
+├── CONTRACTS.md             # Public implementation signatures
+├── pyproject.toml           # Package and console entrypoint
 ├── requirements.txt
 ├── .env.example
 └── README.md

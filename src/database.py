@@ -1,18 +1,39 @@
 """Database layer for Dharvis using SQLite with async support."""
 
 import aiosqlite
-from datetime import datetime
+from contextlib import asynccontextmanager
+from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, AsyncIterator
 
-from config import config
-from utils import format_datetime_iso, get_current_time
+from .config import config
+from .migrate import run_migrations
+from .utils import format_datetime_iso, get_current_time
+
+
+def _utc_value(value: str | datetime | None) -> str | None:
+    """Normalize a compatibility-layer timestamp to aware UTC text."""
+    if value is None:
+        return None
+    parsed = datetime.fromisoformat(value.replace("Z", "+00:00")) if isinstance(value, str) else value
+    return format_datetime_iso(parsed)
+
+
+@asynccontextmanager
+async def _connection(path: Path) -> AsyncIterator[aiosqlite.Connection]:
+    """Yield a legacy-compatible connection with foreign keys enabled."""
+    db = await aiosqlite.connect(path)
+    try:
+        await db.execute("PRAGMA foreign_keys = ON")
+        yield db
+    finally:
+        await db.close()
 
 
 class Database:
     """Async SQLite database manager for tasks and events."""
 
-    def __init__(self, db_path: Path | None = None):
+    def __init__(self, db_path: Path | None = None) -> None:
         """Initialize database with path.
 
         Args:
@@ -21,47 +42,8 @@ class Database:
         self.db_path = db_path or config.DATABASE_PATH
 
     async def init_db(self) -> None:
-        """Create database tables if they don't exist."""
-        async with aiosqlite.connect(self.db_path) as db:
-            # Tasks table
-            await db.execute("""
-                CREATE TABLE IF NOT EXISTS tasks (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    title TEXT NOT NULL,
-                    description TEXT,
-                    deadline TEXT,
-                    priority TEXT DEFAULT 'medium',
-                    status TEXT DEFAULT 'pending',
-                    created_at TEXT,
-                    completed_at TEXT
-                )
-            """)
-
-            # Events table
-            await db.execute("""
-                CREATE TABLE IF NOT EXISTS events (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    title TEXT NOT NULL,
-                    description TEXT,
-                    start_time TEXT,
-                    end_time TEXT,
-                    location TEXT,
-                    created_at TEXT,
-                    source TEXT DEFAULT 'bot'
-                )
-            """)
-
-            # Conversation context table
-            await db.execute("""
-                CREATE TABLE IF NOT EXISTS conversation_context (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    user_message TEXT,
-                    bot_response TEXT,
-                    timestamp TEXT
-                )
-            """)
-
-            await db.commit()
+        """Install only the canonical schema through the migration runner."""
+        await run_migrations(self.db_path)
 
     # Task operations
 
@@ -83,12 +65,11 @@ class Database:
         Returns:
             ID of the created task.
         """
-        if isinstance(deadline, datetime):
-            deadline = format_datetime_iso(deadline)
+        deadline = _utc_value(deadline)
 
         created_at = format_datetime_iso(get_current_time())
 
-        async with aiosqlite.connect(self.db_path) as db:
+        async with _connection(self.db_path) as db:
             cursor = await db.execute(
                 """
                 INSERT INTO tasks (title, description, deadline, priority, status, created_at)
@@ -108,7 +89,7 @@ class Database:
         Returns:
             Task dict or None if not found.
         """
-        async with aiosqlite.connect(self.db_path) as db:
+        async with _connection(self.db_path) as db:
             db.row_factory = aiosqlite.Row
             cursor = await db.execute(
                 "SELECT * FROM tasks WHERE id = ?", (task_id,)
@@ -122,7 +103,7 @@ class Database:
         Returns:
             List of task dicts.
         """
-        async with aiosqlite.connect(self.db_path) as db:
+        async with _connection(self.db_path) as db:
             db.row_factory = aiosqlite.Row
             cursor = await db.execute(
                 """
@@ -143,10 +124,9 @@ class Database:
         Returns:
             List of task dicts.
         """
-        if isinstance(date, datetime):
-            date = format_datetime_iso(date)
+        date = _utc_value(date)
 
-        async with aiosqlite.connect(self.db_path) as db:
+        async with _connection(self.db_path) as db:
             db.row_factory = aiosqlite.Row
             cursor = await db.execute(
                 """
@@ -173,7 +153,7 @@ class Database:
         """
         completed_at = format_datetime_iso(get_current_time())
 
-        async with aiosqlite.connect(self.db_path) as db:
+        async with _connection(self.db_path) as db:
             if task_id:
                 cursor = await db.execute(
                     """
@@ -213,7 +193,7 @@ class Database:
         Returns:
             True if task was found and deleted, False otherwise.
         """
-        async with aiosqlite.connect(self.db_path) as db:
+        async with _connection(self.db_path) as db:
             if task_id:
                 cursor = await db.execute(
                     "DELETE FROM tasks WHERE id = ?", (task_id,)
@@ -231,7 +211,7 @@ class Database:
             await db.commit()
             return cursor.rowcount > 0
 
-    async def update_task(self, task_id: int, **fields) -> bool:
+    async def update_task(self, task_id: int, **fields: Any) -> bool:
         """Update task fields.
 
         Args:
@@ -247,15 +227,13 @@ class Database:
         if not update_fields:
             return False
 
-        if "deadline" in update_fields and isinstance(
-            update_fields["deadline"], datetime
-        ):
-            update_fields["deadline"] = format_datetime_iso(update_fields["deadline"])
+        if "deadline" in update_fields:
+            update_fields["deadline"] = _utc_value(update_fields["deadline"])
 
         set_clause = ", ".join(f"{k} = ?" for k in update_fields.keys())
         values = list(update_fields.values()) + [task_id]
 
-        async with aiosqlite.connect(self.db_path) as db:
+        async with _connection(self.db_path) as db:
             cursor = await db.execute(
                 f"UPDATE tasks SET {set_clause} WHERE id = ?", values
             )
@@ -273,7 +251,7 @@ class Database:
         """
         title_lower = title.lower()
 
-        async with aiosqlite.connect(self.db_path) as db:
+        async with _connection(self.db_path) as db:
             db.row_factory = aiosqlite.Row
             # First try exact match
             cursor = await db.execute(
@@ -325,14 +303,18 @@ class Database:
         Returns:
             ID of the created event.
         """
-        if isinstance(start_time, datetime):
-            start_time = format_datetime_iso(start_time)
-        if isinstance(end_time, datetime):
-            end_time = format_datetime_iso(end_time)
+        start_time = _utc_value(start_time)
+        end_time = _utc_value(end_time)
+        if start_time is None:
+            raise ValueError("start_time is required")
+        if end_time is None:
+            end_time = (
+                datetime.fromisoformat(start_time) + timedelta(hours=1)
+            ).isoformat()
 
         created_at = format_datetime_iso(get_current_time())
 
-        async with aiosqlite.connect(self.db_path) as db:
+        async with _connection(self.db_path) as db:
             cursor = await db.execute(
                 """
                 INSERT INTO events (title, description, start_time, end_time, location, created_at, source)
@@ -352,7 +334,7 @@ class Database:
         Returns:
             Event dict or None if not found.
         """
-        async with aiosqlite.connect(self.db_path) as db:
+        async with _connection(self.db_path) as db:
             db.row_factory = aiosqlite.Row
             cursor = await db.execute(
                 "SELECT * FROM events WHERE id = ?", (event_id,)
@@ -372,12 +354,10 @@ class Database:
         Returns:
             List of event dicts.
         """
-        if isinstance(start, datetime):
-            start = format_datetime_iso(start)
-        if isinstance(end, datetime):
-            end = format_datetime_iso(end)
+        start = _utc_value(start)
+        end = _utc_value(end)
 
-        async with aiosqlite.connect(self.db_path) as db:
+        async with _connection(self.db_path) as db:
             db.row_factory = aiosqlite.Row
             cursor = await db.execute(
                 """
@@ -402,7 +382,7 @@ class Database:
         Returns:
             True if event was found and deleted, False otherwise.
         """
-        async with aiosqlite.connect(self.db_path) as db:
+        async with _connection(self.db_path) as db:
             if event_id:
                 cursor = await db.execute(
                     "DELETE FROM events WHERE id = ?", (event_id,)
@@ -420,7 +400,7 @@ class Database:
             await db.commit()
             return cursor.rowcount > 0
 
-    async def update_event(self, event_id: int, **fields) -> bool:
+    async def update_event(self, event_id: int, **fields: Any) -> bool:
         """Update event fields.
 
         Args:
@@ -437,17 +417,13 @@ class Database:
             return False
 
         for time_field in ["start_time", "end_time"]:
-            if time_field in update_fields and isinstance(
-                update_fields[time_field], datetime
-            ):
-                update_fields[time_field] = format_datetime_iso(
-                    update_fields[time_field]
-                )
+            if time_field in update_fields:
+                update_fields[time_field] = _utc_value(update_fields[time_field])
 
         set_clause = ", ".join(f"{k} = ?" for k in update_fields.keys())
         values = list(update_fields.values()) + [event_id]
 
-        async with aiosqlite.connect(self.db_path) as db:
+        async with _connection(self.db_path) as db:
             cursor = await db.execute(
                 f"UPDATE events SET {set_clause} WHERE id = ?", values
             )
@@ -465,7 +441,7 @@ class Database:
         """
         title_lower = title.lower()
 
-        async with aiosqlite.connect(self.db_path) as db:
+        async with _connection(self.db_path) as db:
             db.row_factory = aiosqlite.Row
             # First try exact match
             cursor = await db.execute(
@@ -505,13 +481,18 @@ class Database:
         """
         timestamp = format_datetime_iso(get_current_time())
 
-        async with aiosqlite.connect(self.db_path) as db:
+        async with _connection(self.db_path) as db:
+            await db.execute(
+                """INSERT INTO messages (
+                    role, content, tool_calls, created_at, session_id
+                ) VALUES ('user', ?, '[]', ?, 'legacy')""",
+                (user_message, timestamp),
+            )
             cursor = await db.execute(
-                """
-                INSERT INTO conversation_context (user_message, bot_response, timestamp)
-                VALUES (?, ?, ?)
-                """,
-                (user_message, bot_response, timestamp),
+                """INSERT INTO messages (
+                    role, content, tool_calls, created_at, session_id
+                ) VALUES ('assistant', ?, '[]', ?, 'legacy')""",
+                (bot_response, timestamp),
             )
             await db.commit()
             return cursor.lastrowid
@@ -527,15 +508,28 @@ class Database:
         Returns:
             List of conversation dicts.
         """
-        async with aiosqlite.connect(self.db_path) as db:
+        async with _connection(self.db_path) as db:
             db.row_factory = aiosqlite.Row
             cursor = await db.execute(
-                """
-                SELECT * FROM conversation_context
-                ORDER BY timestamp DESC
-                LIMIT ?
-                """,
-                (limit,),
+                """SELECT * FROM (
+                    SELECT id, role, content, created_at
+                    FROM messages
+                    WHERE session_id = 'legacy' AND role IN ('user', 'assistant')
+                    ORDER BY id DESC LIMIT ?
+                ) ORDER BY id""",
+                (limit * 2,),
             )
-            rows = await cursor.fetchall()
-            return [dict(row) for row in reversed(rows)]
+            rows = [dict(row) for row in await cursor.fetchall()]
+            conversations: list[dict[str, Any]] = []
+            for index in range(0, len(rows) - 1, 2):
+                user, assistant = rows[index], rows[index + 1]
+                if user["role"] == "user" and assistant["role"] == "assistant":
+                    conversations.append(
+                        {
+                            "id": assistant["id"],
+                            "user_message": user["content"],
+                            "bot_response": assistant["content"],
+                            "timestamp": assistant["created_at"],
+                        }
+                    )
+            return conversations

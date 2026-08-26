@@ -79,8 +79,8 @@ class TestEventFormatting:
 
         assert formatted["id"] == "event123"
         assert formatted["title"] == "Team Meeting"
-        assert formatted["start_time"] == "2024-01-20T14:00:00-06:00"
-        assert formatted["end_time"] == "2024-01-20T15:00:00-06:00"
+        assert formatted["start_time"] == "2024-01-20T20:00:00+00:00"
+        assert formatted["end_time"] == "2024-01-20T21:00:00+00:00"
         assert formatted["source"] == "gcal"
 
     def test_format_event_with_location(self):
@@ -127,8 +127,8 @@ class TestEventFormatting:
 
         formatted = service._format_event(gcal_event)
 
-        assert formatted["start_time"] == "2024-01-20"
-        assert formatted["end_time"] == "2024-01-21"
+        assert formatted["start_time"] == "2024-01-20T06:00:00+00:00"
+        assert formatted["end_time"] == "2024-01-21T06:00:00+00:00"
 
     def test_format_event_missing_summary(self):
         """Test formatting an event with missing summary."""
@@ -310,6 +310,30 @@ class TestAvailabilityCheck:
             assert is_available is True
         finally:
             token_path.unlink(missing_ok=True)
+
+    @pytest.mark.asyncio
+    async def test_malformed_event_is_skipped_without_discarding_valid_events(self):
+        service = CalendarService(token_path=Path("/nonexistent/token.json"))
+        mock_service = MagicMock()
+        mock_service.events().list().execute.return_value = {
+            "items": [
+                {
+                    "id": "valid",
+                    "summary": "Valid",
+                    "start": {"dateTime": "2026-08-26T10:00:00-05:00"},
+                    "end": {"dateTime": "2026-08-26T11:00:00-05:00"},
+                },
+                {"id": "malformed", "summary": "Broken", "start": {}},
+            ]
+        }
+        service._service = mock_service
+        start = datetime(2026, 8, 26, 0, 0, tzinfo=pytz.UTC)
+        end = datetime(2026, 8, 27, 0, 0, tzinfo=pytz.UTC)
+
+        events = await service.list_events(start, end)
+
+        assert [event["id"] for event in events] == ["valid"]
+        assert service._last_query_complete is False
 
     @pytest.mark.asyncio
     @patch("src.calendar_service.build")

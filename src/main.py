@@ -1,103 +1,102 @@
-"""Main entry point for Dharvis - the Claude-powered agenda bot."""
+"""Package entrypoint for the runnable Telegram placeholder."""
 
+from __future__ import annotations
+
+import argparse
 import asyncio
 import logging
 import signal
 import sys
 
-from config import config
-from database import Database
-from claude_agent import ClaudeAgent
-from calendar_service import CalendarService
-from telegram_handler import TelegramHandler
+from .agent import Agent
+from .config import config
+from .history import History
+from .store import Store
+from .telegram_handler import TelegramHandler
 
-# Configure logging
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    handlers=[logging.StreamHandler(sys.stdout)],
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    stream=sys.stdout,
 )
 logger = logging.getLogger(__name__)
 
 
-async def main() -> None:
-    """Initialize and run the Dharvis bot."""
-    # Validate configuration
+async def build_application() -> tuple[TelegramHandler, object]:
+    """Initialize persistence and build, but do not start, the Telegram app."""
+    store = Store()
+    await store.initialize()
+    agent = Agent(History(store))
+    handler = TelegramHandler(agent, store=store)
+    return handler, handler.create_application()
+
+
+async def main(*, check_only: bool = False) -> None:
+    """Connect polling, serve placeholder replies, and shut down cleanly."""
     missing = config.validate()
     if missing:
-        logger.error(f"Missing required configuration: {', '.join(missing)}")
-        logger.error("Please set these in your .env file")
-        sys.exit(1)
-
-    logger.info("Initializing Dharvis...")
-
-    # Initialize database
-    db = Database()
-    await db.init_db()
-    logger.info("Database initialized")
-
-    # Initialize Claude agent
-    agent = ClaudeAgent()
-    logger.info("Claude agent initialized")
-
-    # Initialize Google Calendar (optional - may fail gracefully)
-    calendar = CalendarService()
-    if calendar.is_available():
-        logger.info("Google Calendar connected")
-    else:
-        logger.warning(
-            "Google Calendar not available - run setup_gcal_auth.py to configure"
+        logger.error(
+            "Refusing to start: missing required configuration: %s",
+            ", ".join(missing),
         )
-        calendar = None
+        return
+    handler, app = await build_application()
+    del handler
+    if check_only:
+        logger.info("Configuration, schema, and Telegram application are valid")
+        return
 
-    # Initialize Telegram handler
-    handler = TelegramHandler(
-        database=db,
-        claude_agent=agent,
-        calendar_service=calendar,
-    )
-
-    # Create application
-    app = handler.create_application()
-
-    # Set up signal handlers for graceful shutdown
     stop_event = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    for signame in (signal.SIGINT, signal.SIGTERM):
+        try:
+            loop.add_signal_handler(signame, stop_event.set)
+        except NotImplementedError:  # pragma: no cover - Windows fallback
+            pass
 
-    def signal_handler(sig, frame):
-        logger.info("Received shutdown signal")
-        stop_event.set()
-
-    signal.signal(signal.SIGINT, signal_handler)
-    signal.signal(signal.SIGTERM, signal_handler)
-
-    # Start bot
-    logger.info("Starting Dharvis bot...")
-    await app.initialize()
-    await app.start()
-    await app.updater.start_polling(drop_pending_updates=True)
-
-    logger.info("Dharvis is running! Press Ctrl+C to stop.")
-
-    # Wait for stop signal
-    await stop_event.wait()
-
-    # Graceful shutdown
-    logger.info("Shutting down...")
-    await app.updater.stop()
-    await app.stop()
-    await app.shutdown()
-    logger.info("Dharvis stopped.")
+    initialized = started = polling = False
+    try:
+        await app.initialize()
+        initialized = True
+        await app.start()
+        started = True
+        if app.updater is None:
+            raise RuntimeError("Telegram updater is unavailable")
+        await app.updater.start_polling(
+            drop_pending_updates=True,
+            timeout=config.TELEGRAM_POLL_TIMEOUT_SECONDS,
+        )
+        polling = True
+        logger.info("Dharvis Telegram placeholder is running")
+        await stop_event.wait()
+    finally:
+        logger.info("Stopping Dharvis")
+        if polling and app.updater is not None:
+            await app.updater.stop()
+        if started:
+            await app.stop()
+        if initialized:
+            await app.shutdown()
 
 
 def run() -> None:
-    """Entry point for running the bot."""
+    """Console-script entrypoint."""
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--check", action="store_true", help="build dependencies and exit before polling"
+    )
+    args = parser.parse_args()
+    missing = config.validate()
+    if missing:
+        logger.error(
+            "Refusing to start: missing required configuration: %s",
+            ", ".join(missing),
+        )
+        raise SystemExit(2)
     try:
-        asyncio.run(main())
+        asyncio.run(main(check_only=args.check))
     except KeyboardInterrupt:
-        logger.info("Interrupted by user")
-    except Exception as e:
-        logger.error(f"Fatal error: {e}")
-        sys.exit(1)
+        logger.info("Interrupted")
 
 
 if __name__ == "__main__":

@@ -2,9 +2,10 @@
 
 from datetime import datetime, timedelta
 from typing import Any
-import pytz
+from zoneinfo import ZoneInfo
 
-from config import config
+from .config import config
+from .timeutil import day_bounds, now_local, to_utc
 
 
 def get_current_time(timezone: str | None = None) -> datetime:
@@ -16,8 +17,7 @@ def get_current_time(timezone: str | None = None) -> datetime:
     Returns:
         Current datetime in the specified timezone.
     """
-    tz = pytz.timezone(timezone or config.USER_TIMEZONE)
-    return datetime.now(tz)
+    return datetime.now(ZoneInfo(timezone)) if timezone else now_local()
 
 
 def format_datetime_for_display(dt: datetime | str | None) -> str:
@@ -60,7 +60,7 @@ def format_datetime_iso(dt: datetime) -> str:
     Returns:
         ISO format string.
     """
-    return dt.isoformat()
+    return to_utc(dt).isoformat()
 
 
 def parse_iso_datetime(iso_str: str) -> datetime | None:
@@ -76,10 +76,8 @@ def parse_iso_datetime(iso_str: str) -> datetime | None:
         return None
     try:
         dt = datetime.fromisoformat(iso_str)
-        # Ensure timezone awareness
-        if dt.tzinfo is None:
-            tz = pytz.timezone(config.USER_TIMEZONE)
-            dt = tz.localize(dt)
+        if dt.tzinfo is None or dt.utcoffset() is None:
+            return None
         return dt
     except (ValueError, TypeError):
         return None
@@ -94,18 +92,10 @@ def get_day_range(date: datetime | None = None) -> tuple[datetime, datetime]:
     Returns:
         Tuple of (start_of_day, end_of_day) datetimes.
     """
-    if date is None:
-        date = get_current_time()
-
-    tz = pytz.timezone(config.USER_TIMEZONE)
-    start = datetime(date.year, date.month, date.day, 0, 0, 0)
-    end = datetime(date.year, date.month, date.day, 23, 59, 59)
-
-    if start.tzinfo is None:
-        start = tz.localize(start)
-        end = tz.localize(end)
-
-    return start, end
+    selected = date or get_current_time()
+    if selected.tzinfo is None or selected.utcoffset() is None:
+        raise ValueError("date must be timezone-aware; naive datetimes are not allowed")
+    return day_bounds(selected)
 
 
 def get_week_range(date: datetime | None = None) -> tuple[datetime, datetime]:
@@ -117,22 +107,14 @@ def get_week_range(date: datetime | None = None) -> tuple[datetime, datetime]:
     Returns:
         Tuple of (start_of_week, end_of_week) datetimes.
     """
-    if date is None:
-        date = get_current_time()
-
-    tz = pytz.timezone(config.USER_TIMEZONE)
-    # Get Monday of the week
-    days_since_monday = date.weekday()
-    monday = date - timedelta(days=days_since_monday)
-    sunday = monday + timedelta(days=6)
-
-    start = datetime(monday.year, monday.month, monday.day, 0, 0, 0)
-    end = datetime(sunday.year, sunday.month, sunday.day, 23, 59, 59)
-
-    if start.tzinfo is None:
-        start = tz.localize(start)
-        end = tz.localize(end)
-
+    selected = date or get_current_time()
+    if selected.tzinfo is None or selected.utcoffset() is None:
+        raise ValueError("date must be timezone-aware; naive datetimes are not allowed")
+    local = selected.astimezone(ZoneInfo(config.USER_TIMEZONE))
+    monday = local.date() - timedelta(days=local.weekday())
+    next_monday = monday + timedelta(days=7)
+    start, _ = day_bounds(monday)
+    end, _ = day_bounds(next_monday)
     return start, end
 
 
