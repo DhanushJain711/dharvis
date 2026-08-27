@@ -1,0 +1,2228 @@
+{
+  "summary": {
+    "multi_item": {
+      "passed": 6,
+      "total": 6,
+      "rate": 1.0
+    },
+    "relative_dates": {
+      "passed": 14,
+      "total": 14,
+      "rate": 1.0
+    },
+    "ambiguous_references": {
+      "passed": 7,
+      "total": 7,
+      "rate": 1.0
+    },
+    "corrections": {
+      "passed": 6,
+      "total": 6,
+      "rate": 1.0
+    },
+    "multi_turn_context": {
+      "passed": 6,
+      "total": 6,
+      "rate": 1.0
+    },
+    "cross_domain_queries": {
+      "passed": 6,
+      "total": 6,
+      "rate": 1.0
+    }
+  },
+  "usage": {
+    "input_tokens": 428124,
+    "cached_tokens": 394009,
+    "cache_write_tokens": 9933,
+    "output_tokens": 7271,
+    "total_tokens": 435395,
+    "estimated_cost_usd": 0.23925030000000003,
+    "calls": 122,
+    "cache_hit_rate": 0.9203
+  },
+  "results": [
+    {
+      "id": "multi_tasks_1",
+      "category": "multi_item",
+      "message": "add laundry, call mom, and renew my license",
+      "expected": [
+        "add_task"
+      ],
+      "observed": [
+        "add_task"
+      ],
+      "passed": true,
+      "call_details": [
+        {
+          "name": "add_task",
+          "arguments": {
+            "tasks": [
+              {
+                "title": "Do laundry",
+                "description": null,
+                "deadline": null,
+                "estimated_minutes": null,
+                "category": "errand",
+                "energy": "errand",
+                "priority": "medium",
+                "goal_id": null
+              },
+              {
+                "title": "Call mom",
+                "description": null,
+                "deadline": null,
+                "estimated_minutes": null,
+                "category": "personal",
+                "energy": "light",
+                "priority": "medium",
+                "goal_id": null
+              },
+              {
+                "title": "Renew license",
+                "description": null,
+                "deadline": null,
+                "estimated_minutes": null,
+                "category": "errand",
+                "energy": "errand",
+                "priority": "medium",
+                "goal_id": null
+              }
+            ]
+          }
+        }
+      ],
+      "response": "added all three",
+      "error": null,
+      "usage": {
+        "kind": "agent",
+        "input_tokens": 6953,
+        "cached_tokens": 3311,
+        "cache_write_tokens": 3311,
+        "output_tokens": 161,
+        "total_tokens": 7114,
+        "estimated_cost_usd": 0.011533700000000001,
+        "calls": 2
+      }
+    },
+    {
+      "id": "multi_tasks_2",
+      "category": "multi_item",
+      "message": "add these three things: finish the pset by Friday, email Maya tomorrow, buy detergent",
+      "expected": [
+        "resolve_date",
+        "add_task"
+      ],
+      "observed": [
+        "resolve_date",
+        "resolve_date",
+        "add_task"
+      ],
+      "passed": true,
+      "call_details": [
+        {
+          "name": "resolve_date",
+          "arguments": {
+            "phrase": "by Friday"
+          }
+        },
+        {
+          "name": "resolve_date",
+          "arguments": {
+            "phrase": "tomorrow"
+          }
+        },
+        {
+          "name": "add_task",
+          "arguments": {
+            "tasks": [
+              {
+                "title": "Finish the pset",
+                "description": null,
+                "deadline": "2026-08-28T05:00:00Z",
+                "estimated_minutes": null,
+                "category": "school",
+                "energy": "deep_focus",
+                "priority": "high",
+                "goal_id": null
+              },
+              {
+                "title": "Email Maya",
+                "description": null,
+                "deadline": "2026-08-28T00:52:17.662800Z",
+                "estimated_minutes": null,
+                "category": "personal",
+                "energy": "light",
+                "priority": "medium",
+                "goal_id": null
+              },
+              {
+                "title": "Buy detergent",
+                "description": null,
+                "deadline": null,
+                "estimated_minutes": null,
+                "category": "errand",
+                "energy": "errand",
+                "priority": "medium",
+                "goal_id": null
+              }
+            ]
+          }
+        }
+      ],
+      "response": "added all three \u2014 pset due Friday, email Maya tomorrow.",
+      "error": null,
+      "usage": {
+        "kind": "agent",
+        "input_tokens": 10808,
+        "cached_tokens": 9933,
+        "cache_write_tokens": 0,
+        "output_tokens": 298,
+        "total_tokens": 11106,
+        "estimated_cost_usd": 0.0073126,
+        "calls": 3
+      }
+    },
+    {
+      "id": "multi_tasks_3",
+      "category": "multi_item",
+      "message": "I need to draft the memo, review the deck, and submit expenses",
+      "expected": [
+        "add_task"
+      ],
+      "observed": [
+        "add_task"
+      ],
+      "passed": true,
+      "call_details": [
+        {
+          "name": "add_task",
+          "arguments": {
+            "tasks": [
+              {
+                "title": "Draft the memo",
+                "description": null,
+                "deadline": null,
+                "estimated_minutes": null,
+                "category": "work",
+                "energy": "deep_focus",
+                "priority": "medium",
+                "goal_id": null
+              },
+              {
+                "title": "Review the deck",
+                "description": null,
+                "deadline": null,
+                "estimated_minutes": null,
+                "category": "work",
+                "energy": "deep_focus",
+                "priority": "medium",
+                "goal_id": null
+              },
+              {
+                "title": "Submit expenses",
+                "description": null,
+                "deadline": null,
+                "estimated_minutes": null,
+                "category": "work",
+                "energy": "light",
+                "priority": "medium",
+                "goal_id": null
+              }
+            ]
+          }
+        }
+      ],
+      "response": "added all three",
+      "error": null,
+      "usage": {
+        "kind": "agent",
+        "input_tokens": 6974,
+        "cached_tokens": 6622,
+        "cache_write_tokens": 0,
+        "output_tokens": 174,
+        "total_tokens": 7148,
+        "estimated_cost_usd": 0.0041164,
+        "calls": 2
+      }
+    },
+    {
+      "id": "multi_events_1",
+      "category": "multi_item",
+      "message": "calendar these: dentist Friday at 2 for an hour, haircut Saturday at 11 for 30 minutes",
+      "expected": [
+        "resolve_date",
+        "resolve_date",
+        "add_event"
+      ],
+      "observed": [
+        "resolve_date",
+        "resolve_date",
+        "add_event"
+      ],
+      "passed": true,
+      "call_details": [
+        {
+          "name": "resolve_date",
+          "arguments": {
+            "phrase": "Friday at 2 PM"
+          }
+        },
+        {
+          "name": "resolve_date",
+          "arguments": {
+            "phrase": "Saturday at 11 AM"
+          }
+        },
+        {
+          "name": "add_event",
+          "arguments": {
+            "events": [
+              {
+                "title": "Dentist",
+                "description": null,
+                "start": "2026-08-28T19:00:00Z",
+                "end": "2026-08-28T20:00:00Z",
+                "location": null,
+                "category": "personal"
+              },
+              {
+                "title": "Haircut",
+                "description": null,
+                "start": "2026-08-29T16:00:00Z",
+                "end": "2026-08-29T16:30:00Z",
+                "location": null,
+                "category": "personal"
+              }
+            ]
+          }
+        }
+      ],
+      "response": "added \u2014 dentist Friday 2\u20133, haircut Saturday 11\u201311:30",
+      "error": null,
+      "usage": {
+        "kind": "agent",
+        "input_tokens": 10721,
+        "cached_tokens": 9933,
+        "cache_write_tokens": 0,
+        "output_tokens": 229,
+        "total_tokens": 10950,
+        "estimated_cost_usd": 0.0063106,
+        "calls": 3
+      }
+    },
+    {
+      "id": "mixed_1",
+      "category": "multi_item",
+      "message": "add buy groceries and call dad as tasks",
+      "expected": [
+        "add_task"
+      ],
+      "observed": [
+        "add_task"
+      ],
+      "passed": true,
+      "call_details": [
+        {
+          "name": "add_task",
+          "arguments": {
+            "tasks": [
+              {
+                "title": "Buy groceries",
+                "description": null,
+                "deadline": null,
+                "estimated_minutes": null,
+                "category": "errand",
+                "energy": "errand",
+                "priority": "medium",
+                "goal_id": null
+              },
+              {
+                "title": "Call dad",
+                "description": null,
+                "deadline": null,
+                "estimated_minutes": null,
+                "category": "personal",
+                "energy": "light",
+                "priority": "medium",
+                "goal_id": null
+              }
+            ]
+          }
+        }
+      ],
+      "response": "added both",
+      "error": null,
+      "usage": {
+        "kind": "agent",
+        "input_tokens": 6914,
+        "cached_tokens": 6622,
+        "cache_write_tokens": 0,
+        "output_tokens": 125,
+        "total_tokens": 7039,
+        "estimated_cost_usd": 0.0034084,
+        "calls": 2
+      }
+    },
+    {
+      "id": "goals_1",
+      "category": "multi_item",
+      "message": "set goals of 3 gym sessions a week and 8 study hours a week",
+      "expected": [
+        "add_goal",
+        "add_goal"
+      ],
+      "observed": [
+        "add_goal",
+        "add_goal"
+      ],
+      "passed": true,
+      "call_details": [
+        {
+          "name": "add_goal",
+          "arguments": {
+            "title": "Gym sessions",
+            "target_amount": 3,
+            "target_unit": "sessions",
+            "period": "week",
+            "category": "fitness"
+          }
+        },
+        {
+          "name": "add_goal",
+          "arguments": {
+            "title": "Study time",
+            "target_amount": 8,
+            "target_unit": "hours",
+            "period": "week",
+            "category": "school"
+          }
+        }
+      ],
+      "response": "Set: 3 gym sessions and 8 study hours per week.",
+      "error": null,
+      "usage": {
+        "kind": "agent",
+        "input_tokens": 6937,
+        "cached_tokens": 6622,
+        "cache_write_tokens": 0,
+        "output_tokens": 125,
+        "total_tokens": 7062,
+        "estimated_cost_usd": 0.0034544,
+        "calls": 2
+      }
+    },
+    {
+      "id": "relative_tomorrow",
+      "category": "relative_dates",
+      "message": "remind me to submit the form tomorrow",
+      "expected": [
+        "resolve_date",
+        "add_task"
+      ],
+      "observed": [
+        "resolve_date",
+        "add_task"
+      ],
+      "passed": true,
+      "call_details": [
+        {
+          "name": "resolve_date",
+          "arguments": {
+            "phrase": "tomorrow"
+          }
+        },
+        {
+          "name": "add_task",
+          "arguments": {
+            "tasks": [
+              {
+                "title": "Submit the form",
+                "description": null,
+                "deadline": "2026-08-28T00:52:38.659427Z",
+                "estimated_minutes": null,
+                "category": "personal",
+                "energy": "light",
+                "priority": "medium",
+                "goal_id": null
+              }
+            ]
+          }
+        }
+      ],
+      "response": "added \u2014 due tomorrow",
+      "error": null,
+      "usage": {
+        "kind": "agent",
+        "input_tokens": 10441,
+        "cached_tokens": 9933,
+        "cache_write_tokens": 0,
+        "output_tokens": 108,
+        "total_tokens": 10549,
+        "estimated_cost_usd": 0.0042986,
+        "calls": 3
+      }
+    },
+    {
+      "id": "relative_friday_morning",
+      "category": "relative_dates",
+      "message": "finish the report Friday morning",
+      "expected": [
+        "resolve_date",
+        "add_task"
+      ],
+      "observed": [
+        "resolve_date",
+        "add_task"
+      ],
+      "passed": true,
+      "call_details": [
+        {
+          "name": "resolve_date",
+          "arguments": {
+            "phrase": "Friday morning"
+          }
+        },
+        {
+          "name": "add_task",
+          "arguments": {
+            "tasks": [
+              {
+                "title": "Finish the report",
+                "description": null,
+                "deadline": "2026-08-28T14:00:00Z",
+                "estimated_minutes": null,
+                "category": "work",
+                "energy": "deep_focus",
+                "priority": "high",
+                "goal_id": null
+              }
+            ]
+          }
+        }
+      ],
+      "response": "added \u2014 due Friday morning",
+      "error": null,
+      "usage": {
+        "kind": "agent",
+        "input_tokens": 10462,
+        "cached_tokens": 9933,
+        "cache_write_tokens": 0,
+        "output_tokens": 129,
+        "total_tokens": 10591,
+        "estimated_cost_usd": 0.0045926000000000005,
+        "calls": 3
+      }
+    },
+    {
+      "id": "relative_next_tuesday",
+      "category": "relative_dates",
+      "message": "dentist next Tuesday at 3 for an hour",
+      "expected": [
+        "resolve_date",
+        "add_event"
+      ],
+      "observed": [
+        "resolve_date",
+        "add_event"
+      ],
+      "passed": true,
+      "call_details": [
+        {
+          "name": "resolve_date",
+          "arguments": {
+            "phrase": "next Tuesday at 3 PM"
+          }
+        },
+        {
+          "name": "add_event",
+          "arguments": {
+            "events": [
+              {
+                "title": "Dentist",
+                "description": null,
+                "start": "2026-09-01T20:00:00Z",
+                "end": "2026-09-01T21:00:00Z",
+                "location": null,
+                "category": "personal"
+              }
+            ]
+          }
+        }
+      ],
+      "response": "got it, dentist is on Tuesday, Sept 1 from 3\u20134 PM",
+      "error": null,
+      "usage": {
+        "kind": "agent",
+        "input_tokens": 10451,
+        "cached_tokens": 9933,
+        "cache_write_tokens": 0,
+        "output_tokens": 124,
+        "total_tokens": 10575,
+        "estimated_cost_usd": 0.0045106,
+        "calls": 3
+      }
+    },
+    {
+      "id": "relative_in_three_days",
+      "category": "relative_dates",
+      "message": "add the application, due in 3 days",
+      "expected": [
+        "resolve_date",
+        "add_task"
+      ],
+      "observed": [
+        "resolve_date",
+        "add_task"
+      ],
+      "passed": true,
+      "call_details": [
+        {
+          "name": "resolve_date",
+          "arguments": {
+            "phrase": "in 3 days"
+          }
+        },
+        {
+          "name": "add_task",
+          "arguments": {
+            "tasks": [
+              {
+                "title": "Application",
+                "description": null,
+                "deadline": "2026-08-30T00:52:52.280438Z",
+                "estimated_minutes": null,
+                "category": "career",
+                "energy": "deep_focus",
+                "priority": "high",
+                "goal_id": null
+              }
+            ]
+          }
+        }
+      ],
+      "response": "added \u2014 due Saturday evening",
+      "error": null,
+      "usage": {
+        "kind": "agent",
+        "input_tokens": 10467,
+        "cached_tokens": 9933,
+        "cache_write_tokens": 0,
+        "output_tokens": 118,
+        "total_tokens": 10585,
+        "estimated_cost_usd": 0.0044706,
+        "calls": 3
+      }
+    },
+    {
+      "id": "relative_tonight",
+      "category": "relative_dates",
+      "message": "remind me to take the bins out tonight",
+      "expected": [
+        "resolve_date",
+        "add_task"
+      ],
+      "observed": [
+        "resolve_date",
+        "add_task"
+      ],
+      "passed": true,
+      "call_details": [
+        {
+          "name": "resolve_date",
+          "arguments": {
+            "phrase": "tonight"
+          }
+        },
+        {
+          "name": "add_task",
+          "arguments": {
+            "tasks": [
+              {
+                "title": "Take the bins out",
+                "description": null,
+                "deadline": "2026-08-27T01:00:00Z",
+                "estimated_minutes": null,
+                "category": "errand",
+                "energy": "errand",
+                "priority": "medium",
+                "goal_id": null
+              }
+            ]
+          }
+        }
+      ],
+      "response": "added \u2014 due tonight",
+      "error": null,
+      "usage": {
+        "kind": "agent",
+        "input_tokens": 10444,
+        "cached_tokens": 9933,
+        "cache_write_tokens": 0,
+        "output_tokens": 114,
+        "total_tokens": 10558,
+        "estimated_cost_usd": 0.0043766,
+        "calls": 3
+      }
+    },
+    {
+      "id": "relative_end_week",
+      "category": "relative_dates",
+      "message": "submit expenses by the end of this week",
+      "expected": [
+        "resolve_date",
+        "add_task"
+      ],
+      "observed": [
+        "resolve_date",
+        "resolve_date",
+        "add_task"
+      ],
+      "passed": true,
+      "call_details": [
+        {
+          "name": "resolve_date",
+          "arguments": {
+            "phrase": "the end of this week"
+          }
+        },
+        {
+          "name": "resolve_date",
+          "arguments": {
+            "phrase": "this Sunday"
+          }
+        },
+        {
+          "name": "add_task",
+          "arguments": {
+            "tasks": [
+              {
+                "title": "Submit expenses",
+                "description": null,
+                "deadline": "2026-08-31T04:59:00Z",
+                "estimated_minutes": null,
+                "category": "work",
+                "energy": "light",
+                "priority": "medium",
+                "goal_id": null
+              }
+            ]
+          }
+        }
+      ],
+      "response": "added \u2014 due Sunday night",
+      "error": null,
+      "usage": {
+        "kind": "agent",
+        "input_tokens": 14067,
+        "cached_tokens": 13244,
+        "cache_write_tokens": 0,
+        "output_tokens": 249,
+        "total_tokens": 14316,
+        "estimated_cost_usd": 0.0072828,
+        "calls": 4
+      }
+    },
+    {
+      "id": "relative_weekend",
+      "category": "relative_dates",
+      "message": "brunch Sunday at noon for 90 minutes",
+      "expected": [
+        "resolve_date",
+        "add_event"
+      ],
+      "observed": [
+        "resolve_date",
+        "add_event"
+      ],
+      "passed": true,
+      "call_details": [
+        {
+          "name": "resolve_date",
+          "arguments": {
+            "phrase": "Sunday at noon"
+          }
+        },
+        {
+          "name": "add_event",
+          "arguments": {
+            "events": [
+              {
+                "title": "Brunch",
+                "description": null,
+                "start": "2026-08-30T17:00:00Z",
+                "end": "2026-08-30T18:30:00Z",
+                "location": null,
+                "category": "personal"
+              }
+            ]
+          }
+        }
+      ],
+      "response": "got it, brunch is Sunday 12\u20131:30 PM",
+      "error": null,
+      "usage": {
+        "kind": "agent",
+        "input_tokens": 10442,
+        "cached_tokens": 9933,
+        "cache_write_tokens": 0,
+        "output_tokens": 120,
+        "total_tokens": 10562,
+        "estimated_cost_usd": 0.0044446,
+        "calls": 3
+      }
+    },
+    {
+      "id": "relative_after_lunch",
+      "category": "relative_dates",
+      "message": "block coffee with Sam tomorrow afternoon for 45 minutes",
+      "expected": [
+        "resolve_date",
+        "add_event"
+      ],
+      "observed": [
+        "resolve_date",
+        "add_event"
+      ],
+      "passed": true,
+      "call_details": [
+        {
+          "name": "resolve_date",
+          "arguments": {
+            "phrase": "tomorrow afternoon"
+          }
+        },
+        {
+          "name": "add_event",
+          "arguments": {
+            "events": [
+              {
+                "title": "Coffee with Sam",
+                "description": null,
+                "start": "2026-08-27T20:00:00Z",
+                "end": "2026-08-27T20:45:00Z",
+                "location": null,
+                "category": "personal"
+              }
+            ]
+          }
+        }
+      ],
+      "response": "Coffee with Sam is on Thursday, 3:00\u20133:45 PM.",
+      "error": null,
+      "usage": {
+        "kind": "agent",
+        "input_tokens": 10446,
+        "cached_tokens": 9933,
+        "cache_write_tokens": 0,
+        "output_tokens": 125,
+        "total_tokens": 10571,
+        "estimated_cost_usd": 0.0045126,
+        "calls": 3
+      }
+    },
+    {
+      "id": "relative_two_weeks",
+      "category": "relative_dates",
+      "message": "portfolio draft due two weeks from today",
+      "expected": [
+        "resolve_date",
+        "add_task"
+      ],
+      "observed": [
+        "resolve_date",
+        "add_task"
+      ],
+      "passed": true,
+      "call_details": [
+        {
+          "name": "resolve_date",
+          "arguments": {
+            "phrase": "two weeks from today"
+          }
+        },
+        {
+          "name": "add_task",
+          "arguments": {
+            "tasks": [
+              {
+                "title": "Finish portfolio draft",
+                "description": null,
+                "deadline": "2026-08-13T00:53:18.957246Z",
+                "estimated_minutes": null,
+                "category": "career",
+                "energy": "deep_focus",
+                "priority": "high",
+                "goal_id": null
+              }
+            ]
+          }
+        }
+      ],
+      "response": "added \u2014 portfolio draft due in two weeks",
+      "error": null,
+      "usage": {
+        "kind": "agent",
+        "input_tokens": 10517,
+        "cached_tokens": 9933,
+        "cache_write_tokens": 0,
+        "output_tokens": 181,
+        "total_tokens": 10698,
+        "estimated_cost_usd": 0.0053266,
+        "calls": 3
+      }
+    },
+    {
+      "id": "relative_month_end",
+      "category": "relative_dates",
+      "message": "renew the lease by the end of the month",
+      "expected": [
+        "resolve_date",
+        "add_task"
+      ],
+      "observed": [
+        "resolve_date",
+        "resolve_date",
+        "add_task"
+      ],
+      "passed": true,
+      "call_details": [
+        {
+          "name": "resolve_date",
+          "arguments": {
+            "phrase": "by the end of the month"
+          }
+        },
+        {
+          "name": "resolve_date",
+          "arguments": {
+            "phrase": "August 31, 2026 at 11:59 PM"
+          }
+        },
+        {
+          "name": "add_task",
+          "arguments": {
+            "tasks": [
+              {
+                "title": "Renew the lease",
+                "description": null,
+                "deadline": "2026-09-01T04:59:00Z",
+                "estimated_minutes": null,
+                "category": "personal",
+                "energy": "light",
+                "priority": "high",
+                "goal_id": null
+              }
+            ]
+          }
+        }
+      ],
+      "response": "added \u2014 due by the end of August.",
+      "error": null,
+      "usage": {
+        "kind": "agent",
+        "input_tokens": 14048,
+        "cached_tokens": 13244,
+        "cache_write_tokens": 0,
+        "output_tokens": 155,
+        "total_tokens": 14203,
+        "estimated_cost_usd": 0.0061168,
+        "calls": 4
+      }
+    },
+    {
+      "id": "relative_next_week",
+      "category": "relative_dates",
+      "message": "schedule a planning meeting next week Tuesday at 10 for an hour",
+      "expected": [
+        "resolve_date",
+        "add_event"
+      ],
+      "observed": [
+        "resolve_date",
+        "resolve_date",
+        "add_event"
+      ],
+      "passed": true,
+      "call_details": [
+        {
+          "name": "resolve_date",
+          "arguments": {
+            "phrase": "next week Tuesday at 10 AM"
+          }
+        },
+        {
+          "name": "resolve_date",
+          "arguments": {
+            "phrase": "next Tuesday at 10"
+          }
+        },
+        {
+          "name": "add_event",
+          "arguments": {
+            "events": [
+              {
+                "title": "Planning meeting",
+                "description": null,
+                "start": "2026-09-01T15:00:00Z",
+                "end": "2026-09-01T16:00:00Z",
+                "location": null,
+                "category": "work"
+              }
+            ]
+          }
+        }
+      ],
+      "response": "got it, planning meeting is Tuesday, Sep 1 from 10\u201311 AM",
+      "error": null,
+      "usage": {
+        "kind": "agent",
+        "input_tokens": 14149,
+        "cached_tokens": 13244,
+        "cache_write_tokens": 0,
+        "output_tokens": 246,
+        "total_tokens": 14395,
+        "estimated_cost_usd": 0.0074108,
+        "calls": 4
+      }
+    },
+    {
+      "id": "relative_monday_evening",
+      "category": "relative_dates",
+      "message": "call grandma Monday evening",
+      "expected": [
+        "resolve_date",
+        "add_task"
+      ],
+      "observed": [
+        "resolve_date",
+        "add_task"
+      ],
+      "passed": true,
+      "call_details": [
+        {
+          "name": "resolve_date",
+          "arguments": {
+            "phrase": "Monday evening"
+          }
+        },
+        {
+          "name": "add_task",
+          "arguments": {
+            "tasks": [
+              {
+                "title": "Call grandma",
+                "description": null,
+                "deadline": "2026-09-01T00:00:00Z",
+                "estimated_minutes": null,
+                "category": "personal",
+                "energy": "light",
+                "priority": "medium",
+                "goal_id": null
+              }
+            ]
+          }
+        }
+      ],
+      "response": "added \u2014 call grandma Monday evening",
+      "error": null,
+      "usage": {
+        "kind": "agent",
+        "input_tokens": 10481,
+        "cached_tokens": 9933,
+        "cache_write_tokens": 0,
+        "output_tokens": 140,
+        "total_tokens": 10621,
+        "estimated_cost_usd": 0.0047626000000000005,
+        "calls": 3
+      }
+    },
+    {
+      "id": "relative_midnight",
+      "category": "relative_dates",
+      "message": "the upload is due tomorrow at midnight",
+      "expected": [
+        "resolve_date",
+        "add_task"
+      ],
+      "observed": [
+        "resolve_date",
+        "add_task"
+      ],
+      "passed": true,
+      "call_details": [
+        {
+          "name": "resolve_date",
+          "arguments": {
+            "phrase": "tomorrow at midnight"
+          }
+        },
+        {
+          "name": "add_task",
+          "arguments": {
+            "tasks": [
+              {
+                "title": "Upload",
+                "description": null,
+                "deadline": "2026-08-27T05:00:00Z",
+                "estimated_minutes": null,
+                "category": "school",
+                "energy": "light",
+                "priority": "high",
+                "goal_id": null
+              }
+            ]
+          }
+        }
+      ],
+      "response": "added \u2014 due tomorrow at midnight",
+      "error": null,
+      "usage": {
+        "kind": "agent",
+        "input_tokens": 10556,
+        "cached_tokens": 9933,
+        "cache_write_tokens": 0,
+        "output_tokens": 205,
+        "total_tokens": 10761,
+        "estimated_cost_usd": 0.0056926,
+        "calls": 3
+      }
+    },
+    {
+      "id": "relative_later_today",
+      "category": "relative_dates",
+      "message": "remind me to stretch later today",
+      "expected": [
+        "resolve_date",
+        "add_task"
+      ],
+      "observed": [
+        "resolve_date",
+        "resolve_date",
+        "add_task"
+      ],
+      "passed": true,
+      "call_details": [
+        {
+          "name": "resolve_date",
+          "arguments": {
+            "phrase": "later today"
+          }
+        },
+        {
+          "name": "resolve_date",
+          "arguments": {
+            "phrase": "today"
+          }
+        },
+        {
+          "name": "add_task",
+          "arguments": {
+            "tasks": [
+              {
+                "title": "Stretch",
+                "description": null,
+                "deadline": null,
+                "estimated_minutes": 5,
+                "category": "fitness",
+                "energy": "light",
+                "priority": "medium",
+                "goal_id": null
+              }
+            ]
+          }
+        }
+      ],
+      "response": "added \u2014 stretch later today",
+      "error": null,
+      "usage": {
+        "kind": "agent",
+        "input_tokens": 14160,
+        "cached_tokens": 9933,
+        "cache_write_tokens": 3311,
+        "output_tokens": 234,
+        "total_tokens": 14394,
+        "estimated_cost_usd": 0.0149041,
+        "calls": 4
+      }
+    },
+    {
+      "id": "ambiguous_it",
+      "category": "ambiguous_references",
+      "message": "move it to 4",
+      "expected": [],
+      "observed": [],
+      "passed": true,
+      "call_details": [],
+      "response": "Which thing should I move to 4?",
+      "error": null,
+      "usage": {
+        "kind": "agent",
+        "input_tokens": 3384,
+        "cached_tokens": 3311,
+        "cache_write_tokens": 0,
+        "output_tokens": 28,
+        "total_tokens": 3412,
+        "estimated_cost_usd": 0.0011442,
+        "calls": 1
+      }
+    },
+    {
+      "id": "ambiguous_delete",
+      "category": "ambiguous_references",
+      "message": "delete that thing",
+      "expected": [],
+      "observed": [],
+      "passed": true,
+      "call_details": [],
+      "response": "Which thing do you want deleted?",
+      "error": null,
+      "usage": {
+        "kind": "agent",
+        "input_tokens": 3382,
+        "cached_tokens": 3311,
+        "cache_write_tokens": 0,
+        "output_tokens": 26,
+        "total_tokens": 3408,
+        "estimated_cost_usd": 0.0011162000000000001,
+        "calls": 1
+      }
+    },
+    {
+      "id": "ambiguous_task_name",
+      "category": "ambiguous_references",
+      "message": "mark the report done",
+      "expected": [
+        "query_tasks",
+        "complete_task"
+      ],
+      "observed": [
+        "query_tasks",
+        "complete_task"
+      ],
+      "passed": true,
+      "call_details": [
+        {
+          "name": "query_tasks",
+          "arguments": {
+            "status": "pending",
+            "category": null,
+            "due_before": null,
+            "due_after": null
+          }
+        },
+        {
+          "name": "complete_task",
+          "arguments": {
+            "task_id": 12,
+            "actual_minutes": null
+          }
+        }
+      ],
+      "response": "done \u2014 marked the pset report complete.",
+      "error": null,
+      "usage": {
+        "kind": "agent",
+        "input_tokens": 10347,
+        "cached_tokens": 9933,
+        "cache_write_tokens": 0,
+        "output_tokens": 82,
+        "total_tokens": 10429,
+        "estimated_cost_usd": 0.0037986,
+        "calls": 3
+      }
+    },
+    {
+      "id": "ambiguous_event_name",
+      "category": "ambiguous_references",
+      "message": "cancel the dentist appointment",
+      "expected": [
+        "query_schedule",
+        "delete_event"
+      ],
+      "observed": [
+        "query_schedule",
+        "delete_event"
+      ],
+      "passed": true,
+      "call_details": [
+        {
+          "name": "query_schedule",
+          "arguments": {
+            "start": "2026-08-27T00:54:00Z",
+            "end": "2027-08-27T00:54:00Z"
+          }
+        },
+        {
+          "name": "delete_event",
+          "arguments": {
+            "event_id": 21
+          }
+        }
+      ],
+      "response": "deleted the dentist appointment",
+      "error": null,
+      "usage": {
+        "kind": "agent",
+        "input_tokens": 10544,
+        "cached_tokens": 9933,
+        "cache_write_tokens": 0,
+        "output_tokens": 145,
+        "total_tokens": 10689,
+        "estimated_cost_usd": 0.0049486,
+        "calls": 3
+      }
+    },
+    {
+      "id": "ambiguous_why",
+      "category": "ambiguous_references",
+      "message": "why is the pset there?",
+      "expected": [
+        "query_tasks",
+        "explain_schedule"
+      ],
+      "observed": [
+        "query_tasks",
+        "explain_schedule"
+      ],
+      "passed": true,
+      "call_details": [
+        {
+          "name": "query_tasks",
+          "arguments": {
+            "status": null,
+            "category": "school",
+            "due_before": null,
+            "due_after": null
+          }
+        },
+        {
+          "name": "explain_schedule",
+          "arguments": {
+            "task_id": 12
+          }
+        }
+      ],
+      "response": "Because the Friday deadline made it the only 90-minute gap.",
+      "error": null,
+      "usage": {
+        "kind": "agent",
+        "input_tokens": 10417,
+        "cached_tokens": 9933,
+        "cache_write_tokens": 0,
+        "output_tokens": 107,
+        "total_tokens": 10524,
+        "estimated_cost_usd": 0.0042386,
+        "calls": 3
+      }
+    },
+    {
+      "id": "ambiguous_fact",
+      "category": "ambiguous_references",
+      "message": "that gym preference is wrong",
+      "expected": [
+        "query_facts"
+      ],
+      "observed": [
+        "query_facts"
+      ],
+      "passed": true,
+      "call_details": [
+        {
+          "name": "query_facts",
+          "arguments": {
+            "category": null,
+            "active": true,
+            "min_confidence": null
+          }
+        }
+      ],
+      "response": "What\u2019s the right gym preference?",
+      "error": null,
+      "usage": {
+        "kind": "agent",
+        "input_tokens": 6879,
+        "cached_tokens": 6622,
+        "cache_write_tokens": 0,
+        "output_tokens": 90,
+        "total_tokens": 6969,
+        "estimated_cost_usd": 0.0029184,
+        "calls": 2
+      }
+    },
+    {
+      "id": "ambiguous_goal",
+      "category": "ambiguous_references",
+      "message": "log one session toward my gym goal",
+      "expected": [
+        "query_goals",
+        "log_goal_progress"
+      ],
+      "observed": [
+        "query_goals",
+        "log_goal_progress"
+      ],
+      "passed": true,
+      "call_details": [
+        {
+          "name": "query_goals",
+          "arguments": {
+            "active": true,
+            "category": "fitness"
+          }
+        },
+        {
+          "name": "log_goal_progress",
+          "arguments": {
+            "goal_id": 5,
+            "amount": 1,
+            "source": "manual",
+            "logged_at": "2026-08-27T00:54:00Z"
+          }
+        }
+      ],
+      "response": "logged \u2014 gym goal is complete for the week.",
+      "error": null,
+      "usage": {
+        "kind": "agent",
+        "input_tokens": 10402,
+        "cached_tokens": 9933,
+        "cache_write_tokens": 0,
+        "output_tokens": 130,
+        "total_tokens": 10532,
+        "estimated_cost_usd": 0.0044846,
+        "calls": 3
+      }
+    },
+    {
+      "id": "correct_task_deadline",
+      "category": "corrections",
+      "message": "actually make it due Saturday",
+      "expected": [
+        "resolve_date",
+        "update_task"
+      ],
+      "observed": [
+        "resolve_date",
+        "update_task"
+      ],
+      "passed": true,
+      "call_details": [
+        {
+          "name": "resolve_date",
+          "arguments": {
+            "phrase": "Saturday"
+          }
+        },
+        {
+          "name": "update_task",
+          "arguments": {
+            "task_id": 12,
+            "title": null,
+            "description": null,
+            "deadline": "2026-08-29T05:00:00Z",
+            "estimated_minutes": null,
+            "category": null,
+            "energy": null,
+            "priority": null,
+            "status": null,
+            "goal_id": null,
+            "clear_fields": []
+          }
+        }
+      ],
+      "response": "done \u2014 report is due Saturday.",
+      "error": null,
+      "usage": {
+        "kind": "agent",
+        "input_tokens": 10524,
+        "cached_tokens": 9933,
+        "cache_write_tokens": 0,
+        "output_tokens": 129,
+        "total_tokens": 10653,
+        "estimated_cost_usd": 0.0047166,
+        "calls": 3
+      }
+    },
+    {
+      "id": "correct_task_title",
+      "category": "corrections",
+      "message": "call task 12 quarterly report instead",
+      "expected": [
+        "update_task"
+      ],
+      "observed": [
+        "update_task"
+      ],
+      "passed": true,
+      "call_details": [
+        {
+          "name": "update_task",
+          "arguments": {
+            "task_id": 12,
+            "title": "Quarterly report",
+            "description": null,
+            "deadline": null,
+            "estimated_minutes": null,
+            "category": null,
+            "energy": null,
+            "priority": null,
+            "status": null,
+            "goal_id": null,
+            "clear_fields": []
+          }
+        }
+      ],
+      "response": "done \u2014 renamed it \u201cQuarterly report.\u201d",
+      "error": null,
+      "usage": {
+        "kind": "agent",
+        "input_tokens": 6893,
+        "cached_tokens": 6622,
+        "cache_write_tokens": 0,
+        "output_tokens": 76,
+        "total_tokens": 6969,
+        "estimated_cost_usd": 0.0027784000000000003,
+        "calls": 2
+      }
+    },
+    {
+      "id": "correct_event_time",
+      "category": "corrections",
+      "message": "actually move event 21 to 4pm tomorrow",
+      "expected": [
+        "resolve_date",
+        "update_event"
+      ],
+      "observed": [
+        "resolve_date",
+        "query_schedule",
+        "update_event"
+      ],
+      "passed": true,
+      "call_details": [
+        {
+          "name": "resolve_date",
+          "arguments": {
+            "phrase": "tomorrow at 4pm"
+          }
+        },
+        {
+          "name": "query_schedule",
+          "arguments": {
+            "start": "2026-08-27T00:00:00-05:00",
+            "end": "2026-08-28T00:00:00-05:00"
+          }
+        },
+        {
+          "name": "update_event",
+          "arguments": {
+            "event_id": 21,
+            "title": null,
+            "description": null,
+            "start": "2026-08-27T21:00:00Z",
+            "end": "2026-08-27T22:00:00Z",
+            "location": null,
+            "category": null,
+            "clear_fields": []
+          }
+        }
+      ],
+      "response": "moved it to tomorrow, 4\u20135 PM",
+      "error": null,
+      "usage": {
+        "kind": "agent",
+        "input_tokens": 14355,
+        "cached_tokens": 13244,
+        "cache_write_tokens": 0,
+        "output_tokens": 247,
+        "total_tokens": 14602,
+        "estimated_cost_usd": 0.0078348,
+        "calls": 4
+      }
+    },
+    {
+      "id": "correct_duration",
+      "category": "corrections",
+      "message": "task 12 takes 90 minutes, not 30",
+      "expected": [
+        "update_task"
+      ],
+      "observed": [
+        "update_task"
+      ],
+      "passed": true,
+      "call_details": [
+        {
+          "name": "update_task",
+          "arguments": {
+            "task_id": 12,
+            "title": null,
+            "description": null,
+            "deadline": null,
+            "estimated_minutes": 90,
+            "category": null,
+            "energy": null,
+            "priority": null,
+            "status": null,
+            "goal_id": null,
+            "clear_fields": []
+          }
+        }
+      ],
+      "response": "updated \u2014 90 minutes.",
+      "error": null,
+      "usage": {
+        "kind": "agent",
+        "input_tokens": 6913,
+        "cached_tokens": 6622,
+        "cache_write_tokens": 0,
+        "output_tokens": 85,
+        "total_tokens": 6998,
+        "estimated_cost_usd": 0.0029264,
+        "calls": 2
+      }
+    },
+    {
+      "id": "correct_completion",
+      "category": "corrections",
+      "message": "I didn't finish task 12 \u2014 put it back to pending",
+      "expected": [
+        "update_task"
+      ],
+      "observed": [
+        "update_task"
+      ],
+      "passed": true,
+      "call_details": [
+        {
+          "name": "update_task",
+          "arguments": {
+            "task_id": 12,
+            "title": null,
+            "description": null,
+            "deadline": null,
+            "estimated_minutes": null,
+            "category": null,
+            "energy": null,
+            "priority": null,
+            "status": "pending",
+            "goal_id": null,
+            "clear_fields": []
+          }
+        }
+      ],
+      "response": "put task 12 back to pending",
+      "error": null,
+      "usage": {
+        "kind": "agent",
+        "input_tokens": 6899,
+        "cached_tokens": 6622,
+        "cache_write_tokens": 0,
+        "output_tokens": 86,
+        "total_tokens": 6985,
+        "estimated_cost_usd": 0.0029104,
+        "calls": 2
+      }
+    },
+    {
+      "id": "correct_fact",
+      "category": "corrections",
+      "message": "fact 7 should say I prefer workouts after 9am",
+      "expected": [
+        "update_fact"
+      ],
+      "observed": [
+        "update_fact"
+      ],
+      "passed": true,
+      "call_details": [
+        {
+          "name": "update_fact",
+          "arguments": {
+            "fact_id": 7,
+            "content": "Prefers workouts after 9am.",
+            "category": null,
+            "confidence": null,
+            "active": null
+          }
+        }
+      ],
+      "response": "updated \u2014 workouts after 9am.",
+      "error": null,
+      "usage": {
+        "kind": "agent",
+        "input_tokens": 6890,
+        "cached_tokens": 6622,
+        "cache_write_tokens": 0,
+        "output_tokens": 68,
+        "total_tokens": 6958,
+        "estimated_cost_usd": 0.0026764000000000002,
+        "calls": 2
+      }
+    },
+    {
+      "id": "context_move_event",
+      "category": "multi_turn_context",
+      "message": "move it to 4",
+      "expected": [
+        "update_event"
+      ],
+      "observed": [
+        "resolve_date",
+        "query_schedule",
+        "update_event"
+      ],
+      "passed": true,
+      "call_details": [
+        {
+          "name": "resolve_date",
+          "arguments": {
+            "phrase": "tomorrow at 4 PM"
+          }
+        },
+        {
+          "name": "query_schedule",
+          "arguments": {
+            "start": "2026-08-27T00:00:00-05:00",
+            "end": "2026-08-28T00:00:00-05:00"
+          }
+        },
+        {
+          "name": "update_event",
+          "arguments": {
+            "event_id": 21,
+            "title": null,
+            "description": null,
+            "start": "2026-08-28T21:00:00Z",
+            "end": "2026-08-28T22:00:00Z",
+            "location": null,
+            "category": null,
+            "clear_fields": []
+          }
+        }
+      ],
+      "response": "moved dentist to 4\u20135 Friday.",
+      "error": null,
+      "usage": {
+        "kind": "agent",
+        "input_tokens": 14854,
+        "cached_tokens": 9933,
+        "cache_write_tokens": 3311,
+        "output_tokens": 500,
+        "total_tokens": 15354,
+        "estimated_cost_usd": 0.0194841,
+        "calls": 4
+      }
+    },
+    {
+      "id": "context_complete_task",
+      "category": "multi_turn_context",
+      "message": "done with it, took 40 minutes",
+      "expected": [
+        "complete_task"
+      ],
+      "observed": [
+        "complete_task"
+      ],
+      "passed": true,
+      "call_details": [
+        {
+          "name": "complete_task",
+          "arguments": {
+            "task_id": 12,
+            "actual_minutes": 40
+          }
+        }
+      ],
+      "response": "nice, marked it done at 40 minutes",
+      "error": null,
+      "usage": {
+        "kind": "agent",
+        "input_tokens": 6888,
+        "cached_tokens": 6622,
+        "cache_write_tokens": 0,
+        "output_tokens": 57,
+        "total_tokens": 6945,
+        "estimated_cost_usd": 0.0025404,
+        "calls": 2
+      }
+    },
+    {
+      "id": "context_delete_event",
+      "category": "multi_turn_context",
+      "message": "delete that one",
+      "expected": [
+        "delete_event"
+      ],
+      "observed": [
+        "delete_event"
+      ],
+      "passed": true,
+      "call_details": [
+        {
+          "name": "delete_event",
+          "arguments": {
+            "event_id": 21
+          }
+        }
+      ],
+      "response": "deleted",
+      "error": null,
+      "usage": {
+        "kind": "agent",
+        "input_tokens": 6867,
+        "cached_tokens": 6622,
+        "cache_write_tokens": 0,
+        "output_tokens": 44,
+        "total_tokens": 6911,
+        "estimated_cost_usd": 0.0023424,
+        "calls": 2
+      }
+    },
+    {
+      "id": "context_goal_progress",
+      "category": "multi_turn_context",
+      "message": "log another session",
+      "expected": [
+        "log_goal_progress"
+      ],
+      "observed": [
+        "log_goal_progress"
+      ],
+      "passed": true,
+      "call_details": [
+        {
+          "name": "log_goal_progress",
+          "arguments": {
+            "goal_id": 5,
+            "amount": 1,
+            "source": "manual",
+            "logged_at": "2026-08-27T00:55:00Z"
+          }
+        }
+      ],
+      "response": "nice, logged another gym session",
+      "error": null,
+      "usage": {
+        "kind": "agent",
+        "input_tokens": 6922,
+        "cached_tokens": 6622,
+        "cache_write_tokens": 0,
+        "output_tokens": 113,
+        "total_tokens": 7035,
+        "estimated_cost_usd": 0.0032804,
+        "calls": 2
+      }
+    },
+    {
+      "id": "context_schedule",
+      "category": "multi_turn_context",
+      "message": "put it in that gap",
+      "expected": [
+        "schedule_task"
+      ],
+      "observed": [
+        "find_free_blocks",
+        "schedule_task"
+      ],
+      "passed": true,
+      "call_details": [
+        {
+          "name": "find_free_blocks",
+          "arguments": {
+            "start": "2026-08-27T20:00:00Z",
+            "end": "2026-08-27T22:00:00Z",
+            "min_minutes": 120
+          }
+        },
+        {
+          "name": "schedule_task",
+          "arguments": {
+            "task_id": 12,
+            "start": "2026-08-27T20:00:00Z",
+            "end": "2026-08-27T22:00:00Z",
+            "reasoning": "This is the open two-hour gap before dinner, giving the pset the uninterrupted focus time it needs.",
+            "trigger": "user_request"
+          }
+        }
+      ],
+      "response": "put it there \u2014 it\u2019s the open two-hour focus block before dinner.",
+      "error": null,
+      "usage": {
+        "kind": "agent",
+        "input_tokens": 10695,
+        "cached_tokens": 9933,
+        "cache_write_tokens": 0,
+        "output_tokens": 198,
+        "total_tokens": 10893,
+        "estimated_cost_usd": 0.0058866,
+        "calls": 3
+      }
+    },
+    {
+      "id": "context_why",
+      "category": "multi_turn_context",
+      "message": "why there?",
+      "expected": [
+        "explain_schedule"
+      ],
+      "observed": [
+        "explain_schedule"
+      ],
+      "passed": true,
+      "call_details": [
+        {
+          "name": "explain_schedule",
+          "arguments": {
+            "task_id": 12
+          }
+        }
+      ],
+      "response": "Because the Friday deadline made that your only 90-minute gap.",
+      "error": null,
+      "usage": {
+        "kind": "agent",
+        "input_tokens": 6873,
+        "cached_tokens": 6622,
+        "cache_write_tokens": 0,
+        "output_tokens": 51,
+        "total_tokens": 6924,
+        "estimated_cost_usd": 0.0024384000000000003,
+        "calls": 2
+      }
+    },
+    {
+      "id": "query_day",
+      "category": "cross_domain_queries",
+      "message": "what's on my schedule and due tomorrow?",
+      "expected": [
+        "query_schedule",
+        "query_tasks"
+      ],
+      "observed": [
+        "resolve_date",
+        "query_schedule",
+        "query_tasks",
+        "query_tasks"
+      ],
+      "passed": true,
+      "call_details": [
+        {
+          "name": "resolve_date",
+          "arguments": {
+            "phrase": "tomorrow"
+          }
+        },
+        {
+          "name": "query_schedule",
+          "arguments": {
+            "start": "2026-08-27T05:00:00Z",
+            "end": "2026-08-28T05:00:00Z"
+          }
+        },
+        {
+          "name": "query_tasks",
+          "arguments": {
+            "status": "pending",
+            "category": null,
+            "due_before": "2026-08-28T05:00:00Z",
+            "due_after": "2026-08-27T05:00:00Z"
+          }
+        },
+        {
+          "name": "query_tasks",
+          "arguments": {
+            "status": "scheduled",
+            "category": null,
+            "due_before": "2026-08-28T05:00:00Z",
+            "due_after": "2026-08-27T05:00:00Z"
+          }
+        }
+      ],
+      "response": "Tomorrow\u2019s calendar is clear. Due: **pset report** (about 90 min).",
+      "error": null,
+      "usage": {
+        "kind": "agent",
+        "input_tokens": 10735,
+        "cached_tokens": 9933,
+        "cache_write_tokens": 0,
+        "output_tokens": 434,
+        "total_tokens": 11169,
+        "estimated_cost_usd": 0.0087986,
+        "calls": 3
+      }
+    },
+    {
+      "id": "query_week_goals",
+      "category": "cross_domain_queries",
+      "message": "show my week, pending tasks, and goal progress",
+      "expected": [
+        "query_schedule",
+        "query_tasks",
+        "query_goals"
+      ],
+      "observed": [
+        "resolve_date",
+        "query_schedule",
+        "query_tasks",
+        "query_goals"
+      ],
+      "passed": true,
+      "call_details": [
+        {
+          "name": "resolve_date",
+          "arguments": {
+            "phrase": "this week"
+          }
+        },
+        {
+          "name": "query_schedule",
+          "arguments": {
+            "start": "2026-08-24T05:00:00Z",
+            "end": "2026-08-31T05:00:00Z"
+          }
+        },
+        {
+          "name": "query_tasks",
+          "arguments": {
+            "status": "pending",
+            "category": null,
+            "due_before": null,
+            "due_after": null
+          }
+        },
+        {
+          "name": "query_goals",
+          "arguments": {
+            "active": true,
+            "category": null
+          }
+        }
+      ],
+      "response": "This week: dentist Friday, 2\u20133 PM.\n\nPending: pset report \u2014 90 min.\n\nGym goal: 1 session left this week.",
+      "error": null,
+      "usage": {
+        "kind": "agent",
+        "input_tokens": 10704,
+        "cached_tokens": 9933,
+        "cache_write_tokens": 0,
+        "output_tokens": 263,
+        "total_tokens": 10967,
+        "estimated_cost_usd": 0.0066846,
+        "calls": 3
+      }
+    },
+    {
+      "id": "query_fitness",
+      "category": "cross_domain_queries",
+      "message": "how are my fitness tasks and goals looking?",
+      "expected": [
+        "query_tasks",
+        "query_goals"
+      ],
+      "observed": [
+        "query_tasks",
+        "query_goals"
+      ],
+      "passed": true,
+      "call_details": [
+        {
+          "name": "query_tasks",
+          "arguments": {
+            "status": null,
+            "category": "fitness",
+            "due_before": null,
+            "due_after": null
+          }
+        },
+        {
+          "name": "query_goals",
+          "arguments": {
+            "active": true,
+            "category": "fitness"
+          }
+        }
+      ],
+      "response": "Fitness goal: gym has 1 session left this week.\n\nOne pending fitness task: **pset report** (90 min).",
+      "error": null,
+      "usage": {
+        "kind": "agent",
+        "input_tokens": 6938,
+        "cached_tokens": 6622,
+        "cache_write_tokens": 0,
+        "output_tokens": 205,
+        "total_tokens": 7143,
+        "estimated_cost_usd": 0.0044164,
+        "calls": 2
+      }
+    },
+    {
+      "id": "query_availability",
+      "category": "cross_domain_queries",
+      "message": "am I free Friday afternoon and what tasks could fit?",
+      "expected": [
+        "resolve_date",
+        "query_schedule",
+        "query_tasks"
+      ],
+      "observed": [
+        "resolve_date",
+        "query_schedule",
+        "query_tasks",
+        "query_tasks"
+      ],
+      "passed": true,
+      "call_details": [
+        {
+          "name": "resolve_date",
+          "arguments": {
+            "phrase": "Friday afternoon"
+          }
+        },
+        {
+          "name": "query_schedule",
+          "arguments": {
+            "start": "2026-08-28T17:00:00Z",
+            "end": "2026-08-28T22:00:00Z"
+          }
+        },
+        {
+          "name": "query_tasks",
+          "arguments": {
+            "status": "pending",
+            "category": null,
+            "due_before": null,
+            "due_after": null
+          }
+        },
+        {
+          "name": "query_tasks",
+          "arguments": {
+            "status": "scheduled",
+            "category": null,
+            "due_before": null,
+            "due_after": null
+          }
+        }
+      ],
+      "response": "You\u2019re free 12\u20132 and 3\u20135 Friday afternoon; dentist is 2\u20133. Your 90-minute pset report fits in either gap.",
+      "error": null,
+      "usage": {
+        "kind": "agent",
+        "input_tokens": 10664,
+        "cached_tokens": 9933,
+        "cache_write_tokens": 0,
+        "output_tokens": 288,
+        "total_tokens": 10952,
+        "estimated_cost_usd": 0.0069045999999999995,
+        "calls": 3
+      }
+    },
+    {
+      "id": "query_why_goal",
+      "category": "cross_domain_queries",
+      "message": "why is the pset scheduled there and am I behind on any goals?",
+      "expected": [
+        "query_tasks",
+        "query_goals",
+        "explain_schedule"
+      ],
+      "observed": [
+        "query_tasks",
+        "query_goals",
+        "explain_schedule"
+      ],
+      "passed": true,
+      "call_details": [
+        {
+          "name": "query_tasks",
+          "arguments": {
+            "status": null,
+            "category": null,
+            "due_before": null,
+            "due_after": null
+          }
+        },
+        {
+          "name": "query_goals",
+          "arguments": {
+            "active": true,
+            "category": null
+          }
+        },
+        {
+          "name": "explain_schedule",
+          "arguments": {
+            "task_id": 12
+          }
+        }
+      ],
+      "response": "The pset\u2019s there because it was the only 90-minute gap before Friday\u2019s deadline.\n\nYou\u2019ve got 1 gym session left for this week.",
+      "error": null,
+      "usage": {
+        "kind": "agent",
+        "input_tokens": 10673,
+        "cached_tokens": 9933,
+        "cache_write_tokens": 0,
+        "output_tokens": 233,
+        "total_tokens": 10906,
+        "estimated_cost_usd": 0.0062626,
+        "calls": 3
+      }
+    },
+    {
+      "id": "query_everything",
+      "category": "cross_domain_queries",
+      "message": "give me today's events, scheduled work, pending tasks, and active goals",
+      "expected": [
+        "query_schedule",
+        "query_tasks",
+        "query_goals"
+      ],
+      "observed": [
+        "query_schedule",
+        "query_tasks",
+        "query_goals"
+      ],
+      "passed": true,
+      "call_details": [
+        {
+          "name": "query_schedule",
+          "arguments": {
+            "start": "2026-08-26T05:00:00Z",
+            "end": "2026-08-27T05:00:00Z"
+          }
+        },
+        {
+          "name": "query_tasks",
+          "arguments": {
+            "status": "pending",
+            "category": null,
+            "due_before": null,
+            "due_after": null
+          }
+        },
+        {
+          "name": "query_goals",
+          "arguments": {
+            "active": true,
+            "category": null
+          }
+        }
+      ],
+      "response": "Today: no events or scheduled work.\n\nPending: pset report \u2014 90 min  \nActive goal: gym \u2014 1 session remaining this week",
+      "error": null,
+      "usage": {
+        "kind": "agent",
+        "input_tokens": 7044,
+        "cached_tokens": 6622,
+        "cache_write_tokens": 0,
+        "output_tokens": 226,
+        "total_tokens": 7270,
+        "estimated_cost_usd": 0.0048804,
+        "calls": 2
+      }
+    }
+  ]
+}

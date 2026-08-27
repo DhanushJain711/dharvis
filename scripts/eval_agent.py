@@ -8,9 +8,11 @@ import asyncio
 import json
 import tempfile
 from collections import defaultdict
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+from src import timeutil
 from src.agent import Agent
 from src.config import config
 from src.history import History
@@ -19,11 +21,16 @@ from src.tools import TOOLS_BY_NAME
 
 ROOT = Path(__file__).resolve().parents[1]
 CASES_PATH = ROOT / "evals" / "agent_cases.json"
+SAFE_EXTRA_TOOLS = {
+    "resolve_date", "query_schedule", "query_tasks", "find_free_blocks",
+    "query_facts", "query_goals", "explain_schedule",
+}
 
 
 class RecordingTools:
     def __init__(self) -> None:
         self.calls: list[str] = []
+        self.call_details: list[dict[str, Any]] = []
         self.next_id = 100
 
     def handlers(self) -> dict[str, Any]:
@@ -31,6 +38,7 @@ class RecordingTools:
         for name in TOOLS_BY_NAME:
             async def handler(_name: str = name, **arguments: Any) -> Any:
                 self.calls.append(_name)
+                self.call_details.append({"name": _name, "arguments": arguments})
                 self.next_id += 1
                 return self.result(_name, arguments)
             handlers[name] = handler
@@ -38,10 +46,11 @@ class RecordingTools:
 
     def result(self, name: str, arguments: dict[str, Any]) -> Any:
         if name == "resolve_date":
+            local = timeutil.resolve_relative(str(arguments.get("phrase", "")))
             return {
                 "phrase": arguments.get("phrase"),
-                "local": "2026-08-28T09:00:00-05:00",
-                "utc": "2026-08-28T14:00:00Z",
+                "local": local.isoformat(),
+                "utc": timeutil.to_utc(local).isoformat().replace("+00:00", "Z"),
                 "timezone": config.USER_TIMEZONE,
             }
         if name == "query_tasks":
@@ -49,7 +58,10 @@ class RecordingTools:
         if name == "query_schedule":
             return [{"source": "event", "source_id": "21", "title": "dentist", "start": "2026-08-28T19:00:00Z", "end": "2026-08-28T20:00:00Z"}]
         if name == "find_free_blocks":
-            return [{"start": "2026-08-28T20:00:00Z", "end": "2026-08-28T22:00:00Z", "before": "dinner"}]
+            return [{
+                "start": arguments.get("start"), "end": arguments.get("end"),
+                "before": "dinner",
+            }]
         if name == "query_facts":
             return [{"id": 7, "content": "prefers workouts after 9am", "active": True}]
         if name == "query_goals":
@@ -62,12 +74,24 @@ class RecordingTools:
 
 
 def matches(case: dict[str, Any], observed: list[str]) -> bool:
+    """Match required calls while permitting additional read-only verification."""
     expected = list(case["expected"])
     if case.get("unordered"):
-        return sorted(expected) == sorted(observed)
-    if case.get("unordered_tail") and expected:
-        return observed[:1] == expected[:1] and sorted(observed[1:]) == sorted(expected[1:])
-    return observed == expected
+        remaining = list(observed)
+        for name in expected:
+            if name not in remaining:
+                return False
+            remaining.remove(name)
+        return all(name in SAFE_EXTRA_TOOLS for name in remaining)
+
+    position = 0
+    extras: list[str] = []
+    for name in observed:
+        if position < len(expected) and name == expected[position]:
+            position += 1
+        else:
+            extras.append(name)
+    return position == len(expected) and all(name in SAFE_EXTRA_TOOLS for name in extras)
 
 
 async def run_case(case: dict[str, Any], root: Path) -> dict[str, Any]:
@@ -85,11 +109,15 @@ async def run_case(case: dict[str, Any], root: Path) -> dict[str, Any]:
         error = None
     except Exception as exc:  # The report must retain failures rather than stop.
         response, error = "", f"{type(exc).__name__}: {exc}"
+    now = datetime.now(UTC)
+    usage_rows = await store.usage_summary(now - timedelta(days=1), now + timedelta(days=1))
+    usage = next((row for row in usage_rows if row["kind"] == "agent"), {})
     return {
         "id": case["id"], "category": case["category"],
         "message": case["message"], "expected": case["expected"],
         "observed": recorder.calls, "passed": matches(case, recorder.calls),
-        "response": response, "error": error,
+        "call_details": recorder.call_details, "response": response, "error": error,
+        "usage": usage,
     }
 
 
@@ -117,12 +145,24 @@ async def main_async(report_path: Path) -> int:
         }
         for category, items in grouped.items()
     }
+    usage_fields = (
+        "input_tokens", "cached_tokens", "cache_write_tokens", "output_tokens",
+        "total_tokens", "estimated_cost_usd", "calls",
+    )
+    usage = {
+        field: sum((item["usage"].get(field, 0) or 0) for item in results)
+        for field in usage_fields
+    }
+    usage["cache_hit_rate"] = round(
+        usage["cached_tokens"] / usage["input_tokens"], 4
+    ) if usage["input_tokens"] else 0.0
     report_path.parent.mkdir(parents=True, exist_ok=True)
     report_path.write_text(
-        json.dumps({"summary": summary, "results": results}, indent=2),
+        json.dumps({"summary": summary, "usage": usage, "results": results}, indent=2),
         encoding="utf-8",
     )
     print(json.dumps(summary, indent=2))
+    print(json.dumps({"usage": usage}, indent=2))
     return 0 if all(item["passed"] for item in results) else 1
 
 

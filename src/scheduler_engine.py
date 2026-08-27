@@ -251,6 +251,11 @@ class SchedulerEngine:
             "real priority ordering in the facts even when paper priority differs. Every reasoning "
             "field must name the concrete constraint that drove it: a deadline, duration or block "
             "boundary, energy/time-of-day match, cited habit fact, behind goal quota, or priority. "
+            "Before emitting an assignment, verify its reason contains at least one literal value "
+            "from the supplied data: the exact task or block minutes, deadline, bounded-by label, "
+            "energy plus matching time of day, cited fact content, quota remaining, or priority. "
+            "When no stronger habit or quota applies, use the exact duration comparison and deadline; "
+            "for example, 'the 45-minute task fits the 75-minute block and ends before its Friday deadline.' "
             "Generic claims like 'good slot' or restating the assignment are invalid. facts_used "
             "may contain only IDs from supplied facts and every cited fact must be explicitly tied "
             "to the wording of the reason. Never claim a duration, weekday, time of day, energy, "
@@ -449,7 +454,7 @@ class SchedulerEngine:
         block_minutes = int((block.end - block.start).total_seconds() // 60)
         quantity_minutes: list[int] = []
         for amount, unit in re.findall(
-            r"\b(\d+)\s*(minutes?|mins?|m|hours?|hrs?|h)\b", lower
+            r"\b(\d+)\s*(?:-\s*)?(minutes?|mins?|m|hours?|hrs?|h)\b", lower
         ):
             quantity_minutes.append(int(amount) * (60 if unit.startswith("h") else 1))
         word_amounts = {
@@ -597,7 +602,7 @@ class SchedulerEngine:
                 reason, task, placement_block, fact_ids, facts_by_id, goals
             ):
                 raise SchedulingPlanError(
-                    f"task {task_id} reasoning does not name a true constraint"
+                    f"task {task_id} reasoning does not name a true constraint: {reason!r}"
                 )
             deadline = task.get("deadline")
             if deadline is not None and end > _utc(deadline, f"task {task_id} deadline"):

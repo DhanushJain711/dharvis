@@ -1,0 +1,559 @@
+{
+  "summary": {
+    "passed": 20,
+    "total": 20
+  },
+  "usage": {
+    "kind": "background",
+    "input_tokens": 17091,
+    "cached_tokens": 0,
+    "cache_write_tokens": 0,
+    "output_tokens": 3546,
+    "total_tokens": 20637,
+    "estimated_cost_usd": 0.076734,
+    "calls": 25,
+    "cache_hit_rate": 0.0
+  },
+  "results": [
+    {
+      "task_id": 1,
+      "day": "2026-08-27",
+      "start": "2026-08-27T14:00:00+00:00",
+      "reasoning": "The 30-minute deep_focus task is scheduled in the 60-minute only_block because fact 1 says \"deep work usually happens before lunch,\" and this block runs from 2026-08-27T14:00:00+00:00 to 2026-08-27T15:00:00+00:00.",
+      "facts_used": [
+        1
+      ],
+      "why_chain": [
+        {
+          "id": 1,
+          "task_id": 1,
+          "decided_at": "2026-08-27T00:59:03.171000Z",
+          "action": "scheduled",
+          "start": "2026-08-27T14:00:00Z",
+          "end": "2026-08-27T14:30:00Z",
+          "previous_start": null,
+          "previous_end": null,
+          "trigger": "daily_plan",
+          "reasoning": "The 30-minute deep_focus task is scheduled in the 60-minute only_block because fact 1 says \"deep work usually happens before lunch,\" and this block runs from 2026-08-27T14:00:00+00:00 to 2026-08-27T15:00:00+00:00.",
+          "facts_used": [
+            1
+          ],
+          "surfaced_to_user": false
+        }
+      ],
+      "generic": false,
+      "coherent": true,
+      "passed": true
+    },
+    {
+      "task_id": 2,
+      "day": "2026-08-28",
+      "start": "2026-08-28T16:00:00+00:00",
+      "reasoning": "The 45-minute task fits the 75-minute only_block, which is bounded after by class and ends before its 2026-08-28T20:15:00+00:00 deadline; its deep_focus energy also matches the habit that \"deep work usually happens before lunch.\"",
+      "facts_used": [
+        1
+      ],
+      "why_chain": [
+        {
+          "id": 2,
+          "task_id": 2,
+          "decided_at": "2026-08-27T00:59:05.540000Z",
+          "action": "scheduled",
+          "start": "2026-08-28T16:00:00Z",
+          "end": "2026-08-28T16:45:00Z",
+          "previous_start": null,
+          "previous_end": null,
+          "trigger": "daily_plan",
+          "reasoning": "The 45-minute task fits the 75-minute only_block, which is bounded after by class and ends before its 2026-08-28T20:15:00+00:00 deadline; its deep_focus energy also matches the habit that \"deep work usually happens before lunch.\"",
+          "facts_used": [
+            1
+          ],
+          "surfaced_to_user": false
+        }
+      ],
+      "generic": false,
+      "coherent": true,
+      "passed": true
+    },
+    {
+      "task_id": 3,
+      "day": "2026-08-29",
+      "start": "2026-08-29T19:00:00+00:00",
+      "reasoning": "The 60-minute task fits the 90-minute block and finishes before its 2026-08-30T00:30:00+00:00 deadline; it is high priority.",
+      "facts_used": [],
+      "why_chain": [
+        {
+          "id": 3,
+          "task_id": 3,
+          "decided_at": "2026-08-27T00:59:06.982000Z",
+          "action": "scheduled",
+          "start": "2026-08-29T19:00:00Z",
+          "end": "2026-08-29T20:00:00Z",
+          "previous_start": null,
+          "previous_end": null,
+          "trigger": "daily_plan",
+          "reasoning": "The 60-minute task fits the 90-minute block and finishes before its 2026-08-30T00:30:00+00:00 deadline; it is high priority.",
+          "facts_used": [],
+          "surfaced_to_user": false
+        }
+      ],
+      "generic": false,
+      "coherent": true,
+      "passed": true
+    },
+    {
+      "task_id": 4,
+      "day": "2026-08-30",
+      "start": "2026-08-30T21:00:00+00:00",
+      "reasoning": "The 90-minute task fits the 120-minute only_block and ends before its 2026-08-31T04:00:00+00:00 deadline.",
+      "facts_used": [],
+      "why_chain": [
+        {
+          "id": 4,
+          "task_id": 4,
+          "decided_at": "2026-08-27T00:59:08.391000Z",
+          "action": "scheduled",
+          "start": "2026-08-30T21:00:00Z",
+          "end": "2026-08-30T22:30:00Z",
+          "previous_start": null,
+          "previous_end": null,
+          "trigger": "daily_plan",
+          "reasoning": "The 90-minute task fits the 120-minute only_block and ends before its 2026-08-31T04:00:00+00:00 deadline.",
+          "facts_used": [],
+          "surfaced_to_user": false
+        }
+      ],
+      "generic": false,
+      "coherent": true,
+      "passed": true
+    },
+    {
+      "task_id": 5,
+      "day": "2026-08-31",
+      "start": "2026-09-01T00:00:00+00:00",
+      "reasoning": "The 120-minute task fits the 150-minute only_block, which ends at 2026-09-01T02:30:00+00:00 before the 2026-09-01T04:30:00+00:00 deadline.",
+      "facts_used": [],
+      "why_chain": [
+        {
+          "id": 5,
+          "task_id": 5,
+          "decided_at": "2026-08-27T00:59:14.041000Z",
+          "action": "scheduled",
+          "start": "2026-09-01T00:00:00Z",
+          "end": "2026-09-01T02:00:00Z",
+          "previous_start": null,
+          "previous_end": null,
+          "trigger": "daily_plan",
+          "reasoning": "The 120-minute task fits the 150-minute only_block, which ends at 2026-09-01T02:30:00+00:00 before the 2026-09-01T04:30:00+00:00 deadline.",
+          "facts_used": [],
+          "surfaced_to_user": false
+        }
+      ],
+      "generic": false,
+      "coherent": true,
+      "passed": true
+    },
+    {
+      "task_id": 6,
+      "day": "2026-09-01",
+      "start": "2026-09-01T14:00:00+00:00",
+      "reasoning": "The 30-minute deep_focus task fits the 60-minute only_block, which ends at 2026-09-01T15:00:00+00:00 before its 2026-09-01T18:00:00+00:00 deadline; the block is before lunch, matching the cited habit that deep work usually happens before lunch.",
+      "facts_used": [
+        1
+      ],
+      "why_chain": [
+        {
+          "id": 6,
+          "task_id": 6,
+          "decided_at": "2026-08-27T00:59:16.096000Z",
+          "action": "scheduled",
+          "start": "2026-09-01T14:00:00Z",
+          "end": "2026-09-01T14:30:00Z",
+          "previous_start": null,
+          "previous_end": null,
+          "trigger": "daily_plan",
+          "reasoning": "The 30-minute deep_focus task fits the 60-minute only_block, which ends at 2026-09-01T15:00:00+00:00 before its 2026-09-01T18:00:00+00:00 deadline; the block is before lunch, matching the cited habit that deep work usually happens before lunch.",
+          "facts_used": [
+            1
+          ],
+          "surfaced_to_user": false
+        }
+      ],
+      "generic": false,
+      "coherent": true,
+      "passed": true
+    },
+    {
+      "task_id": 7,
+      "day": "2026-09-02",
+      "start": "2026-09-02T16:00:00+00:00",
+      "reasoning": "The 45-minute task fits the 75-minute only_block and finishes before its 2026-09-02T21:15:00+00:00 deadline.",
+      "facts_used": [],
+      "why_chain": [
+        {
+          "id": 7,
+          "task_id": 7,
+          "decided_at": "2026-08-27T00:59:18.326000Z",
+          "action": "scheduled",
+          "start": "2026-09-02T16:00:00Z",
+          "end": "2026-09-02T16:45:00Z",
+          "previous_start": null,
+          "previous_end": null,
+          "trigger": "daily_plan",
+          "reasoning": "The 45-minute task fits the 75-minute only_block and finishes before its 2026-09-02T21:15:00+00:00 deadline.",
+          "facts_used": [],
+          "surfaced_to_user": false
+        }
+      ],
+      "generic": false,
+      "coherent": true,
+      "passed": true
+    },
+    {
+      "task_id": 8,
+      "day": "2026-08-27",
+      "start": "2026-08-27T19:00:00+00:00",
+      "reasoning": "The 60-minute task fits the 90-minute block and ends before its 2026-08-28T01:30:00+00:00 deadline.",
+      "facts_used": [],
+      "why_chain": [
+        {
+          "id": 8,
+          "task_id": 8,
+          "decided_at": "2026-08-27T00:59:19.876000Z",
+          "action": "scheduled",
+          "start": "2026-08-27T19:00:00Z",
+          "end": "2026-08-27T20:00:00Z",
+          "previous_start": null,
+          "previous_end": null,
+          "trigger": "daily_plan",
+          "reasoning": "The 60-minute task fits the 90-minute block and ends before its 2026-08-28T01:30:00+00:00 deadline.",
+          "facts_used": [],
+          "surfaced_to_user": false
+        }
+      ],
+      "generic": false,
+      "coherent": true,
+      "passed": true
+    },
+    {
+      "task_id": 9,
+      "day": "2026-08-28",
+      "start": "2026-08-28T21:00:00+00:00",
+      "reasoning": "The 90-minute task fits the 120-minute only_block and the block ends at 2026-08-28T23:00:00+00:00, before the 2026-08-29T01:00:00+00:00 deadline.",
+      "facts_used": [],
+      "why_chain": [
+        {
+          "id": 9,
+          "task_id": 9,
+          "decided_at": "2026-08-27T00:59:26.239000Z",
+          "action": "scheduled",
+          "start": "2026-08-28T21:00:00Z",
+          "end": "2026-08-28T22:30:00Z",
+          "previous_start": null,
+          "previous_end": null,
+          "trigger": "daily_plan",
+          "reasoning": "The 90-minute task fits the 120-minute only_block and the block ends at 2026-08-28T23:00:00+00:00, before the 2026-08-29T01:00:00+00:00 deadline.",
+          "facts_used": [],
+          "surfaced_to_user": false
+        }
+      ],
+      "generic": false,
+      "coherent": true,
+      "passed": true
+    },
+    {
+      "task_id": 10,
+      "day": "2026-08-29",
+      "start": "2026-08-30T00:00:00+00:00",
+      "reasoning": "The 120-minute task fits the 150-minute only_block and ends before its 2026-08-30T05:30:00+00:00 deadline.",
+      "facts_used": [],
+      "why_chain": [
+        {
+          "id": 10,
+          "task_id": 10,
+          "decided_at": "2026-08-27T00:59:28.293000Z",
+          "action": "scheduled",
+          "start": "2026-08-30T00:00:00Z",
+          "end": "2026-08-30T02:00:00Z",
+          "previous_start": null,
+          "previous_end": null,
+          "trigger": "daily_plan",
+          "reasoning": "The 120-minute task fits the 150-minute only_block and ends before its 2026-08-30T05:30:00+00:00 deadline.",
+          "facts_used": [],
+          "surfaced_to_user": false
+        }
+      ],
+      "generic": false,
+      "coherent": true,
+      "passed": true
+    },
+    {
+      "task_id": 11,
+      "day": "2026-08-30",
+      "start": "2026-08-30T14:00:00+00:00",
+      "reasoning": "The 30-minute deep_focus task fits the 60-minute block before lunch, matching the habit that \"deep work usually happens before lunch,\" and finishes before its 2026-08-30T19:00:00+00:00 deadline.",
+      "facts_used": [
+        1
+      ],
+      "why_chain": [
+        {
+          "id": 11,
+          "task_id": 11,
+          "decided_at": "2026-08-27T00:59:30.624000Z",
+          "action": "scheduled",
+          "start": "2026-08-30T14:00:00Z",
+          "end": "2026-08-30T14:30:00Z",
+          "previous_start": null,
+          "previous_end": null,
+          "trigger": "daily_plan",
+          "reasoning": "The 30-minute deep_focus task fits the 60-minute block before lunch, matching the habit that \"deep work usually happens before lunch,\" and finishes before its 2026-08-30T19:00:00+00:00 deadline.",
+          "facts_used": [
+            1
+          ],
+          "surfaced_to_user": false
+        }
+      ],
+      "generic": false,
+      "coherent": true,
+      "passed": true
+    },
+    {
+      "task_id": 12,
+      "day": "2026-08-31",
+      "start": "2026-08-31T16:00:00+00:00",
+      "reasoning": "The 45-minute task fits the 75-minute block and ends before its 2026-08-31T22:15:00+00:00 deadline.",
+      "facts_used": [],
+      "why_chain": [
+        {
+          "id": 12,
+          "task_id": 12,
+          "decided_at": "2026-08-27T00:59:32.418000Z",
+          "action": "scheduled",
+          "start": "2026-08-31T16:00:00Z",
+          "end": "2026-08-31T16:45:00Z",
+          "previous_start": null,
+          "previous_end": null,
+          "trigger": "daily_plan",
+          "reasoning": "The 45-minute task fits the 75-minute block and ends before its 2026-08-31T22:15:00+00:00 deadline.",
+          "facts_used": [],
+          "surfaced_to_user": false
+        }
+      ],
+      "generic": false,
+      "coherent": true,
+      "passed": true
+    },
+    {
+      "task_id": 13,
+      "day": "2026-09-01",
+      "start": "2026-09-01T19:00:00+00:00",
+      "reasoning": "The 60-minute task fits within the 90-minute only_block, which ends at 2026-09-01T20:30:00+00:00 before the task deadline of 2026-09-01T22:30:00+00:00.",
+      "facts_used": [],
+      "why_chain": [
+        {
+          "id": 13,
+          "task_id": 13,
+          "decided_at": "2026-08-27T00:59:38.382000Z",
+          "action": "scheduled",
+          "start": "2026-09-01T19:00:00Z",
+          "end": "2026-09-01T20:00:00Z",
+          "previous_start": null,
+          "previous_end": null,
+          "trigger": "daily_plan",
+          "reasoning": "The 60-minute task fits within the 90-minute only_block, which ends at 2026-09-01T20:30:00+00:00 before the task deadline of 2026-09-01T22:30:00+00:00.",
+          "facts_used": [],
+          "surfaced_to_user": false
+        }
+      ],
+      "generic": false,
+      "coherent": true,
+      "passed": true
+    },
+    {
+      "task_id": 14,
+      "day": "2026-09-02",
+      "start": "2026-09-02T21:00:00+00:00",
+      "reasoning": "The 90-minute task fits the 120-minute block and ends before its 2026-09-03T02:00:00+00:00 deadline.",
+      "facts_used": [],
+      "why_chain": [
+        {
+          "id": 14,
+          "task_id": 14,
+          "decided_at": "2026-08-27T00:59:39.828000Z",
+          "action": "scheduled",
+          "start": "2026-09-02T21:00:00Z",
+          "end": "2026-09-02T22:30:00Z",
+          "previous_start": null,
+          "previous_end": null,
+          "trigger": "daily_plan",
+          "reasoning": "The 90-minute task fits the 120-minute block and ends before its 2026-09-03T02:00:00+00:00 deadline.",
+          "facts_used": [],
+          "surfaced_to_user": false
+        }
+      ],
+      "generic": false,
+      "coherent": true,
+      "passed": true
+    },
+    {
+      "task_id": 15,
+      "day": "2026-08-27",
+      "start": "2026-08-28T00:00:00+00:00",
+      "reasoning": "The 120-minute task fits the 150-minute only_block, which is bounded before by meeting, and completes before its 2026-08-28T06:30:00+00:00 deadline.",
+      "facts_used": [],
+      "why_chain": [
+        {
+          "id": 15,
+          "task_id": 15,
+          "decided_at": "2026-08-27T00:59:41.939000Z",
+          "action": "scheduled",
+          "start": "2026-08-28T00:00:00Z",
+          "end": "2026-08-28T02:00:00Z",
+          "previous_start": null,
+          "previous_end": null,
+          "trigger": "daily_plan",
+          "reasoning": "The 120-minute task fits the 150-minute only_block, which is bounded before by meeting, and completes before its 2026-08-28T06:30:00+00:00 deadline.",
+          "facts_used": [],
+          "surfaced_to_user": false
+        }
+      ],
+      "generic": false,
+      "coherent": true,
+      "passed": true
+    },
+    {
+      "task_id": 16,
+      "day": "2026-08-28",
+      "start": "2026-08-28T14:00:00+00:00",
+      "reasoning": "The 30-minute task fits the 60-minute only_block, which is before lunch in America/Chicago and matches fact 1: deep work usually happens before lunch; it also ends before the 2026-08-28T20:00:00+00:00 deadline.",
+      "facts_used": [
+        1
+      ],
+      "why_chain": [
+        {
+          "id": 16,
+          "task_id": 16,
+          "decided_at": "2026-08-27T00:59:44.614000Z",
+          "action": "scheduled",
+          "start": "2026-08-28T14:00:00Z",
+          "end": "2026-08-28T14:30:00Z",
+          "previous_start": null,
+          "previous_end": null,
+          "trigger": "daily_plan",
+          "reasoning": "The 30-minute task fits the 60-minute only_block, which is before lunch in America/Chicago and matches fact 1: deep work usually happens before lunch; it also ends before the 2026-08-28T20:00:00+00:00 deadline.",
+          "facts_used": [
+            1
+          ],
+          "surfaced_to_user": false
+        }
+      ],
+      "generic": false,
+      "coherent": true,
+      "passed": true
+    },
+    {
+      "task_id": 17,
+      "day": "2026-08-29",
+      "start": "2026-08-29T16:00:00+00:00",
+      "reasoning": "The 45-minute task fits the 75-minute only_block, which is bounded before by meeting.",
+      "facts_used": [],
+      "why_chain": [
+        {
+          "id": 17,
+          "task_id": 17,
+          "decided_at": "2026-08-27T00:59:53.137000Z",
+          "action": "scheduled",
+          "start": "2026-08-29T16:00:00Z",
+          "end": "2026-08-29T16:45:00Z",
+          "previous_start": null,
+          "previous_end": null,
+          "trigger": "daily_plan",
+          "reasoning": "The 45-minute task fits the 75-minute only_block, which is bounded before by meeting.",
+          "facts_used": [],
+          "surfaced_to_user": false
+        }
+      ],
+      "generic": false,
+      "coherent": true,
+      "passed": true
+    },
+    {
+      "task_id": 18,
+      "day": "2026-08-30",
+      "start": "2026-08-30T19:00:00+00:00",
+      "reasoning": "The 60-minute task fits the 90-minute only_block and ends before its 2026-08-30T23:30:00+00:00 deadline.",
+      "facts_used": [],
+      "why_chain": [
+        {
+          "id": 18,
+          "task_id": 18,
+          "decided_at": "2026-08-27T00:59:54.772000Z",
+          "action": "scheduled",
+          "start": "2026-08-30T19:00:00Z",
+          "end": "2026-08-30T20:00:00Z",
+          "previous_start": null,
+          "previous_end": null,
+          "trigger": "daily_plan",
+          "reasoning": "The 60-minute task fits the 90-minute only_block and ends before its 2026-08-30T23:30:00+00:00 deadline.",
+          "facts_used": [],
+          "surfaced_to_user": false
+        }
+      ],
+      "generic": false,
+      "coherent": true,
+      "passed": true
+    },
+    {
+      "task_id": 19,
+      "day": "2026-08-31",
+      "start": "2026-08-31T21:00:00+00:00",
+      "reasoning": "The 90-minute task fits the 120-minute only_block and ends before its 2026-09-01T03:00:00+00:00 deadline.",
+      "facts_used": [],
+      "why_chain": [
+        {
+          "id": 19,
+          "task_id": 19,
+          "decided_at": "2026-08-27T00:59:56.103000Z",
+          "action": "scheduled",
+          "start": "2026-08-31T21:00:00Z",
+          "end": "2026-08-31T22:30:00Z",
+          "previous_start": null,
+          "previous_end": null,
+          "trigger": "daily_plan",
+          "reasoning": "The 90-minute task fits the 120-minute only_block and ends before its 2026-09-01T03:00:00+00:00 deadline.",
+          "facts_used": [],
+          "surfaced_to_user": false
+        }
+      ],
+      "generic": false,
+      "coherent": true,
+      "passed": true
+    },
+    {
+      "task_id": 20,
+      "day": "2026-09-01",
+      "start": "2026-09-02T00:00:00+00:00",
+      "reasoning": "The 120-minute task fits the 150-minute block, which is bounded after by class and before by meeting, and must be completed before its 2026-09-02T07:30:00+00:00 deadline.",
+      "facts_used": [],
+      "why_chain": [
+        {
+          "id": 20,
+          "task_id": 20,
+          "decided_at": "2026-08-27T00:59:57.641000Z",
+          "action": "scheduled",
+          "start": "2026-09-02T00:00:00Z",
+          "end": "2026-09-02T02:00:00Z",
+          "previous_start": null,
+          "previous_end": null,
+          "trigger": "daily_plan",
+          "reasoning": "The 120-minute task fits the 150-minute block, which is bounded after by class and before by meeting, and must be completed before its 2026-09-02T07:30:00+00:00 deadline.",
+          "facts_used": [],
+          "surfaced_to_user": false
+        }
+      ],
+      "generic": false,
+      "coherent": true,
+      "passed": true
+    }
+  ]
+}

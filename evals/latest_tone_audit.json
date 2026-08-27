@@ -1,0 +1,207 @@
+{
+  "summary": {
+    "passed": 20,
+    "total": 20
+  },
+  "results": [
+    {
+      "message": "add laundry",
+      "output": "added",
+      "tools": [
+        "add_task"
+      ],
+      "violations": [],
+      "passed": true
+    },
+    {
+      "message": "add laundry, call mom, and renew my license",
+      "output": "added all three",
+      "tools": [
+        "add_task"
+      ],
+      "violations": [],
+      "passed": true
+    },
+    {
+      "message": "dentist tomorrow at 2 for an hour",
+      "output": "got it, dentist is on Thursday from 2\u20133 PM",
+      "tools": [
+        "resolve_date",
+        "add_event"
+      ],
+      "violations": [],
+      "passed": true
+    },
+    {
+      "message": "finished task 12 in 35 mins",
+      "output": "nice, marked it done at 35 minutes",
+      "tools": [
+        "complete_task"
+      ],
+      "violations": [],
+      "passed": true
+    },
+    {
+      "message": "delete event 21",
+      "output": "deleted",
+      "tools": [
+        "delete_event"
+      ],
+      "violations": [],
+      "passed": true
+    },
+    {
+      "message": "what's due this week?",
+      "output": "Pset report is due this week.",
+      "tools": [
+        "query_tasks"
+      ],
+      "violations": [],
+      "passed": true
+    },
+    {
+      "message": "am I free Friday afternoon?",
+      "output": "Mostly \u2014 you have a dentist appointment Friday from 2\u20133 PM.",
+      "tools": [
+        "resolve_date",
+        "query_schedule"
+      ],
+      "violations": [],
+      "passed": true
+    },
+    {
+      "message": "put task 12 at 3 tomorrow \u2014 it's the only 90 minute gap before Friday",
+      "output": "put it at 3\u20134:30 tomorrow \u2014 it\u2019s the only 90-minute gap before Friday.",
+      "tools": [
+        "resolve_date",
+        "find_free_blocks",
+        "schedule_task"
+      ],
+      "violations": [],
+      "passed": true
+    },
+    {
+      "message": "move task 12 to 10 tomorrow because I never use the 6am slot",
+      "output": "moved it to 10 tomorrow \u2014 you never use the 6am slot.",
+      "tools": [
+        "resolve_date",
+        "query_schedule",
+        "find_free_blocks",
+        "query_tasks",
+        "schedule_task"
+      ],
+      "violations": [],
+      "passed": true
+    },
+    {
+      "message": "why is task 12 after dinner?",
+      "output": "Because the Friday deadline made it the only 90-minute gap.",
+      "tools": [
+        "explain_schedule"
+      ],
+      "violations": [],
+      "passed": true
+    },
+    {
+      "message": "set a goal of 3 gym sessions a week",
+      "output": "set \u2014 3 gym sessions per week.",
+      "tools": [
+        "add_goal"
+      ],
+      "violations": [],
+      "passed": true
+    },
+    {
+      "message": "logged one gym session",
+      "output": "nice, logged one gym session.",
+      "tools": [
+        "log_goal_progress"
+      ],
+      "violations": [],
+      "passed": true
+    },
+    {
+      "message": "actually make task 12 due Saturday",
+      "output": "done \u2014 task 12 is due Saturday.",
+      "tools": [
+        "resolve_date",
+        "update_task"
+      ],
+      "violations": [],
+      "passed": true
+    },
+    {
+      "message": "move it to 4",
+      "output": "moved dentist to 4\u20135 Friday.",
+      "tools": [
+        "resolve_date",
+        "query_schedule",
+        "resolve_date",
+        "update_event"
+      ],
+      "violations": [],
+      "passed": true
+    },
+    {
+      "message": "add a fact that I do deep work before lunch",
+      "output": "got it \u2014 deep work before lunch.",
+      "tools": [
+        "add_fact"
+      ],
+      "violations": [],
+      "passed": true
+    },
+    {
+      "message": "show my goals and pending tasks",
+      "output": "Goal: gym \u2014 1 session left.\n\nPending: pset report \u2014 90 min.",
+      "tools": [
+        "query_goals",
+        "query_tasks"
+      ],
+      "violations": [],
+      "passed": true
+    },
+    {
+      "message": "cancel the dentist appointment",
+      "output": "deleted the dentist appointment",
+      "tools": [
+        "query_schedule",
+        "delete_event"
+      ],
+      "violations": [],
+      "passed": true
+    },
+    {
+      "message": "schedule task 12 in the open block from 3 to 5 tomorrow",
+      "output": "Scheduled task 12 tomorrow 3\u20135 PM \u2014 that\u2019s the open block you picked.",
+      "tools": [
+        "resolve_date",
+        "resolve_date",
+        "find_free_blocks",
+        "schedule_task"
+      ],
+      "violations": [],
+      "passed": true
+    },
+    {
+      "message": "I skipped the 6am gym again",
+      "output": "Yeah, 6am gym is not your slot. I\u2019ll avoid putting workouts there.",
+      "tools": [
+        "add_fact"
+      ],
+      "violations": [],
+      "passed": true
+    },
+    {
+      "message": "what changed today?",
+      "output": "No completed tasks or calendar items showing for today. The pset report is still pending.",
+      "tools": [
+        "query_schedule",
+        "query_tasks",
+        "query_tasks"
+      ],
+      "violations": [],
+      "passed": true
+    }
+  ]
+}

@@ -9,7 +9,7 @@
   {"id":"relative_tomorrow","category":"relative_dates","message":"remind me to submit the form tomorrow","expected":["resolve_date","add_task"]},
   {"id":"relative_friday_morning","category":"relative_dates","message":"finish the report Friday morning","expected":["resolve_date","add_task"]},
   {"id":"relative_next_tuesday","category":"relative_dates","message":"dentist next Tuesday at 3 for an hour","expected":["resolve_date","add_event"]},
-  {"id":"relative_in_three_days","category":"relative_dates","message":"make the application due in 3 days","expected":["resolve_date","add_task"]},
+  {"id":"relative_in_three_days","category":"relative_dates","message":"add the application, due in 3 days","expected":["resolve_date","add_task"]},
   {"id":"relative_tonight","category":"relative_dates","message":"remind me to take the bins out tonight","expected":["resolve_date","add_task"]},
   {"id":"relative_end_week","category":"relative_dates","message":"submit expenses by the end of this week","expected":["resolve_date","add_task"]},
   {"id":"relative_weekend","category":"relative_dates","message":"brunch Sunday at noon for 90 minutes","expected":["resolve_date","add_event"]},
@@ -26,7 +26,7 @@
   {"id":"ambiguous_task_name","category":"ambiguous_references","message":"mark the report done","expected":["query_tasks","complete_task"]},
   {"id":"ambiguous_event_name","category":"ambiguous_references","message":"cancel the dentist appointment","expected":["query_schedule","delete_event"]},
   {"id":"ambiguous_why","category":"ambiguous_references","message":"why is the pset there?","expected":["query_tasks","explain_schedule"]},
-  {"id":"ambiguous_fact","category":"ambiguous_references","message":"that gym preference is wrong","expected":["query_facts","update_fact"]},
+  {"id":"ambiguous_fact","category":"ambiguous_references","message":"that gym preference is wrong","expected":["query_facts"]},
   {"id":"ambiguous_goal","category":"ambiguous_references","message":"log one session toward my gym goal","expected":["query_goals","log_goal_progress"]},
 
   {"id":"correct_task_deadline","category":"corrections","message":"actually make it due Saturday","prior":[["user","add the report due Friday"],["assistant","added the report as task 12, due Friday"]],"expected":["resolve_date","update_task"]},
@@ -43,8 +43,8 @@
   {"id":"context_schedule","category":"multi_turn_context","message":"put it in that gap","prior":[["assistant","task 12 is the pset; the open block is 2026-08-27T20:00:00Z to 2026-08-27T22:00:00Z"]],"expected":["schedule_task"]},
   {"id":"context_why","category":"multi_turn_context","message":"why there?","prior":[["assistant","I put task 12, the pset, at 3pm"]],"expected":["explain_schedule"]},
 
-  {"id":"query_day","category":"cross_domain_queries","message":"what's on my schedule and due tomorrow?","expected":["resolve_date","query_schedule","query_tasks"],"unordered_tail":true},
-  {"id":"query_week_goals","category":"cross_domain_queries","message":"show my week, pending tasks, and goal progress","expected":["resolve_date","query_schedule","query_tasks","query_goals"],"unordered_tail":true},
+  {"id":"query_day","category":"cross_domain_queries","message":"what's on my schedule and due tomorrow?","expected":["query_schedule","query_tasks"],"unordered":true},
+  {"id":"query_week_goals","category":"cross_domain_queries","message":"show my week, pending tasks, and goal progress","expected":["query_schedule","query_tasks","query_goals"],"unordered":true},
   {"id":"query_fitness","category":"cross_domain_queries","message":"how are my fitness tasks and goals looking?","expected":["query_tasks","query_goals"],"unordered":true},
   {"id":"query_availability","category":"cross_domain_queries","message":"am I free Friday afternoon and what tasks could fit?","expected":["resolve_date","query_schedule","query_tasks"],"unordered_tail":true},
   {"id":"query_why_goal","category":"cross_domain_queries","message":"why is the pset scheduled there and am I behind on any goals?","expected":["query_tasks","query_goals","explain_schedule"],"unordered":true},

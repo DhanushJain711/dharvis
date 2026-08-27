@@ -7,7 +7,7 @@ import asyncio
 import json
 import re
 import tempfile
-from datetime import datetime, time, timedelta
+from datetime import UTC, datetime, time, timedelta
 from pathlib import Path
 
 from src import timeutil
@@ -74,9 +74,17 @@ async def main_async(report: Path) -> int:
                 "goal_id": goal["id"] if index % 4 == 0 else None,
             }])
             goals = await store.query_goals(active=True)
-            placements = await engine._plan_assignments(
-                [task], [("only_block", block)], [facts], goals
-            )
+            try:
+                placements = await engine._plan_assignments(
+                    [task], [("only_block", block)], [facts], goals
+                )
+            except Exception as exc:
+                results.append({
+                    "task_id": task["id"], "passed": False,
+                    "reason": f"{type(exc).__name__}: {exc}",
+                })
+                print(f"{index + 1:02d}. FAIL: {exc}", flush=True)
+                continue
             if len(placements) != 1:
                 results.append({"task_id": task["id"], "passed": False, "reason": "no assignment"})
                 continue
@@ -100,9 +108,24 @@ async def main_async(report: Path) -> int:
             "passed": sum(item["passed"] for item in results),
             "total": len(results),
         }
+        now = datetime.now(UTC)
+        usage_rows = await store.usage_summary(
+            now - timedelta(days=1), now + timedelta(days=1)
+        )
+        usage = next(
+            (row for row in usage_rows if row["kind"] == "background"), {}
+        )
+        input_tokens = int(usage.get("input_tokens", 0) or 0)
+        usage["cache_hit_rate"] = round(
+            int(usage.get("cached_tokens", 0) or 0) / input_tokens, 4
+        ) if input_tokens else 0.0
         report.parent.mkdir(parents=True, exist_ok=True)
-        report.write_text(json.dumps({"summary": summary, "results": results}, indent=2), encoding="utf-8")
+        report.write_text(
+            json.dumps({"summary": summary, "usage": usage, "results": results}, indent=2),
+            encoding="utf-8",
+        )
         print(json.dumps(summary, indent=2))
+        print(json.dumps({"usage": usage}, indent=2))
         return 0 if summary["passed"] == summary["total"] else 1
 
 

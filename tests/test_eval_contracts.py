@@ -43,6 +43,26 @@ def test_scheduler_rejects_generic_rationale_even_when_slot_fits():
         engine._pack_and_validate(raw, [task], [("block", block)], [], [])
 
 
+def test_scheduler_accepts_hyphenated_duration_constraint():
+    engine = SchedulerEngine(None, None, client=object())
+    start = datetime(2026, 8, 28, 14, tzinfo=UTC)
+    task = {
+        "id": 1, "title": "pset", "deadline": start + timedelta(hours=3),
+        "estimated_minutes": 30, "energy": "deep_focus", "priority": "high",
+        "category": "school", "goal_id": None,
+    }
+    block = FreeBlock(start, start + timedelta(hours=1), None, None)
+    raw = {"assignments": [{
+        "task_id": 1, "block_id": "block",
+        "reasoning": "the 30-minute task fits inside the 60-minute block",
+        "facts_used": [],
+    }]}
+
+    placements = engine._pack_and_validate(raw, [task], [("block", block)], [], [])
+
+    assert len(placements) == 1
+
+
 def test_few_shot_assistant_lines_have_no_corporate_phrases_or_reasoning_label():
     prompt = (Path(__file__).parents[1] / "src" / "prompts" / "system.md").read_text()
     assistant_lines = [
