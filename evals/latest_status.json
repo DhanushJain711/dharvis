@@ -1,0 +1,30 @@
+{
+  "generated_at": "2026-08-26T19:30:00-05:00",
+  "agent_eval": {
+    "status": "blocked_missing_openai_api_key",
+    "structural_cases_valid": 45,
+    "categories": {
+      "multi_item": {"passed": null, "total": 6, "rate": null},
+      "relative_dates": {"passed": null, "total": 14, "rate": null},
+      "ambiguous_references": {"passed": null, "total": 7, "rate": null},
+      "corrections": {"passed": null, "total": 6, "rate": null},
+      "multi_turn_context": {"passed": null, "total": 6, "rate": null},
+      "cross_domain_queries": {"passed": null, "total": 6, "rate": null}
+    }
+  },
+  "scheduler_rationale_audit": {
+    "status": "blocked_missing_openai_api_key",
+    "passed": null,
+    "total": 20
+  },
+  "tone_audit": {
+    "status": "blocked_missing_openai_api_key",
+    "passed": null,
+    "total": 20
+  },
+  "deployment": {
+    "status": "blocked_no_railway_cli_or_project_link",
+    "local_health_check": "passed",
+    "persistent_scheduler_restart": "passed"
+  }
+}

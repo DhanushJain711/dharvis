@@ -13,6 +13,7 @@ from zoneinfo import ZoneInfo
 
 from . import timeutil
 from .config import config
+from .costs import estimated_cost, usage_numbers
 from .store import Store
 
 Fact = dict[str, Any]
@@ -353,13 +354,13 @@ class FactsEngine:
         self,
         store: Store,
         client: Any | None = None,
-        model: str = FACTS_MODEL,
+        model: str | None = None,
         *,
         max_active_facts: int = MAX_ACTIVE_FACTS,
     ) -> None:
         self.store = store
         self._client = client
-        self.model = model
+        self.model = model or config.FACTS_MODEL_ID or FACTS_MODEL
         self.max_active_facts = max_active_facts
         self._memory_evidence: dict[int, list[Fact]] = {}
         self._memory_batches: dict[str, list[int]] = {}
@@ -427,6 +428,14 @@ class FactsEngine:
             text={"format": _EXTRACTION_SCHEMA, "verbosity": "low"},
             store=False,
         )
+        usage = usage_numbers(response)
+        cost = estimated_cost(self.model, usage)
+        recorder = getattr(self.store, "record_usage", None)
+        if callable(recorder):
+            try:
+                await recorder("facts", self.model, usage, cost, None)
+            except Exception:
+                logger.exception("facts_usage_persistence_failed")
         extracted = _parse_extraction(response)
         override_ids = await self._override_context_fact_ids(decisions)
         return await self.consolidate(
@@ -878,40 +887,10 @@ class FactsEngine:
         if connection is None:
             return False
         async with connection() as db:
-            await db.execute(
-                """CREATE TABLE IF NOT EXISTS facts_engine_evidence (
-                       id INTEGER PRIMARY KEY AUTOINCREMENT,
-                       fact_id INTEGER NOT NULL REFERENCES facts(id) ON DELETE CASCADE,
-                       observed_at TEXT NOT NULL,
-                       kind TEXT NOT NULL,
-                       evidence TEXT NOT NULL,
-                       observation_key TEXT
-                   )"""
-            )
-            columns = await db.execute("PRAGMA table_info(facts_engine_evidence)")
-            column_names = {row["name"] for row in await columns.fetchall()}
-            if "observation_key" not in column_names:
-                await db.execute(
-                    "ALTER TABLE facts_engine_evidence ADD COLUMN observation_key TEXT"
-                )
-            await db.execute(
-                """CREATE INDEX IF NOT EXISTS idx_facts_engine_evidence_fact_time
-                   ON facts_engine_evidence(fact_id, observed_at, id)"""
-            )
-            await db.execute(
-                """CREATE UNIQUE INDEX IF NOT EXISTS
-                   idx_facts_engine_evidence_observation
-                   ON facts_engine_evidence(fact_id, kind, observation_key)
-                   WHERE observation_key IS NOT NULL"""
-            )
-            await db.execute(
-                """CREATE TABLE IF NOT EXISTS facts_engine_batches (
-                       observation_key TEXT PRIMARY KEY,
-                       processed_at TEXT NOT NULL,
-                       fact_ids TEXT NOT NULL CHECK (json_valid(fact_ids))
-                   )"""
-            )
-            await db.commit()
+            # These tables are canonical schema, not an engine-owned migration.
+            # A read check catches callers that forgot Store.initialize().
+            await db.execute("SELECT 1 FROM facts_engine_evidence LIMIT 1")
+            await db.execute("SELECT 1 FROM facts_engine_batches LIMIT 1")
         return True
 
     async def _record_evidence(

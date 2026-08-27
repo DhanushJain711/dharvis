@@ -172,12 +172,58 @@ CREATE TABLE IF NOT EXISTS daily_log (
     CHECK (debrief_sent_at IS NULL OR (julianday(debrief_sent_at) IS NOT NULL AND instr(debrief_sent_at, 'T') = 11))
 );
 
+CREATE TABLE IF NOT EXISTS facts_engine_evidence (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    fact_id INTEGER NOT NULL REFERENCES facts(id) ON DELETE CASCADE,
+    kind TEXT NOT NULL,
+    evidence TEXT NOT NULL,
+    observed_at TEXT NOT NULL
+        CHECK (substr(observed_at, -1) = 'Z' OR substr(observed_at, -6) = '+00:00'),
+    observation_key TEXT,
+    CHECK (julianday(observed_at) IS NOT NULL AND instr(observed_at, 'T') = 11)
+);
+
+CREATE TABLE IF NOT EXISTS facts_engine_batches (
+    observation_key TEXT PRIMARY KEY,
+    processed_at TEXT NOT NULL
+        CHECK (substr(processed_at, -1) = 'Z' OR substr(processed_at, -6) = '+00:00'),
+    fact_ids TEXT NOT NULL DEFAULT '[]'
+        CHECK (json_valid(fact_ids) AND json_type(fact_ids) = 'array'),
+    CHECK (julianday(processed_at) IS NOT NULL AND instr(processed_at, 'T') = 11)
+);
+
+CREATE TABLE IF NOT EXISTS usage_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    occurred_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+        CHECK (substr(occurred_at, -1) = 'Z' OR substr(occurred_at, -6) = '+00:00'),
+    component TEXT NOT NULL CHECK (
+        component IN ('agent_loop', 'session_summary', 'scheduler', 'facts')
+    ),
+    model TEXT NOT NULL,
+    session_id TEXT,
+    input_tokens INTEGER NOT NULL DEFAULT 0 CHECK (input_tokens >= 0),
+    cached_tokens INTEGER NOT NULL DEFAULT 0 CHECK (cached_tokens >= 0),
+    cache_write_tokens INTEGER NOT NULL DEFAULT 0 CHECK (cache_write_tokens >= 0),
+    output_tokens INTEGER NOT NULL DEFAULT 0 CHECK (output_tokens >= 0),
+    reasoning_tokens INTEGER NOT NULL DEFAULT 0 CHECK (reasoning_tokens >= 0),
+    total_tokens INTEGER NOT NULL DEFAULT 0 CHECK (total_tokens >= 0),
+    estimated_cost_usd REAL,
+    CHECK (julianday(occurred_at) IS NOT NULL AND instr(occurred_at, 'T') = 11)
+);
+
 CREATE INDEX IF NOT EXISTS idx_tasks_status_deadline ON tasks(status, deadline);
 CREATE INDEX IF NOT EXISTS idx_tasks_scheduled_start ON tasks(scheduled_start);
 CREATE INDEX IF NOT EXISTS idx_tasks_goal_id ON tasks(goal_id);
 CREATE INDEX IF NOT EXISTS idx_events_time_range ON events(start_time, end_time);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_events_gcal_id
     ON events(gcal_event_id) WHERE gcal_event_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_facts_engine_evidence_fact_time
+    ON facts_engine_evidence(fact_id, observed_at, id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_facts_engine_evidence_observation
+    ON facts_engine_evidence(fact_id, kind, observation_key)
+    WHERE observation_key IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_usage_events_time_component
+    ON usage_events(occurred_at, component);
 CREATE INDEX IF NOT EXISTS idx_schedule_decisions_task_time
     ON schedule_decisions(task_id, decided_at);
 CREATE INDEX IF NOT EXISTS idx_facts_active_category ON facts(active, category);

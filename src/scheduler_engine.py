@@ -21,6 +21,7 @@ from openai import AsyncOpenAI
 from . import timeutil
 from .calendar_service import CalendarService
 from .config import config
+from .costs import estimated_cost, usage_numbers
 from .freebusy import (
     CalendarQueryIncompleteError,
     FreeBlock,
@@ -222,14 +223,14 @@ class SchedulerEngine:
         *,
         client: Any | None = None,
         openai_client: Any | None = None,
-        model: str = SCHEDULER_MODEL,
+        model: str | None = None,
     ) -> None:
         if client is not None and openai_client is not None:
             raise ValueError("Pass either client or openai_client, not both")
         self.store = store
         self.calendar = calendar
         self._client = client if client is not None else openai_client
-        self.model = model
+        self.model = model or config.SCHEDULER_MODEL_ID or SCHEDULER_MODEL
         self._mutation_lock = asyncio.Lock()
 
     @property
@@ -299,13 +300,21 @@ class SchedulerEngine:
             raise SchedulingPlanError("model returned malformed JSON") from exc
         if not isinstance(decoded, dict) or set(decoded) != {"assignments"}:
             raise SchedulingPlanError("model output must contain only assignments")
-        usage = _record_value(response, "usage")
+        usage = usage_numbers(response)
+        cost = estimated_cost(self.model, usage)
+        recorder = getattr(self.store, "record_usage", None)
+        if callable(recorder):
+            try:
+                await recorder("scheduler", self.model, usage, cost, None)
+            except Exception:
+                logger.exception("scheduler_usage_persistence_failed")
         logger.info(
             "scheduler_model_call",
             extra={"scheduler_event": {
                 "model": self.model,
                 "duration_ms": duration_ms,
-                "usage": usage.model_dump() if hasattr(usage, "model_dump") else usage,
+                "usage": usage,
+                "estimated_cost_usd": cost,
             }},
         )
         return decoded

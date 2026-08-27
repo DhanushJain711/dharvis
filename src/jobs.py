@@ -1329,7 +1329,7 @@ async def reconcile_calendar(engine: SchedulerEngine) -> None:
     """Resolve conflicts, coalescing or alerting according to brief proximity."""
     start = timeutil.now_utc()
     end = start + timedelta(days=max(1, config.SCHEDULER_LOOKAHEAD_DAYS))
-    decisions = await engine.resolve_conflicts(start, end)
+    decisions = await engine.detect_conflicts(start, end)
     if decisions and _inside_brief_coalesce_window():
         LOGGER.info(
             "Coalescing %s reconciliation decision(s) into the morning brief",
@@ -1844,9 +1844,7 @@ def create_job_scheduler() -> Any:
 
         database_path = str(config.DATABASE_PATH)
         if database_path != ":memory:":
-            jobs_path = os.getenv(
-                "APSCHEDULER_DATABASE_PATH", f"{database_path}.jobs.sqlite"
-            )
+            jobs_path = str(config.APSCHEDULER_DATABASE_PATH)
             kwargs["jobstores"] = {
                 "default": SQLAlchemyJobStore(url=f"sqlite:///{jobs_path}")
             }

@@ -38,9 +38,10 @@ Edit `.env` with your credentials and local-time policy:
 TELEGRAM_BOT_TOKEN=your_telegram_bot_token
 ALLOWED_USER_ID=your_telegram_user_id
 OPENAI_API_KEY=your_openai_api_key
-AGENT_MODEL_ID=gpt-5-mini
-SCHEDULER_MODEL_ID=gpt-5-mini
-FACTS_MODEL_ID=gpt-5-mini
+AGENT_MODEL_ID=gpt-5.6-terra
+SUMMARY_MODEL_ID=gpt-5.6-luna
+SCHEDULER_MODEL_ID=gpt-5.6-terra
+FACTS_MODEL_ID=gpt-5.6-luna
 OPENAI_REASONING_EFFORT=medium
 USER_TIMEZONE=America/Chicago
 QUIET_HOURS_START=22:00
@@ -111,10 +112,8 @@ push the deadline to next week
 
 ### Commands
 - `/start` - Welcome message
-- `/today` - Today's briefing
-- `/week` - Week overview
-- `/tasks` - List pending tasks
 - `/help` - Usage guide
+- `/cost` - Today's and month-to-date agent/background cost and cache rate
 
 ## Google Calendar Setup (Optional)
 
@@ -167,17 +166,45 @@ dharvis/
 └── README.md
 ```
 
-## Deployment
+## Railway deployment
 
-For production deployment on AWS Lightsail or similar:
+The included `railway.json` starts `python -m src.main`, checks `/healthz`, and
+restarts failed processes. Attach a Railway persistent volume at `/data`, then
+set:
 
-1. Set up a Linux server (Ubuntu recommended)
-2. Clone the repository
-3. Install Python 3.11+ and dependencies
-4. Configure `.env`
-5. Copy `token.json` from local OAuth setup
-6. Create a systemd service for the bot
-7. (Optional) Set up webhook mode with SSL
+```text
+DATA_DIR=/data
+DATABASE_PATH=/data/dharvis.db
+APSCHEDULER_DATABASE_PATH=/data/dharvis.jobs.sqlite
+GOOGLE_CALENDAR_TOKEN_PATH=/data/token.json
+```
+
+Supply `GOOGLE_CALENDAR_TOKEN_BASE64` for the first boot or copy `token.json`
+onto the volume. Refreshed OAuth credentials, SQLite state, Telegram checklist
+state, the Kalendra calendar id, and APScheduler's job store then survive
+restarts. `SQLAlchemy` is included so APScheduler uses the persistent job store;
+daily-log occurrence markers and startup catch-up remain a second line of
+defense after downtime.
+
+All application logs are JSON lines. The health endpoint returns 200 only when
+SQLite and job configuration are ready.
+
+## Evaluation and audits
+
+These commands use real OpenAI responses but replace tools with harmless
+recorders or temporary databases:
+
+```bash
+python scripts/eval_agent.py
+python scripts/audit_scheduler.py
+python scripts/audit_tone.py
+```
+
+The agent regression set contains 45 messages across multi-item creation,
+relative dates, ambiguous references, corrections, multi-turn context, and
+cross-domain queries. Reports are written under `evals/`. An
+`OPENAI_API_KEY` is required; the scripts fail fast instead of reporting fake
+offline scores.
 
 ## License
 

@@ -95,7 +95,7 @@ TOOLS: list[ToolSchema] = [
     ),
     _tool(
         "update_event",
-        "Change fields on an existing local or synchronized event. Query the schedule first when the id is ambiguous. Null field values mean unchanged; nullable fields are cleared only by naming them in clear_fields.",
+        "Change a bot-created event identified by its integer local event id. Query the schedule first when the id is ambiguous. External Google events are read-only. Null field values mean unchanged; nullable fields are cleared only by naming them in clear_fields.",
         {
             "event_id": {"type": "integer", "minimum": 1, "description": "Exact local event id."},
             "title": _nullable("string", "Replacement title, or null to leave unchanged."),
@@ -120,7 +120,7 @@ TOOLS: list[ToolSchema] = [
         },
     ),
     _tool("delete_task", "Drop an existing task the user no longer intends to do. Query first if the id is uncertain.", {"task_id": {"type": "integer", "minimum": 1, "description": "Exact task id to drop."}}),
-    _tool("delete_event", "Delete an existing event only when the user explicitly cancels or removes it. Query first if the id is uncertain.", {"event_id": {"type": "integer", "minimum": 1, "description": "Exact local event id to delete."}}),
+    _tool("delete_event", "Delete a bot-created event only when the user explicitly cancels it. Query first if the integer local id is uncertain; external Google events are read-only.", {"event_id": {"type": "integer", "minimum": 1, "description": "Exact local event id to delete."}}),
     _tool(
         "query_schedule",
         "Read the merged schedule of Google Calendar events, local events, and scheduled task work blocks over a UTC range. Use before answering availability or calendar questions.",

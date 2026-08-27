@@ -17,7 +17,7 @@ dharvis = "src.main:run"
 packages = ["src"]
 
 [tool.setuptools.package-data]
-src = ["schema.sql"]
+src = ["schema.sql", "prompts/system.md"]
 
 [tool.setuptools.dynamic]
 dependencies = {file = ["requirements.txt"]}

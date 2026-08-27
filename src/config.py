@@ -39,7 +39,8 @@ def _materialize_google_token() -> None:
     encoded = os.getenv("GOOGLE_CALENDAR_TOKEN_BASE64")
     if not encoded:
         return
-    path = Path(os.getenv("GOOGLE_CALENDAR_TOKEN_PATH", "./token.json"))
+    data_dir = Path(os.getenv("DATA_DIR", "."))
+    path = Path(os.getenv("GOOGLE_CALENDAR_TOKEN_PATH", str(data_dir / "token.json")))
     if path.exists():
         path.chmod(0o600)
         return
@@ -74,9 +75,10 @@ class Config:
 
     # OpenAI models
     OPENAI_API_KEY: str = os.getenv("OPENAI_API_KEY", "")
-    AGENT_MODEL_ID: str = os.getenv("AGENT_MODEL_ID", "gpt-5-mini")
-    SCHEDULER_MODEL_ID: str = os.getenv("SCHEDULER_MODEL_ID", "gpt-5-mini")
-    FACTS_MODEL_ID: str = os.getenv("FACTS_MODEL_ID", "gpt-5-mini")
+    AGENT_MODEL_ID: str = os.getenv("AGENT_MODEL_ID", "gpt-5.6-terra")
+    SUMMARY_MODEL_ID: str = os.getenv("SUMMARY_MODEL_ID", "gpt-5.6-luna")
+    SCHEDULER_MODEL_ID: str = os.getenv("SCHEDULER_MODEL_ID", "gpt-5.6-terra")
+    FACTS_MODEL_ID: str = os.getenv("FACTS_MODEL_ID", "gpt-5.6-luna")
     OPENAI_REASONING_EFFORT: str = os.getenv("OPENAI_REASONING_EFFORT", "medium")
 
     # Legacy compatibility while the Anthropic classifier is retired.
@@ -88,15 +90,18 @@ class Config:
     QUIET_HOURS_END: str = os.getenv("QUIET_HOURS_END", "07:00")
     DAILY_BRIEF_TIME: str = os.getenv("DAILY_BRIEF_TIME", "07:30")
     DAILY_DEBRIEF_TIME: str = os.getenv("DAILY_DEBRIEF_TIME", "20:30")
+    WEEKLY_REVIEW_TIME: str = os.getenv("WEEKLY_REVIEW_TIME", "20:30")
     REASONING_VERBOSITY: ReasoningVerbosity = _reasoning_verbosity()
 
     # Google Calendar
     GOOGLE_CALENDAR_CREDENTIALS_PATH: Path = Path(
         os.getenv("GOOGLE_CALENDAR_CREDENTIALS_PATH", "./credentials.json")
     )
-    GOOGLE_CALENDAR_TOKEN_PATH: Path = Path(
-        os.getenv("GOOGLE_CALENDAR_TOKEN_PATH", "./token.json")
-    )
+    DATA_DIR: Path = Path(os.getenv("DATA_DIR", "."))
+    GOOGLE_CALENDAR_TOKEN_PATH: Path = Path(os.getenv(
+        "GOOGLE_CALENDAR_TOKEN_PATH",
+        str(Path(os.getenv("DATA_DIR", ".")) / "token.json"),
+    ))
     GOOGLE_CALENDAR_TOKEN_BASE64: str = os.getenv(
         "GOOGLE_CALENDAR_TOKEN_BASE64", ""
     )
@@ -107,7 +112,18 @@ class Config:
     KALENDRA_CALENDAR_ID: str | None = os.getenv("KALENDRA_CALENDAR_ID") or None
 
     # Persistence and scheduling
-    DATABASE_PATH: Path = Path(os.getenv("DATABASE_PATH", "./dharvis.db"))
+    DATABASE_PATH: Path = Path(os.getenv(
+        "DATABASE_PATH",
+        str(Path(os.getenv("DATA_DIR", ".")) / "dharvis.db"),
+    ))
+    APSCHEDULER_DATABASE_PATH: Path = Path(os.getenv(
+        "APSCHEDULER_DATABASE_PATH",
+        str(Path(os.getenv(
+            "DATABASE_PATH",
+            str(Path(os.getenv("DATA_DIR", ".")) / "dharvis.db"),
+        ))) + ".jobs.sqlite",
+    ))
+    HEALTH_PORT: int = int(os.getenv("PORT", os.getenv("HEALTH_PORT", "0")))
     MESSAGE_HISTORY_LIMIT: int = int(os.getenv("MESSAGE_HISTORY_LIMIT", "100"))
     DEFAULT_TASK_MINUTES: int = int(os.getenv("DEFAULT_TASK_MINUTES", "30"))
     SCHEDULER_LOOKAHEAD_DAYS: int = int(

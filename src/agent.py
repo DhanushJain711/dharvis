@@ -12,6 +12,9 @@ from collections.abc import Awaitable, Callable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
+from .costs import estimated_cost as _shared_estimated_cost
+from .costs import usage_numbers as _shared_usage_numbers
+from .config import config
 from .history import History
 from .timeutil import format_time_context
 from .tools import TOOLS, TOOLS_BY_NAME
@@ -25,10 +28,6 @@ SUMMARY_MODEL = "gpt-5.6-luna"
 MAX_MODEL_CALLS = 8
 HISTORY_LIMIT = 20
 PROMPT_CACHE_KEY = "dharvis-agent-core-v1"
-_PRICES_PER_MILLION: dict[str, tuple[float, float, float]] = {
-    AGENT_MODEL: (2.0, 0.2, 12.0),
-    SUMMARY_MODEL: (0.2, 0.02, 1.2),
-}
 
 
 def _read_system_prompt() -> str:
@@ -87,53 +86,11 @@ def _response_tools() -> list[dict[str, Any]]:
 
 
 def _usage_numbers(response: Any) -> dict[str, int]:
-    usage = _field(response, "usage", {}) or {}
-    input_details = _field(usage, "input_tokens_details", {}) or {}
-    output_details = _field(usage, "output_tokens_details", {}) or {}
-    input_tokens = int(_field(usage, "input_tokens", 0) or 0)
-    output_tokens = int(_field(usage, "output_tokens", 0) or 0)
-    cached_tokens = int(_field(input_details, "cached_tokens", 0) or 0)
-    cache_write_tokens = int(
-        _field(input_details, "cache_write_tokens", 0)
-        or _field(input_details, "cache_creation_tokens", 0)
-        or _field(usage, "cache_write_tokens", 0)
-        or _field(usage, "cache_creation_input_tokens", 0)
-        or 0
-    )
-    reasoning_tokens = int(_field(output_details, "reasoning_tokens", 0) or 0)
-    total_tokens = int(
-        _field(usage, "total_tokens", input_tokens + output_tokens)
-        or input_tokens + output_tokens
-    )
-    return {
-        "input_tokens": input_tokens,
-        "cached_tokens": cached_tokens,
-        "cache_write_tokens": cache_write_tokens,
-        "output_tokens": output_tokens,
-        "reasoning_tokens": reasoning_tokens,
-        "total_tokens": total_tokens,
-    }
+    return _shared_usage_numbers(response)
 
 
 def _estimated_cost(model: str, usage: Mapping[str, int]) -> float | None:
-    prices = _PRICES_PER_MILLION.get(model)
-    if prices is None:
-        return None
-    input_price, cached_price, output_price = prices
-    if usage["input_tokens"] > 272_000:
-        input_price *= 2
-        cached_price *= 2
-        output_price *= 1.5
-    cached = usage["cached_tokens"]
-    cache_write = usage["cache_write_tokens"]
-    regular_input = max(0, usage["input_tokens"] - cached - cache_write)
-    dollars = (
-        regular_input * input_price
-        + cached * cached_price
-        + cache_write * input_price * 1.25
-        + usage["output_tokens"] * output_price
-    ) / 1_000_000
-    return dollars
+    return _shared_estimated_cost(model, usage)
 
 
 def _terminal_failure_text(response: Any, *, partial_text: str = "") -> str:
@@ -186,12 +143,10 @@ class Agent:
         self.tools = TOOLS
         self.tool_handlers = dict(tool_handlers or {})
         self._client = client
-        self.model = model or os.getenv("AGENT_MODEL_ID", AGENT_MODEL)
-        self.summary_model = summary_model or os.getenv(
-            "SUMMARY_MODEL_ID", SUMMARY_MODEL
-        )
+        self.model = model or config.AGENT_MODEL_ID or AGENT_MODEL
+        self.summary_model = summary_model or config.SUMMARY_MODEL_ID or SUMMARY_MODEL
         requested_effort = reasoning_effort or os.getenv(
-            "OPENAI_REASONING_EFFORT", "medium"
+            "OPENAI_REASONING_EFFORT", config.OPENAI_REASONING_EFFORT
         )
         self.reasoning_effort = (
             requested_effort
@@ -215,6 +170,11 @@ class Agent:
         return self._assemble_instructions([])
 
     def _assemble_instructions(self, facts: Sequence[Mapping[str, Any]]) -> str:
+        facts_block = self._facts_block(facts)
+        return f"{_read_system_prompt()}\n\n{facts_block}\n\n{format_time_context()}"
+
+    @staticmethod
+    def _facts_block(facts: Sequence[Mapping[str, Any]]) -> str:
         sorted_facts = sorted(
             facts,
             key=lambda fact: (
@@ -236,17 +196,31 @@ class Agent:
             facts_block = "Known facts about the user:\n" + "\n".join(fact_lines)
         else:
             facts_block = "Known facts about the user:\n- none yet"
-        # Prompt-cache order is deliberate: static prompt, slow-changing facts,
-        # then the per-call clock context.
-        return f"{_read_system_prompt()}\n\n{facts_block}\n\n{format_time_context()}"
+        return facts_block
+
+    def _system_input(self, facts: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+        """Put the explicit cache boundary before all dynamic prompt content."""
+        return {
+            "role": "system",
+            "content": [
+                {
+                    "type": "input_text",
+                    "text": _read_system_prompt(),
+                    "prompt_cache_breakpoint": {"mode": "explicit"},
+                },
+                {
+                    "type": "input_text",
+                    "text": self._facts_block(facts),
+                    "prompt_cache_breakpoint": {"mode": "explicit"},
+                },
+                {"type": "input_text", "text": format_time_context()},
+            ],
+        }
 
     async def _load_facts(self) -> list[dict[str, Any]]:
         if self.history is None:
             return []
-        try:
-            facts = await self.history.store.query_facts(active=True)
-        except NotImplementedError:
-            return []
+        facts = await self.history.store.query_facts(active=True)
         return [fact for fact in facts if isinstance(fact, dict)]
 
     async def respond(self, message: str, session_id: str) -> str:
@@ -341,6 +315,37 @@ class Agent:
         usage = _usage_numbers(response)
         return summary, usage, _estimated_cost(self.summary_model, usage)
 
+    async def _record_usage(
+        self,
+        component: str,
+        model: str,
+        usage: Mapping[str, int],
+        cost: float | None,
+        session_id: str,
+    ) -> None:
+        recorder = getattr(getattr(self.history, "store", None), "record_usage", None)
+        if not callable(recorder):
+            return
+        try:
+            await recorder(component, model, dict(usage), cost, session_id)
+        except Exception:
+            logger.exception("usage_persistence_failed")
+
+    @staticmethod
+    def _friendly_failure(exc: Exception) -> str:
+        module = type(exc).__module__.lower()
+        name = type(exc).__name__.lower()
+        message = str(exc).lower()
+        if "openai" in module or any(
+            token in name for token in ("ratelimit", "apiconnection", "apitimeout")
+        ):
+            return "I can’t reach OpenAI right now, so I didn’t change anything. Try again in a minute."
+        if "locked" in message or "sqlite" in module:
+            return "My saved data is busy right now, so I didn’t change anything. Try that again in a moment."
+        if "calendar" in module or "google" in module:
+            return "I can’t reach the calendar right now, so I left it unchanged."
+        return "Something broke before I could finish that, so I didn’t claim it was done."
+
     @staticmethod
     def _add_usage(total: dict[str, int], addition: Mapping[str, int]) -> None:
         for key in total:
@@ -411,6 +416,10 @@ class Agent:
                         summary, summary_usage, summary_cost = await self._summarize_session(
                             previous
                         )
+                        await self._record_usage(
+                            "session_summary", self.summary_model, summary_usage,
+                            summary_cost, physical_session,
+                        )
                         self._add_usage(usage_total, summary_usage)
                         if cost_total is not None:
                             cost_total = (
@@ -435,14 +444,13 @@ class Agent:
                     if self.history is not None
                     else []
                 )
-                input_items.append({"role": "user", "content": message})
                 facts = await self._load_facts()
-                instructions = self._assemble_instructions(facts)
+                input_items.insert(0, self._system_input(facts))
+                input_items.append({"role": "user", "content": message})
 
                 for iterations in range(1, MAX_MODEL_CALLS + 1):
                     response = await self.client.responses.create(
                         model=self.model,
-                        instructions=instructions,
                         input=input_items,
                         tools=_response_tools(),
                         tool_choice="auto",
@@ -450,12 +458,17 @@ class Agent:
                         store=False,
                         include=["reasoning.encrypted_content"],
                         prompt_cache_key=PROMPT_CACHE_KEY,
+                        prompt_cache_options={"mode": "explicit"},
                         reasoning={"effort": self.reasoning_effort},
                         text={"verbosity": "low"},
                     )
                     response_usage = _usage_numbers(response)
                     self._add_usage(usage_total, response_usage)
                     response_cost = _estimated_cost(self.model, response_usage)
+                    await self._record_usage(
+                        "agent_loop", self.model, response_usage, response_cost,
+                        physical_session,
+                    )
                     if cost_total is not None:
                         cost_total = (
                             cost_total + response_cost
@@ -540,6 +553,12 @@ class Agent:
                         physical_session, "assistant", final_text
                     )
                 return final_text
+            except Exception as exc:
+                logger.exception(
+                    "agent_turn_failed",
+                    extra={"failure_type": type(exc).__name__, "conversation_id": session_id},
+                )
+                return self._friendly_failure(exc)
             finally:
                 self._log_turn(
                     conversation_id=session_id,

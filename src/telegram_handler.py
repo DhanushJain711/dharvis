@@ -37,7 +37,7 @@ from .config import config
 
 LOGGER = logging.getLogger(__name__)
 
-PLACEHOLDER_REPLY = "Dharvis is online. Agentic planning is being connected now."
+PLACEHOLDER_REPLY = "i’m up — send me a task, event, or what you’re trying to plan"
 TELEGRAM_TEXT_LIMIT = 4096
 _CHECKLIST_CALLBACK = "cl"
 _WHY_CALLBACK = "why"
@@ -154,8 +154,51 @@ class TelegramHandler:
     async def help_command(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
     ) -> None:
-        """Return the compatibility help response."""
-        await self.start_command(update, context)
+        """Describe the compact command surface."""
+        del context
+        if not self._authorize_update(update, "command"):
+            return
+        message = getattr(update, "message", None)
+        if message is not None:
+            await message.reply_text(
+                "text me naturally — I can manage tasks, events, goals, and scheduling. "
+                "Use /cost for today and month-to-date model usage."
+            )
+
+    async def cost_command(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """Show persisted interactive/background cost and cache counters."""
+        del context
+        if not self._authorize_update(update, "command"):
+            return
+        message = getattr(update, "message", None)
+        if message is None or self.store is None:
+            return
+        from . import timeutil
+
+        now = timeutil.now_utc()
+        local_today = timeutil.now_local().date()
+        today_start, today_end = timeutil.day_bounds(local_today)
+        month_start = timeutil.day_bounds(local_today.replace(day=1))[0]
+        today, month = await asyncio.gather(
+            self.store.usage_summary(today_start, today_end),
+            self.store.usage_summary(month_start, now + timedelta(microseconds=1)),
+        )
+
+        def render(label: str, rows: list[dict[str, Any]]) -> str:
+            by_kind = {row["kind"]: row for row in rows}
+            parts: list[str] = []
+            for kind in ("agent", "background"):
+                row = by_kind.get(kind, {})
+                input_tokens = int(row.get("input_tokens") or 0)
+                cached = int(row.get("cached_tokens") or 0)
+                rate = cached / input_tokens * 100 if input_tokens else 0.0
+                cost = float(row.get("estimated_cost_usd") or 0.0)
+                parts.append(f"{kind} ${cost:.4f}, cache {rate:.0f}%")
+            return f"{label}: " + "; ".join(parts)
+
+        await message.reply_text(f"{render('today', today)}\n{render('month', month)}")
 
     async def message_handler(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
@@ -315,16 +358,10 @@ class TelegramHandler:
             await self._stop_typing(stop_typing, typing_task)
 
     async def _invoke_agent(self, agent_input: str, session_id: str) -> str:
-        """Invoke the normal text boundary with placeholder-agent compatibility."""
+        """Invoke the normal text boundary."""
         loop = getattr(self.agent, "run_tool_loop", None)
         if callable(loop):
-            try:
-                result = await loop(agent_input, session_id)
-            except NotImplementedError:
-                responder = getattr(self.agent, "respond", None)
-                if not callable(responder):
-                    raise
-                result = await responder(agent_input, session_id)
+            result = await loop(agent_input, session_id)
         else:
             responder = getattr(self.agent, "respond", None)
             if not callable(responder):
@@ -692,10 +729,10 @@ class TelegramHandler:
                 explanation = "No schedule decision history was found for this task."
             elif isinstance(history, str):
                 explanation = history
+            elif isinstance(history, list):
+                explanation = self._format_why_history(history)
             else:
-                explanation = json.dumps(
-                    history, ensure_ascii=False, indent=2, default=str
-                )
+                explanation = str(history)
             if query.message is not None:
                 await self._send_reply(query.message, explanation)
         finally:
@@ -704,14 +741,39 @@ class TelegramHandler:
     async def _explain_schedule(self, task_id: int) -> Any:
         execute_tool = getattr(self.agent, "execute_tool", None)
         if callable(execute_tool):
-            try:
-                return await execute_tool("explain_schedule", {"task_id": task_id})
-            except NotImplementedError:
-                pass
+            return await execute_tool("explain_schedule", {"task_id": task_id})
         explain = getattr(self.agent, "explain_schedule", None)
         if callable(explain):
             return await explain(task_id)
         raise TypeError("Agent cannot execute explain_schedule")
+
+    @staticmethod
+    def _format_why_history(history: list[Any]) -> str:
+        """Render the immutable rationale chain without database-shaped output."""
+        from . import timeutil
+
+        clauses: list[str] = []
+        for index, raw in enumerate(history):
+            if not isinstance(raw, dict):
+                continue
+            action = str(raw.get("action") or "scheduled")
+            reason = " ".join(str(raw.get("reasoning") or "").split()).rstrip(" .")
+            start = raw.get("start")
+            if isinstance(start, str):
+                with suppress(ValueError):
+                    start = datetime.fromisoformat(start.replace("Z", "+00:00"))
+            when = ""
+            if isinstance(start, datetime) and start.tzinfo is not None:
+                local = timeutil.to_local(start)
+                when = local.strftime("%a at %-I:%M%p").replace(":00", "").lower()
+            lead = "originally" if index == 0 else "then"
+            if index == len(history) - 1 and index > 0:
+                lead = "now"
+            if action == "unscheduled":
+                clauses.append(f"{lead} left it unscheduled — {reason}")
+            else:
+                clauses.append(f"{lead} {action} it {when} — {reason}".replace("  ", " "))
+        return "; ".join(clauses) or "No schedule decision history was found for this task."
 
     @classmethod
     def _normalize_checklist_item(cls, item: Any, index: int) -> dict[str, Any]:
@@ -1087,6 +1149,11 @@ class TelegramHandler:
         app.add_handler(
             CommandHandler(
                 "help", self.help_command, filters=filters.UpdateType.MESSAGE
+            )
+        )
+        app.add_handler(
+            CommandHandler(
+                "cost", self.cost_command, filters=filters.UpdateType.MESSAGE
             )
         )
         app.add_handler(CallbackQueryHandler(self.callback_query_handler))

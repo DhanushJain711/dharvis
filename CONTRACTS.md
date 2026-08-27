@@ -27,6 +27,7 @@ Config.ALLOWED_USER_ID: int | None
 Config.TELEGRAM_POLL_TIMEOUT_SECONDS: int
 Config.OPENAI_API_KEY: str
 Config.AGENT_MODEL_ID: str
+Config.SUMMARY_MODEL_ID: str
 Config.SCHEDULER_MODEL_ID: str
 Config.FACTS_MODEL_ID: str
 Config.OPENAI_REASONING_EFFORT: str
@@ -36,6 +37,7 @@ Config.QUIET_HOURS_START: str
 Config.QUIET_HOURS_END: str
 Config.DAILY_BRIEF_TIME: str
 Config.DAILY_DEBRIEF_TIME: str
+Config.WEEKLY_REVIEW_TIME: str
 Config.REASONING_VERBOSITY: ReasoningVerbosity
 Config.GOOGLE_CALENDAR_CREDENTIALS_PATH: Path
 Config.GOOGLE_CALENDAR_TOKEN_PATH: Path
@@ -43,7 +45,10 @@ Config.GOOGLE_CALENDAR_TOKEN_BASE64: str
 Config.GOOGLE_CALENDAR_ID: str
 Config.KALENDRA_CALENDAR_NAME: str
 Config.KALENDRA_CALENDAR_ID: str | None
+Config.DATA_DIR: Path
 Config.DATABASE_PATH: Path
+Config.APSCHEDULER_DATABASE_PATH: Path
+Config.HEALTH_PORT: int
 Config.MESSAGE_HISTORY_LIMIT: int
 Config.DEFAULT_TASK_MINUTES: int
 Config.SCHEDULER_LOOKAHEAD_DAYS: int
@@ -127,6 +132,8 @@ Store.append_message(role: MessageRole, content: str, tool_calls: list[Record], 
 Store.get_messages(session_id: str, limit: int = 100) -> list[Record]  # async
 Store.get_daily_log(local_date: date) -> Record | None  # async
 Store.upsert_daily_log(local_date: date, changes: Record) -> Record  # async
+Store.record_usage(component: Literal["agent_loop", "session_summary", "scheduler", "facts"], model: str, usage: Record, estimated_cost_usd: float | None, session_id: str | None = None) -> None  # async
+Store.usage_summary(start: datetime, end: datetime) -> list[Record]  # async
 create_store(db_path: str | Path | None = None) -> Store  # async
 ```
 
@@ -184,7 +191,7 @@ has_conflict(blocks: list[ScheduleBlock], start: datetime, end: datetime) -> boo
 ```python
 Agent(history: History | None = None)
 Agent.build_system_prompt() -> str
-Agent.respond(message: str, session_id: str) -> str  # async placeholder
+Agent.respond(message: str, session_id: str) -> str  # async
 Agent.execute_tool(name: str, arguments: dict[str, Any]) -> Any  # async
 Agent.run_tool_loop(message: str, session_id: str) -> str  # async
 create_agent(history: History | None = None) -> Agent  # async
@@ -204,6 +211,7 @@ TelegramHandler(agent: Agent | Any | None = None, *, store: Any | None = None, d
 TelegramHandler.is_authorized(user_id: int) -> bool
 TelegramHandler.start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None  # async
 TelegramHandler.help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None  # async
+TelegramHandler.cost_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None  # async
 TelegramHandler.message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None  # async
 TelegramHandler.error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None  # async
 TelegramHandler.create_application(token: str | None = None) -> Application
@@ -218,6 +226,10 @@ SchedulerEngine(store: Store, calendar: CalendarService)
 SchedulerEngine.choose_slot(task_id: int, candidates: list[FreeBlock], trigger: Trigger) -> ScheduleDecision  # async
 SchedulerEngine.schedule_task(task_id: int, start: datetime, end: datetime, reasoning: str, trigger: Trigger, facts_used: list[int] | None = None) -> ScheduleDecision  # async
 SchedulerEngine.plan_day(local_date: date) -> list[ScheduleDecision]  # async
+SchedulerEngine.build_daily_plan(local_date: date) -> list[ScheduleDecision]  # async
+SchedulerEngine.reschedule(reason: str, affected_range: Any, *, trigger: Trigger = "conflict") -> list[ScheduleDecision]  # async
+SchedulerEngine.detect_conflicts(start: datetime | None = None, end: datetime | None = None) -> list[ScheduleDecision]  # async
+SchedulerEngine.format_change_summary(decisions: Sequence[Any], *, mark_surfaced: bool = True) -> str  # async
 SchedulerEngine.resolve_conflicts(start: datetime, end: datetime) -> list[ScheduleDecision]  # async
 SchedulerEngine.explain_schedule(task_id: int) -> list[dict[str, object]]  # async
 create_scheduler_engine(store: Store, calendar: CalendarService) -> SchedulerEngine  # async
@@ -232,6 +244,9 @@ run_daily_planning(engine: SchedulerEngine, local_date: date) -> None  # async
 reconcile_calendar(engine: SchedulerEngine) -> None  # async
 configure_jobs(scheduler: Any, store: Store, engine: SchedulerEngine, telegram: Any) -> None
 create_job_scheduler() -> Any
+start_job_scheduler(scheduler: Any, *, catch_up: bool = True) -> Any
+shutdown_job_scheduler(scheduler: Any, *, wait: bool = True) -> Any
+run_startup_catchup() -> None  # async
 ```
 
 ## Facts (`src.facts_engine`)
@@ -246,6 +261,16 @@ FactsEngine.confirm_fact(fact_id: int, confidence: float = 1.0) -> Fact  # async
 FactsEngine.deactivate_fact(fact_id: int) -> Fact  # async
 create_facts_engine(store: Store) -> FactsEngine  # async
 ```
+
+## Runtime integration (`src.integration`)
+
+```python
+jsonable(value: Any) -> Any
+build_tool_handlers(store: Store, calendar: CalendarService, scheduler: SchedulerEngine, facts_engine: FactsEngine) -> dict[str, ToolHandler]  # async
+```
+
+The returned registry contains exactly every name in `TOOLS_BY_NAME`. Tool
+results contain only JSON-compatible values and never naive datetimes.
 
 ## Entrypoint (`src.main`)
 

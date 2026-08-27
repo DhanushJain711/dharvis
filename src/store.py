@@ -437,7 +437,8 @@ class Store:
                 raise KeyError(f"Task {task_id} does not exist")
             await db.execute(
                 """UPDATE tasks SET status = 'completed', completed_at = ?,
-                   actual_minutes = ? WHERE id = ?""",
+                   actual_minutes = ?, scheduled_start = NULL, scheduled_end = NULL,
+                   gcal_event_id = NULL WHERE id = ?""",
                 (_utc_text(timeutil.now_utc(), "completed_at"), actual_minutes, task_id),
             )
             await db.commit()
@@ -1072,6 +1073,69 @@ class Store:
             result = _record(await cursor.fetchone())
         assert result is not None
         return result
+
+    async def record_usage(
+        self,
+        component: Literal["agent_loop", "session_summary", "scheduler", "facts"],
+        model: str,
+        usage: Record,
+        estimated_cost_usd: float | None,
+        session_id: str | None = None,
+    ) -> None:
+        """Persist one model call's token, cache, and estimated-cost counters."""
+        allowed = {"agent_loop", "session_summary", "scheduler", "facts"}
+        if component not in allowed:
+            raise ValueError(f"unknown usage component: {component}")
+        counters = {
+            key: int(usage.get(key, 0) or 0)
+            for key in (
+                "input_tokens", "cached_tokens", "cache_write_tokens",
+                "output_tokens", "reasoning_tokens", "total_tokens",
+            )
+        }
+        if any(value < 0 for value in counters.values()):
+            raise ValueError("usage counters must be non-negative")
+        async with self.connection() as db:
+            await db.execute(
+                """INSERT INTO usage_events (
+                       component, model, session_id, input_tokens, cached_tokens,
+                       cache_write_tokens, output_tokens, reasoning_tokens,
+                       total_tokens, estimated_cost_usd
+                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    component, model, session_id,
+                    counters["input_tokens"], counters["cached_tokens"],
+                    counters["cache_write_tokens"], counters["output_tokens"],
+                    counters["reasoning_tokens"], counters["total_tokens"],
+                    estimated_cost_usd,
+                ),
+            )
+            await db.commit()
+
+    async def usage_summary(self, start: datetime, end: datetime) -> list[Record]:
+        """Aggregate usage by interactive/background component for a UTC range."""
+        start_text, end_text = _utc_text(start, "start"), _utc_text(end, "end")
+        if end_text <= start_text:
+            raise ValueError("end must be later than start")
+        async with self.connection() as db:
+            cursor = await db.execute(
+                """SELECT
+                       CASE WHEN component IN ('agent_loop', 'session_summary')
+                            THEN 'agent' ELSE 'background' END AS kind,
+                       SUM(input_tokens) AS input_tokens,
+                       SUM(cached_tokens) AS cached_tokens,
+                       SUM(cache_write_tokens) AS cache_write_tokens,
+                       SUM(output_tokens) AS output_tokens,
+                       SUM(total_tokens) AS total_tokens,
+                       SUM(estimated_cost_usd) AS estimated_cost_usd,
+                       COUNT(*) AS calls
+                   FROM usage_events
+                   WHERE utc_epoch_us(occurred_at) >= utc_epoch_us(?)
+                     AND utc_epoch_us(occurred_at) < utc_epoch_us(?)
+                   GROUP BY kind ORDER BY kind""",
+                (start_text, end_text),
+            )
+            return _records(await cursor.fetchall())
 
 
 async def create_store(db_path: str | Path | None = None) -> Store:
