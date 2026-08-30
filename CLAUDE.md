@@ -15,14 +15,17 @@ The bot reads all visible Google calendars for availability and briefs, but it w
 
 ## Runtime flow
 
-The production composition root is `src/main.py`:
+The Telegram application composition root is `src/telegram_handler.py`. Polling
+production uses `src/main.py`; webhook production uses FastAPI in `src/web.py`:
 
 1. Initialize the canonical SQLite schema through `Store`.
 2. Construct `CalendarService`, `SchedulerEngine`, and `FactsEngine`.
 3. Bind every schema in `src/tools.py` to a real handler in `src/integration.py`.
 4. Construct the stateful `Agent` and `TelegramHandler`.
 5. Register persistent APScheduler jobs for planning, briefs, debriefs, weekly reviews, and conflict reconciliation.
-6. Start Telegram polling and the `/healthz` server.
+6. Start Telegram polling plus its dependency-aware `/healthz` server, or the
+   ASGI webhook lifespan which registers Telegram's webhook and owns scheduler
+   startup and clean shutdown.
 
 For each Telegram message, `Agent.run_tool_loop()` loads active facts, local time context, and the last 20 messages from the current session. It calls the OpenAI Responses API, executes all returned tool calls concurrently, appends tool results, and repeats until the model returns text or reaches the eight-call limit. Tool failures are returned to the model as data so it can recover without exposing a stack trace.
 
@@ -70,6 +73,23 @@ The evening debrief records completed tasks and actual minutes, removes the owne
 - Calendar reconciliation checks the configured lookahead window every 15 minutes.
 
 Jobs use the user's IANA timezone, respect quiet hours, coalesce missed executions, and persist their job store and daily occurrence markers so restarts do not normally duplicate messages.
+
+The scheduler also creates a SQLite backup at 03:00 local time under
+`DATA_DIR/backups` and retains dated backups for 14 days. Its nightly facts
+fallback extracts the persisted day's evidence if a debrief was not submitted.
+
+## Deployment modes
+
+`RUN_MODE=polling` is the default and runs `python -m src.main` (including the
+existing Railway deployment). `RUN_MODE=webhook` is for an HTTPS ASGI host such
+as Azure App Service and runs `uvicorn src.web:app --host 0.0.0.0 --port 8000`.
+Webhook mode requires `PUBLIC_BASE_URL`, `TELEGRAM_WEBHOOK_PATH`, and
+`TELEGRAM_WEBHOOK_SECRET`; generate the two token values with
+`python scripts/gen_webhook_secrets.py` and keep them out of source control.
+
+`DATA_DIR` defaults to `./data` and is the single persistent root for SQLite,
+the job store, OAuth credentials/token, and backups unless an explicit path
+override is intentionally configured. Azure App Service uses `DATA_DIR=/home/data`.
 
 ## Important current boundaries
 

@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import base64
 import os
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
+from urllib.parse import urlparse
 
 from dotenv import load_dotenv
 from pydantic import TypeAdapter, ValidationError
@@ -14,6 +16,29 @@ from pydantic import TypeAdapter, ValidationError
 load_dotenv()
 
 ReasoningVerbosity = Literal["brief", "full"]
+RunMode = Literal["polling", "webhook"]
+_WEBHOOK_TOKEN_RE = re.compile(r"[A-Za-z0-9_-]+")
+
+
+def _data_dir() -> Path:
+    return Path(os.getenv("DATA_DIR", "./data"))
+
+
+def _path_from_env(name: str, default: Path) -> Path:
+    """Use an explicit path unchanged, otherwise keep all runtime data together."""
+    return Path(os.getenv(name, str(default)))
+
+
+def _database_path() -> Path:
+    return _path_from_env("DATABASE_PATH", _data_dir() / "dharvis.db")
+
+
+def _apscheduler_database_path() -> Path:
+    database_path = _database_path()
+    return _path_from_env(
+        "APSCHEDULER_DATABASE_PATH",
+        database_path.with_name(database_path.name + ".jobs.sqlite"),
+    )
 
 
 def _optional_int(name: str) -> int | None:
@@ -39,8 +64,8 @@ def _materialize_google_token() -> None:
     encoded = os.getenv("GOOGLE_CALENDAR_TOKEN_BASE64")
     if not encoded:
         return
-    data_dir = Path(os.getenv("DATA_DIR", "."))
-    path = Path(os.getenv("GOOGLE_CALENDAR_TOKEN_PATH", str(data_dir / "token.json")))
+    data_dir = _data_dir()
+    path = _path_from_env("GOOGLE_CALENDAR_TOKEN_PATH", data_dir / "token.json")
     if path.exists():
         path.chmod(0o600)
         return
@@ -72,6 +97,10 @@ class Config:
     TELEGRAM_POLL_TIMEOUT_SECONDS: int = int(
         os.getenv("TELEGRAM_POLL_TIMEOUT_SECONDS", "30")
     )
+    RUN_MODE: RunMode | str = os.getenv("RUN_MODE", "polling").strip().lower()
+    PUBLIC_BASE_URL: str = os.getenv("PUBLIC_BASE_URL", "").strip().rstrip("/")
+    TELEGRAM_WEBHOOK_PATH: str = os.getenv("TELEGRAM_WEBHOOK_PATH", "").strip().lstrip("/")
+    TELEGRAM_WEBHOOK_SECRET: str = os.getenv("TELEGRAM_WEBHOOK_SECRET", "").strip()
 
     # OpenAI models
     OPENAI_API_KEY: str = os.getenv("OPENAI_API_KEY", "")
@@ -94,14 +123,13 @@ class Config:
     REASONING_VERBOSITY: ReasoningVerbosity = _reasoning_verbosity()
 
     # Google Calendar
-    GOOGLE_CALENDAR_CREDENTIALS_PATH: Path = Path(
-        os.getenv("GOOGLE_CALENDAR_CREDENTIALS_PATH", "./credentials.json")
+    DATA_DIR: Path = _data_dir()
+    GOOGLE_CALENDAR_CREDENTIALS_PATH: Path = _path_from_env(
+        "GOOGLE_CALENDAR_CREDENTIALS_PATH", _data_dir() / "credentials.json"
     )
-    DATA_DIR: Path = Path(os.getenv("DATA_DIR", "."))
-    GOOGLE_CALENDAR_TOKEN_PATH: Path = Path(os.getenv(
-        "GOOGLE_CALENDAR_TOKEN_PATH",
-        str(Path(os.getenv("DATA_DIR", ".")) / "token.json"),
-    ))
+    GOOGLE_CALENDAR_TOKEN_PATH: Path = _path_from_env(
+        "GOOGLE_CALENDAR_TOKEN_PATH", _data_dir() / "token.json"
+    )
     GOOGLE_CALENDAR_TOKEN_BASE64: str = os.getenv(
         "GOOGLE_CALENDAR_TOKEN_BASE64", ""
     )
@@ -112,17 +140,8 @@ class Config:
     KALENDRA_CALENDAR_ID: str | None = os.getenv("KALENDRA_CALENDAR_ID") or None
 
     # Persistence and scheduling
-    DATABASE_PATH: Path = Path(os.getenv(
-        "DATABASE_PATH",
-        str(Path(os.getenv("DATA_DIR", ".")) / "dharvis.db"),
-    ))
-    APSCHEDULER_DATABASE_PATH: Path = Path(os.getenv(
-        "APSCHEDULER_DATABASE_PATH",
-        str(Path(os.getenv(
-            "DATABASE_PATH",
-            str(Path(os.getenv("DATA_DIR", ".")) / "dharvis.db"),
-        ))) + ".jobs.sqlite",
-    ))
+    DATABASE_PATH: Path = _database_path()
+    APSCHEDULER_DATABASE_PATH: Path = _apscheduler_database_path()
     HEALTH_PORT: int = int(os.getenv("PORT", os.getenv("HEALTH_PORT", "0")))
     MESSAGE_HISTORY_LIMIT: int = int(os.getenv("MESSAGE_HISTORY_LIMIT", "100"))
     DEFAULT_TASK_MINUTES: int = int(os.getenv("DEFAULT_TASK_MINUTES", "30"))
@@ -137,6 +156,37 @@ class Config:
             missing.append("TELEGRAM_BOT_TOKEN")
         if self.ALLOWED_USER_ID is None:
             missing.append("ALLOWED_USER_ID")
+        if self.RUN_MODE not in {"polling", "webhook"}:
+            missing.append("RUN_MODE must be 'polling' or 'webhook'")
+        elif self.RUN_MODE == "webhook":
+            if not self.PUBLIC_BASE_URL.strip():
+                missing.append("PUBLIC_BASE_URL")
+            else:
+                parsed_url = urlparse(self.PUBLIC_BASE_URL)
+                if (
+                    parsed_url.scheme != "https"
+                    or not parsed_url.netloc
+                    or parsed_url.path not in {"", "/"}
+                    or parsed_url.params
+                    or parsed_url.query
+                    or parsed_url.fragment
+                ):
+                    missing.append(
+                        "PUBLIC_BASE_URL must be an absolute HTTPS URL without a path, query, fragment, or params"
+                    )
+            if not self.TELEGRAM_WEBHOOK_PATH.strip():
+                missing.append("TELEGRAM_WEBHOOK_PATH")
+            elif not _WEBHOOK_TOKEN_RE.fullmatch(self.TELEGRAM_WEBHOOK_PATH):
+                missing.append("TELEGRAM_WEBHOOK_PATH must be a URL-safe token")
+            if not self.TELEGRAM_WEBHOOK_SECRET.strip():
+                missing.append("TELEGRAM_WEBHOOK_SECRET")
+            elif (
+                len(self.TELEGRAM_WEBHOOK_SECRET) > 256
+                or not _WEBHOOK_TOKEN_RE.fullmatch(self.TELEGRAM_WEBHOOK_SECRET)
+            ):
+                missing.append(
+                    "TELEGRAM_WEBHOOK_SECRET must be a URL-safe token of at most 256 characters"
+                )
         return missing
 
 

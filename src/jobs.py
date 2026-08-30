@@ -18,6 +18,8 @@ import logging
 import math
 import os
 import re
+import sqlite3
+import tempfile
 from calendar import monthrange
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, time, timedelta
@@ -42,6 +44,8 @@ RECONCILE_JOB_ID = "proactive-calendar-reconcile"
 DECISION_ACK_JOB_ID = "proactive-decision-ack"
 CHANGE_ACK_JOB_ID = "proactive-change-ack"
 FOLLOWUP_JOB_ID = "proactive-debrief-followup"
+BACKUP_JOB_ID = "proactive-daily-backup"
+NIGHTLY_FACTS_JOB_ID = "proactive-nightly-facts"
 _CHECKLIST_PREFIX = "daily-debrief"
 _RECENT_CONVERSATION = timedelta(minutes=5)
 _MAX_BRIEF_CHARS = 1_350
@@ -50,6 +54,7 @@ _UNSURFACED_SINCE = datetime(1970, 1, 1, tzinfo=UTC)
 _occurrence_locks: dict[str, asyncio.Lock] = {}
 _startup_tasks: set[asyncio.Task[None]] = set()
 _persistent_jobstore_enabled = False
+_managed_scheduler: Any | None = None
 
 
 @dataclass(slots=True)
@@ -1068,6 +1073,9 @@ async def handle_debrief_submission(
                 "session_id": session_id,
             }
         )
+        if _nightly_facts_marker(local_date) in notes:
+            LOGGER.info("Skipping duplicate debrief evidence after nightly fallback")
+            return
         conversation, decisions = await _day_learning_evidence(store, local_date)
         await _extract_day(facts_engine, learning_log, conversation, decisions)
         return
@@ -1347,8 +1355,11 @@ async def handle_debrief_submission(
     persisted_log = await store.get_daily_log(local_date) or {}
     learning_log = dict(persisted_log)
     learning_log.update(day_payload)
-    conversation, decisions = await _day_learning_evidence(store, local_date)
-    await _extract_day(facts_engine, learning_log, conversation, decisions)
+    if _nightly_facts_marker(local_date) in str(persisted_log.get("notes") or ""):
+        LOGGER.info("Skipping duplicate debrief evidence after nightly fallback")
+    else:
+        conversation, decisions = await _day_learning_evidence(store, local_date)
+        await _extract_day(facts_engine, learning_log, conversation, decisions)
     if marker:
         notes = _append_note(notes, marker)
     if followup_kind:
@@ -1773,6 +1784,44 @@ async def _scheduled_reconcile() -> None:
     await reconcile_calendar(_runtime_required().engine)
 
 
+async def _scheduled_nightly_facts() -> None:
+    """Extract day-scoped evidence even when no debrief was submitted."""
+    runtime = _runtime_required()
+    local_date = timeutil.now_local().date()
+    async with _occurrence_lock("nightly-facts", local_date):
+        daily_log = await runtime.store.get_daily_log(local_date)
+        if daily_log is None:
+            return
+        if daily_log.get("debrief_sent_at"):
+            # A delivered checklist may still receive outcomes or a reflection;
+            # its callback owns the richer debrief extraction.
+            return
+        notes = str(daily_log.get("notes") or "")
+        # A debrief already submitted this same day to the facts engine.  Its
+        # checklist marker is durable, so do not feed the identical raw day a
+        # second time through the fallback path.
+        if re.search(r"\[debrief-checklist:[A-Za-z0-9_-]+\]", notes):
+            return
+        marker = _nightly_facts_marker(local_date)
+        if marker in notes:
+            return
+        conversation, decisions = await _day_learning_evidence(
+            runtime.store, local_date
+        )
+        await runtime.facts_engine.extract_from_day(
+            daily_log=daily_log,
+            conversation=conversation,
+            decisions=decisions,
+        )
+        await runtime.store.upsert_daily_log(
+            local_date, {"notes": _append_note(notes, marker)}
+        )
+
+
+def _nightly_facts_marker(local_date: date) -> str:
+    return f"[nightly-facts:{local_date.isoformat()}]"
+
+
 def _register_completion_handler(runtime: _Runtime) -> None:
     async def callback(event: Record, session_id: str | None = None) -> None:
         await handle_debrief_submission(
@@ -1885,6 +1934,75 @@ def configure_jobs(
         id=RECONCILE_JOB_ID,
         **defaults,
     )
+    scheduler.add_job(
+        _scheduled_backup,
+        CronTrigger(hour=3, minute=0, timezone=zone),
+        id=BACKUP_JOB_ID,
+        **defaults,
+    )
+    scheduler.add_job(
+        _scheduled_nightly_facts,
+        CronTrigger(hour=23, minute=30, timezone=zone),
+        id=NIGHTLY_FACTS_JOB_ID,
+        **defaults,
+    )
+
+
+def _backup_path(local_date: date) -> Any:
+    return config.DATA_DIR / "backups" / f"agenda-{local_date.isoformat()}.db"
+
+
+def _write_sqlite_backup(source_path: Any, destination_path: Any) -> None:
+    """Use SQLite's online backup API so a live database stays consistent."""
+    destination_path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{destination_path.name}.", suffix=".tmp", dir=destination_path.parent
+    )
+    os.close(descriptor)
+    try:
+        with sqlite3.connect(str(source_path)) as source, sqlite3.connect(
+            temporary_name
+        ) as destination:
+            source.backup(destination)
+        os.replace(temporary_name, destination_path)
+    except Exception:
+        try:
+            os.unlink(temporary_name)
+        except FileNotFoundError:
+            pass
+        raise
+
+
+def _prune_agenda_backups(backup_dir: Any, today: date) -> None:
+    cutoff = today - timedelta(days=14)
+    pattern = re.compile(r"agenda-(\d{4}-\d{2}-\d{2})\.db$")
+    for candidate in backup_dir.iterdir():
+        matched = pattern.fullmatch(candidate.name)
+        if matched is None or not candidate.is_file():
+            continue
+        try:
+            backup_date = date.fromisoformat(matched.group(1))
+        except ValueError:
+            continue
+        if backup_date < cutoff:
+            candidate.unlink()
+
+
+async def _scheduled_backup() -> None:
+    """Create the local daily agenda snapshot and prune only dated snapshots."""
+    runtime = _runtime_required()
+    today = timeutil.now_local().date()
+    source_path = runtime.store.db_path
+    if str(source_path) == ":memory:":
+        LOGGER.warning("Skipping SQLite backup for an in-memory database")
+        return
+    destination = _backup_path(today)
+    try:
+        await asyncio.to_thread(_write_sqlite_backup, source_path, destination)
+        await asyncio.to_thread(_prune_agenda_backups, destination.parent, today)
+    except Exception:
+        LOGGER.exception("Daily SQLite backup failed")
+        raise
 
 
 async def run_startup_catchup() -> None:
@@ -1960,6 +2078,62 @@ def start_job_scheduler(scheduler: Any, *, catch_up: bool = True) -> Any:
             _startup_tasks.add(task)
             task.add_done_callback(_finish_startup_task)
     return result
+
+
+def start_scheduler(application: Any) -> None:
+    """Configure and start this application's scheduler exactly once.
+
+    The application factory attaches the service runtime to ``bot_data`` but
+    intentionally does not start background work during import.  This seam is
+    shared by polling startup and the ASGI lifespan.
+    """
+    global _managed_scheduler
+    if _managed_scheduler is not None and getattr(_managed_scheduler, "running", False):
+        LOGGER.warning("A proactive scheduler is already running; ignoring duplicate start")
+        return
+    scheduler = _prepare_scheduler(application)
+    if getattr(scheduler, "running", False):
+        LOGGER.warning("Proactive scheduler is already running; ignoring duplicate start")
+        _managed_scheduler = scheduler
+        return
+    start_job_scheduler(scheduler)
+    _managed_scheduler = scheduler
+
+
+def _prepare_scheduler(application: Any) -> Any:
+    """Configure application jobs without starting them (used by ``--check``)."""
+    runtime = getattr(application, "bot_data", None)
+    if runtime is None:
+        raise RuntimeError("Telegram application has no bot_data runtime")
+    scheduler = runtime.get("job_scheduler")
+    if scheduler is None:
+        scheduler = create_job_scheduler()
+        telegram = runtime["telegram_handler"]
+        configure_jobs(
+            scheduler,
+            runtime["store"],
+            runtime["scheduler_engine"],
+            telegram,
+            runtime["facts_engine"],
+        )
+        runtime["job_scheduler"] = scheduler
+        telegram.job_scheduler = scheduler
+        telegram.scheduler_engine = runtime["scheduler_engine"]
+        telegram.facts_engine = runtime["facts_engine"]
+    assert_jobs_ready()
+    return scheduler
+
+
+def stop_scheduler() -> None:
+    """Stop the scheduler managed by :func:`start_scheduler`, if any."""
+    global _managed_scheduler
+    scheduler = _managed_scheduler
+    if scheduler is None:
+        return
+    try:
+        shutdown_job_scheduler(scheduler, wait=True)
+    finally:
+        _managed_scheduler = None
 
 
 def jobs_integration_status() -> Record:

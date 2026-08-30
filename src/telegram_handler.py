@@ -1173,3 +1173,66 @@ class TelegramHandler:
 def create_telegram_handler(agent: Agent, store: Any | None = None) -> TelegramHandler:
     """Create the Telegram transport facade."""
     return TelegramHandler(agent, store=store)
+
+
+def build_application() -> Application:
+    """Compose a handler-complete Telegram application without starting it.
+
+    Network and SQLite initialization deliberately stay asynchronous.  Both the
+    polling entrypoint and the ASGI lifespan call
+    :func:`initialize_application_runtime` before accepting Telegram updates.
+    Keeping this factory synchronous makes it safe for ASGI module import while
+    still exposing one canonical application composition point.
+    """
+    from .calendar_service import CalendarService
+    from .facts_engine import FactsEngine
+    from .history import History
+    from .scheduler_engine import SchedulerEngine
+    from .store import Store
+
+    store = Store()
+    calendar = CalendarService()
+    scheduler_engine = SchedulerEngine(store, calendar)
+    facts_engine = FactsEngine(store)
+    agent = Agent(History(store))
+    agent.facts_engine = facts_engine
+    telegram = TelegramHandler(agent, store=store, calendar_service=calendar)
+    application = telegram.create_application()
+    application.bot_data.update(
+        {
+            "store": store,
+            "calendar": calendar,
+            "scheduler": scheduler_engine,
+            "scheduler_engine": scheduler_engine,
+            "facts": facts_engine,
+            "facts_engine": facts_engine,
+            "telegram": telegram,
+            "telegram_handler": telegram,
+            "runtime_initialized": False,
+            "runtime_initialization_lock": asyncio.Lock(),
+        }
+    )
+    return application
+
+
+async def initialize_application_runtime(application: Application) -> None:
+    """Initialize SQLite and tool bindings once before update processing."""
+    runtime = application.bot_data
+    lock = runtime.get("runtime_initialization_lock")
+    if lock is None:
+        lock = runtime["runtime_initialization_lock"] = asyncio.Lock()
+    async with lock:
+        if runtime.get("runtime_initialized"):
+            return
+        store = runtime["store"]
+        await store.initialize()
+        from .integration import build_tool_handlers
+
+        agent = runtime["telegram_handler"].agent
+        agent.tool_handlers = await build_tool_handlers(
+            store,
+            runtime["calendar"],
+            runtime["scheduler_engine"],
+            runtime["facts_engine"],
+        )
+        runtime["runtime_initialized"] = True

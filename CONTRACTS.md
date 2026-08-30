@@ -18,6 +18,7 @@ ActualMinutesSource = Literal["user", "debrief", "calendar", "inferred"]
 MessageRole = Literal["user", "assistant", "tool"]
 ScheduleSource = Literal["gcal", "event", "task"]
 ReasoningVerbosity = Literal["brief", "full"]
+RunMode = Literal["polling", "webhook"]
 ```
 
 ## Configuration (`src.config`)
@@ -26,6 +27,10 @@ ReasoningVerbosity = Literal["brief", "full"]
 Config.TELEGRAM_BOT_TOKEN: str
 Config.ALLOWED_USER_ID: int | None
 Config.TELEGRAM_POLL_TIMEOUT_SECONDS: int
+Config.RUN_MODE: RunMode | str
+Config.PUBLIC_BASE_URL: str
+Config.TELEGRAM_WEBHOOK_PATH: str
+Config.TELEGRAM_WEBHOOK_SECRET: str
 Config.OPENAI_API_KEY: str
 Config.AGENT_MODEL_ID: str
 Config.SUMMARY_MODEL_ID: str
@@ -56,7 +61,7 @@ Config.SCHEDULER_LOOKAHEAD_DAYS: int
 Config.validate() -> list[str]
 ```
 
-Production startup requires both `TELEGRAM_BOT_TOKEN` and `ALLOWED_USER_ID` and fails closed when either is absent. Clock settings are local 24-hour `HH:MM` strings. OAuth token material created or refreshed by the app is mode `0600`.
+Production startup requires both `TELEGRAM_BOT_TOKEN` and `ALLOWED_USER_ID` and fails closed when either is absent. `RUN_MODE` defaults to `polling`; webhook mode additionally requires a pathless HTTPS `PUBLIC_BASE_URL` and URL-safe webhook path and secret. Clock settings are local 24-hour `HH:MM` strings. `DATA_DIR` defaults to `./data` and derives the database, scheduler database, OAuth credentials, and OAuth token paths unless their corresponding explicit path variable is set. OAuth token material created or refreshed by the app is mode `0600`.
 
 ## Time (`src.timeutil`)
 
@@ -237,6 +242,8 @@ TelegramHandler.message_handler(update: Update, context: ContextTypes.DEFAULT_TY
 TelegramHandler.error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None  # async
 TelegramHandler.create_application(token: str | None = None) -> Application
 create_telegram_handler(agent: Agent, store: Any | None = None) -> TelegramHandler
+build_application() -> Application
+initialize_application_runtime(application: Application) -> None  # async
 ```
 
 ## Scheduler (`src.scheduler_engine`)
@@ -273,6 +280,8 @@ configure_jobs(scheduler: Any, store: Store, engine: SchedulerEngine, telegram: 
 create_job_scheduler() -> Any
 start_job_scheduler(scheduler: Any, *, catch_up: bool = True) -> Any
 shutdown_job_scheduler(scheduler: Any, *, wait: bool = True) -> Any
+start_scheduler(application: Application) -> None
+stop_scheduler() -> None
 run_startup_catchup() -> None  # async
 ```
 
@@ -309,6 +318,23 @@ run() -> None
 ```
 
 Run with `python -m src.main`; `python -m src.main --check` builds the configured schema and Telegram application, then exits before network polling. The check still requires explicit safe values for both `TELEGRAM_BOT_TOKEN` and `ALLOWED_USER_ID`; either missing value makes the CLI exit with status 2.
+
+## Webhook ingress (`src.web`)
+
+```python
+application: Application
+lifespan(app: FastAPI) -> AsyncIterator[None]  # async context manager
+app: FastAPI
+healthz() -> dict[str, object]  # async; GET /healthz
+telegram_webhook(path: str, request: Request) -> Response  # async; POST /{path:path}
+```
+
+`src.web` is the webhook-mode ASGI entry point. Its lifespan initializes the
+application runtime, starts the Telegram application, registers the configured
+webhook, starts the shared scheduler, and reverses those operations on shutdown.
+The update route matches only `TELEGRAM_WEBHOOK_PATH` and verifies Telegram's
+secret-token header before enqueueing a decoded update. Launch it with
+`uvicorn src.web:app --host 0.0.0.0 --port 8000`.
 
 ## Legacy import compatibility
 

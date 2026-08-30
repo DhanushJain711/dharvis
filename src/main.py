@@ -8,52 +8,32 @@ import json
 import logging
 import signal
 
-from .agent import Agent
-from .calendar_service import CalendarService
 from .config import config
-from .facts_engine import FactsEngine
-from .history import History
-from .integration import build_tool_handlers
 from .jobs import (
+    _prepare_scheduler,
     assert_jobs_ready,
-    configure_jobs,
-    create_job_scheduler,
-    shutdown_job_scheduler,
-    start_job_scheduler,
+    start_scheduler,
+    stop_scheduler,
 )
 from .logging_config import configure_logging
-from .scheduler_engine import SchedulerEngine
-from .store import Store
-from .telegram_handler import TelegramHandler
+from .telegram_handler import (
+    TelegramHandler,
+    build_application as build_telegram_application,
+    initialize_application_runtime,
+)
 
 configure_logging()
+# httpx includes full request URLs at INFO level; Telegram bot-token URLs must
+# never reach process logs.
+logging.getLogger("httpx").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
 
 async def build_application() -> tuple[TelegramHandler, object]:
-    """Initialize persistence and build, but do not start, the Telegram app."""
-    store = Store()
-    await store.initialize()
-    calendar = CalendarService()
-    scheduler_engine = SchedulerEngine(store, calendar)
-    facts_engine = FactsEngine(store)
-    tool_handlers = await build_tool_handlers(
-        store, calendar, scheduler_engine, facts_engine
-    )
-    agent = Agent(History(store), tool_handlers=tool_handlers)
-    agent.facts_engine = facts_engine
-    handler = TelegramHandler(
-        agent, store=store, calendar_service=calendar
-    )
-    job_scheduler = create_job_scheduler()
-    configure_jobs(
-        job_scheduler, store, scheduler_engine, handler, facts_engine
-    )
-    assert_jobs_ready()
-    handler.job_scheduler = job_scheduler
-    handler.scheduler_engine = scheduler_engine
-    handler.facts_engine = facts_engine
-    return handler, handler.create_application()
+    """Compatibility async wrapper around the synchronous application factory."""
+    application = build_telegram_application()
+    await initialize_application_runtime(application)
+    return application.bot_data["telegram_handler"], application
 
 
 async def _health_server(handler: TelegramHandler) -> asyncio.AbstractServer | None:
@@ -106,6 +86,7 @@ async def main(*, check_only: bool = False) -> None:
         return
     handler, app = await build_application()
     if check_only:
+        _prepare_scheduler(app)
         logger.info("Configuration, schema, tools, jobs, and Telegram application are valid")
         return
 
@@ -131,7 +112,7 @@ async def main(*, check_only: bool = False) -> None:
             timeout=config.TELEGRAM_POLL_TIMEOUT_SECONDS,
         )
         polling = True
-        start_job_scheduler(handler.job_scheduler)
+        start_scheduler(app)
         jobs_started = True
         health_server = await _health_server(handler)
         logger.info("Dharvis is running", extra={"event": "application_started"})
@@ -142,7 +123,7 @@ async def main(*, check_only: bool = False) -> None:
             health_server.close()
             await health_server.wait_closed()
         if jobs_started:
-            shutdown_job_scheduler(handler.job_scheduler, wait=False)
+            stop_scheduler()
         if polling and app.updater is not None:
             await app.updater.stop()
         if started:
@@ -165,6 +146,11 @@ def run() -> None:
             ", ".join(missing),
         )
         raise SystemExit(2)
+    if not args.check and config.RUN_MODE == "webhook":
+        logger.error(
+            "Webhook mode must be launched by Uvicorn: uvicorn src.web:app"
+        )
+        raise SystemExit(1)
     try:
         asyncio.run(main(check_only=args.check))
     except KeyboardInterrupt:

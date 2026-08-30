@@ -70,6 +70,8 @@ Message [@userinfobot](https://t.me/userinfobot) to get your user ID, then add i
 
 ### 5. Run the Bot
 
+Local development uses polling by default (`RUN_MODE=polling`):
+
 ```bash
 python -m src.main
 ```
@@ -132,6 +134,12 @@ python scripts/setup_gcal_auth.py
 
 This will open a browser for authentication and save `token.json`.
 
+By default, credentials, the refreshed OAuth token, SQLite database, APScheduler
+store, and backups live under `DATA_DIR` (`./data`). Keep them together by setting
+only `DATA_DIR` on a persistent disk. `GOOGLE_CALENDAR_CREDENTIALS_PATH`,
+`GOOGLE_CALENDAR_TOKEN_PATH`, `DATABASE_PATH`, and
+`APSCHEDULER_DATABASE_PATH` are optional explicit overrides for unusual layouts.
+
 Dharvis creates and updates only events it owns on its secondary `Kalendra` calendar. Owned metadata uses the canonical kinds `fixed-event`, `task-block`, and `goal-session`; it does not edit events on your primary or other visible calendars.
 
 ## Running Tests
@@ -172,15 +180,12 @@ dharvis/
 
 ## Railway deployment
 
-The included `railway.json` starts `python -m src.main`, checks `/healthz`, and
-restarts failed processes. Attach a Railway persistent volume at `/data`, then
-set:
+Railway continues to use polling: the included `railway.json` starts
+`python -m src.main`, checks `/healthz`, and restarts failed processes. Attach a
+Railway persistent volume at `/data`, then set only:
 
 ```text
 DATA_DIR=/data
-DATABASE_PATH=/data/dharvis.db
-APSCHEDULER_DATABASE_PATH=/data/dharvis.jobs.sqlite
-GOOGLE_CALENDAR_TOKEN_PATH=/data/token.json
 ```
 
 Supply `GOOGLE_CALENDAR_TOKEN_BASE64` for the first boot or copy `token.json`
@@ -190,8 +195,51 @@ restarts. `SQLAlchemy` is included so APScheduler uses the persistent job store;
 daily-log occurrence markers and startup catch-up remain a second line of
 defense after downtime.
 
-All application logs are JSON lines. The health endpoint returns 200 only when
-SQLite and job configuration are ready.
+All application logs are JSON lines. In polling mode the health endpoint returns
+200 only when SQLite and job configuration are ready.
+
+## Azure App Service deployment
+
+Azure uses Telegram webhooks rather than polling. Configure the App Service
+startup command as:
+
+```bash
+uvicorn src.web:app --host 0.0.0.0 --port 8000
+```
+
+Set `RUN_MODE=webhook`, `DATA_DIR=/home/data`, the normal Telegram/OpenAI/Google
+settings, and these App Settings:
+
+```text
+PUBLIC_BASE_URL=https://<your-app>.azurewebsites.net
+TELEGRAM_WEBHOOK_PATH=<generated-url-safe-path>
+TELEGRAM_WEBHOOK_SECRET=<generated-url-safe-secret>
+```
+
+Generate the final two values before setting them in Azure:
+
+```bash
+python scripts/gen_webhook_secrets.py
+```
+
+The script prints an `az webapp config appsettings set` command with fresh,
+independent values. Treat both as secrets; the URL path is intentionally hard to
+guess and Telegram also supplies the header secret for each update. `PUBLIC_BASE_URL`
+must be the HTTPS origin only—without a path. Azure's public TLS endpoint is used
+directly; do not run a local tunnel for this production setup.
+
+App Service should probe `GET /healthz`, which returns `{"ok": true}` while the
+ASGI app is live. The webhook route accepts only the configured path, requires
+Telegram's `X-Telegram-Bot-Api-Secret-Token` to match, rejects invalid JSON or
+updates, then queues valid updates for the Telegram application. On lifespan
+startup it registers the Telegram webhook and starts proactive jobs; on shutdown
+it stops jobs and cleanly stops and shuts down the Telegram application.
+
+With `DATA_DIR=/home/data`, the application keeps the SQLite database, scheduler
+store, OAuth token, and `backups/` directory on App Service persistent storage.
+It creates a consistent SQLite backup at 03:00 in the configured user timezone
+and retains dated backups for 14 days. A nightly facts fallback also extracts
+persisted day evidence when no debrief is submitted.
 
 ## Evaluation and audits
 

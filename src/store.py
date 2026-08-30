@@ -251,12 +251,13 @@ class Store:
     def __init__(self, db_path: str | Path | None = None) -> None:
         supplied = db_path if db_path is not None else config.DATABASE_PATH
         self.db_path = Path(supplied)
-        self._memory = str(supplied) == ":memory:"
+        supplied_text = str(supplied)
+        self._memory = supplied_text == ":memory:"
         self._connect_target = (
             f"file:dharvis-{id(self)}?mode=memory&cache=shared"
-            if self._memory else str(self.db_path)
+            if self._memory else supplied_text
         )
-        self._uri = self._memory
+        self._uri = self._memory or supplied_text.startswith("file:")
         self._keeper: aiosqlite.Connection | None = None
         self._initialize_lock = asyncio.Lock()
 
@@ -269,6 +270,7 @@ class Store:
                 keeper = await aiosqlite.connect(self._connect_target, uri=True)
                 try:
                     keeper.row_factory = aiosqlite.Row
+                    await self._configure_connection(keeper)
                     await keeper.create_function(
                         "utc_epoch_us", 1, _utc_epoch_us, deterministic=True
                     )
@@ -281,20 +283,34 @@ class Store:
                     raise
                 self._keeper = keeper
                 return
+            self._ensure_database_parent()
             await run_migrations(self.db_path)
+
+    def _ensure_database_parent(self) -> None:
+        """Create the local database directory before SQLite opens the file."""
+        if not self._memory and not self._uri:
+            self.db_path.parent.mkdir(parents=True, exist_ok=True)
+
+    async def _configure_connection(self, db: aiosqlite.Connection) -> None:
+        """Apply durable, process-safe SQLite settings to every Store connection."""
+        await db.execute("PRAGMA journal_mode = DELETE")
+        await db.execute("PRAGMA busy_timeout = 5000")
+        await db.execute("PRAGMA synchronous = FULL")
+        await db.execute("PRAGMA foreign_keys = ON")
 
     @asynccontextmanager
     async def connection(self) -> AsyncIterator[aiosqlite.Connection]:
         """Yield a database connection with foreign-key enforcement enabled."""
         if self._memory and self._keeper is None:
             await self.initialize()
+        self._ensure_database_parent()
         db = await aiosqlite.connect(self._connect_target, uri=self._uri)
         db.row_factory = aiosqlite.Row
         try:
+            await self._configure_connection(db)
             await db.create_function(
                 "utc_epoch_us", 1, _utc_epoch_us, deterministic=True
             )
-            await db.execute("PRAGMA foreign_keys = ON")
             yield db
         finally:
             await db.close()
