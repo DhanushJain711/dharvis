@@ -12,9 +12,11 @@ canonical database schema.
 
 - **Natural Language Processing**: Add tasks, events, and query your schedule using conversational text
 - **Task Management**: Create, complete, delete, and modify tasks with deadlines and priorities
-- **Event Management**: Create and manage events with times and locations
-- **Google Calendar Integration**: Sync with your Google Calendar for a unified view
-- **Daily Briefings**: Get summaries of your day including events, due tasks, and upcoming deadlines
+- **Safe Event Management**: Conflicting fixed events are warned about first and require an explicit later confirmation before they are created or changed
+- **Goal Sessions**: Scheduling-enabled weekly/monthly goals materialize paced, task-backed work sessions and reschedule missed automatic sessions
+- **Google Calendar Integration**: Reads visible calendars for availability and briefs; writes only owned `Kalendra` events with consistent category/kind colors
+- **Daily Briefings**: Get summaries of local commitments, external Google events, due tasks, scheduled work, and goal pace
+- **Learning From Outcomes**: Reuse observed durations only for matching completed task families; explicit estimates always take precedence
 
 ## Quick Start
 
@@ -130,6 +132,8 @@ python scripts/setup_gcal_auth.py
 
 This will open a browser for authentication and save `token.json`.
 
+Dharvis creates and updates only events it owns on its secondary `Kalendra` calendar. Owned metadata uses the canonical kinds `fixed-event`, `task-block`, and `goal-session`; it does not edit events on your primary or other visible calendars.
+
 ## Running Tests
 
 ```bash
@@ -205,6 +209,8 @@ relative dates, ambiguous references, corrections, multi-turn context, and
 cross-domain queries. Reports are written under `evals/`. An
 `OPENAI_API_KEY` is required; the scripts fail fast instead of reporting fake
 offline scores.
+
+The repository's offline checks use fake calendar/Telegram clients and do not exercise live Google Calendar, Telegram delivery, or paid OpenAI calls.
 
 ## License
 

@@ -50,6 +50,75 @@ async def test_migrates_legacy_tasks_and_events_without_data_loss(tmp_path: Path
 
 
 @pytest.mark.asyncio
+async def test_migrates_additive_goal_and_task_fields_on_existing_canonical_db(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "pre-feature.db"
+    db = sqlite3.connect(path)
+    db.executescript(
+        """
+        CREATE TABLE goals (
+            id INTEGER PRIMARY KEY, title TEXT NOT NULL, target_amount REAL NOT NULL,
+            target_unit TEXT NOT NULL, period TEXT NOT NULL, category TEXT NOT NULL,
+            active INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL
+        );
+        CREATE TABLE tasks (
+            id INTEGER PRIMARY KEY, title TEXT NOT NULL, description TEXT, deadline TEXT,
+            estimated_minutes INTEGER, category TEXT NOT NULL DEFAULT 'personal',
+            energy TEXT NOT NULL DEFAULT 'light', priority TEXT NOT NULL DEFAULT 'medium',
+            status TEXT NOT NULL DEFAULT 'pending', scheduled_start TEXT,
+            scheduled_end TEXT, gcal_event_id TEXT, goal_id INTEGER, created_at TEXT NOT NULL,
+            completed_at TEXT, actual_minutes INTEGER
+        );
+        CREATE TABLE goal_progress (
+            id INTEGER PRIMARY KEY, goal_id INTEGER NOT NULL, logged_at TEXT NOT NULL,
+            amount REAL NOT NULL, source TEXT NOT NULL
+        );
+        CREATE TABLE event_change_proposals (
+            id TEXT PRIMARY KEY, operation TEXT NOT NULL, payload TEXT NOT NULL,
+            conflicts TEXT NOT NULL, created_at TEXT NOT NULL, expires_at TEXT NOT NULL,
+            consumed_at TEXT
+        );
+        INSERT INTO goals VALUES (1, 'Legacy goal', 3, 'sessions', 'week', 'fitness', 1,
+            '2026-08-01T00:00:00Z');
+        INSERT INTO tasks VALUES (2, 'Legacy task', NULL, NULL, NULL, 'personal', 'light',
+            'medium', 'pending', NULL, NULL, NULL, 1, '2026-08-01T00:00:00Z', NULL, NULL);
+        INSERT INTO goal_progress VALUES (3, 1, '2026-08-01T00:00:00Z', 1, 'manual');
+        INSERT INTO event_change_proposals VALUES (
+            'legacy-proposal', 'create', '{}', '[]', '2026-08-01T00:00:00Z',
+            '2026-08-01T01:00:00Z', NULL
+        );
+        """
+    )
+    db.close()
+
+    await run_migrations(path)
+
+    db = sqlite3.connect(path)
+    task_columns = {row[1] for row in db.execute("PRAGMA table_info(tasks)")}
+    goal_columns = {row[1] for row in db.execute("PRAGMA table_info(goals)")}
+    progress_columns = {row[1] for row in db.execute("PRAGMA table_info(goal_progress)")}
+    proposal_columns = {
+        row[1] for row in db.execute("PRAGMA table_info(event_change_proposals)")
+    }
+    assert {"series_key", "estimate_source", "actual_minutes_source"} <= task_columns
+    assert {"session_minutes", "scheduling_enabled"} <= goal_columns
+    assert "task_id" in progress_columns
+    assert {"claimed_at", "claim_token"} <= proposal_columns
+    assert db.execute(
+        "SELECT session_minutes, scheduling_enabled FROM goals WHERE id = 1"
+    ).fetchone() == (60, 1)
+    assert db.execute("SELECT title FROM tasks WHERE id = 2").fetchone() == ("Legacy task",)
+    assert db.execute("SELECT amount FROM goal_progress WHERE id = 3").fetchone() == (1.0,)
+    assert db.execute(
+        "SELECT claimed_at, claim_token FROM event_change_proposals WHERE id = 'legacy-proposal'"
+    ).fetchone() == (None, None)
+    tables = {row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
+    assert {"goal_schedule_items", "event_change_proposals"} <= tables
+    assert not db.execute("PRAGMA foreign_key_check").fetchall()
+
+
+@pytest.mark.asyncio
 async def test_schedule_reasoning_is_database_required(tmp_path: Path) -> None:
     path = tmp_path / "schema.db"
     await run_migrations(path)

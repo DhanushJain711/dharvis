@@ -3,19 +3,30 @@
 from __future__ import annotations
 
 import re
+import logging
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import asdict, is_dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from . import timeutil
-from .calendar_service import CalendarService
+from .calendar_service import FIXED_EVENT_KIND, CalendarService
+from .config import config
 from .facts_engine import FactsEngine
-from .freebusy import find_free_blocks, query_schedule
+from .freebusy import ScheduleBlock, find_free_blocks, overlapping_blocks, query_schedule
 from .scheduler_engine import SchedulerEngine
 from .store import Store
 
 ToolHandler = Callable[..., Awaitable[Any]]
+logger = logging.getLogger(__name__)
+
+
+class _EventApplyError(RuntimeError):
+    """An event write failed with explicit compensation status."""
+
+    def __init__(self, message: str, *, compensated: bool) -> None:
+        super().__init__(message)
+        self.compensated = compensated
 _WORD_RE = re.compile(r"[a-z0-9]+")
 _STOP = {
     "about", "after", "before", "because", "from", "that", "the", "their",
@@ -71,37 +82,162 @@ async def build_tool_handlers(
         for task in tasks:
             item = dict(task)
             item["deadline"] = _aware(item.get("deadline"), "deadline")
+            # A user-supplied estimate is authoritative.  Otherwise reuse only
+            # deterministic evidence from completed tasks, falling back to the
+            # configured default when the task family has no usable history.
+            if item.get("estimated_minutes") is None:
+                inferred = await store.infer_task_duration(
+                    str(item.get("title") or ""),
+                    str(item.get("category") or "personal"),
+                    str(item.get("energy") or "light"),
+                    item.get("series_key"),
+                )
+                item["series_key"] = inferred["series_key"]
+                item["estimated_minutes"] = (
+                    inferred["estimated_minutes"] or config.DEFAULT_TASK_MINUTES
+                )
+                item["estimate_source"] = inferred["estimate_source"]
+            else:
+                item["estimate_source"] = "user"
             payloads.append(item)
         return jsonable(await store.add_tasks(payloads))
+
+    def _validate_event(event: dict[str, Any]) -> dict[str, Any]:
+        item = dict(event)
+        item["start"] = _aware(item.get("start"), "start")
+        item["end"] = _aware(item.get("end"), "end")
+        if item["start"] is None or item["end"] is None or item["end"] <= item["start"]:
+            raise ValueError("event end must be later than start")
+        return item
+
+    async def _conflicts_for(
+        events: list[dict[str, Any]], *, ignore_event_id: int | None = None
+    ) -> list[dict[str, Any]]:
+        """Check candidates against the merged live schedule and one another.
+
+        The overlap helper implements half-open intervals, so an event ending at
+        another's start remains valid while even a one-second intersection is a
+        conflict.
+        """
+        start = min(item["start"] for item in events)
+        end = max(item["end"] for item in events)
+        # Availability must not be decided from CalendarService's short-lived
+        # cache when it is about to authorize an external write.
+        occupied = await query_schedule(store, calendar, start, end, force_refresh=True)
+        if ignore_event_id is not None:
+            occupied = [
+                block for block in occupied
+                if not (block.source == "event" and block.source_id == str(ignore_event_id))
+            ]
+        conflicts: list[dict[str, Any]] = []
+        candidates = list(occupied)
+        for index, item in enumerate(events):
+            for block in overlapping_blocks(candidates, item["start"], item["end"]):
+                conflicts.append({
+                    "event_index": index,
+                    "proposed_title": item["title"],
+                    "start": item["start"], "end": item["end"],
+                    "conflict": jsonable(block),
+                })
+            # Candidate events must be checked too, making a multi-event create
+            # all-or-nothing rather than partially writing a conflicting batch.
+            candidates.append(ScheduleBlock(
+                item["start"], item["end"], str(item["title"]), "event",
+                f"candidate-{index}", {},
+            ))
+        return conflicts
+
+    async def _apply_event_create(events: list[dict[str, Any]]) -> dict[str, Any]:
+        created_remote: list[dict[str, Any]] = []
+        try:
+            for item in events:
+                created_remote.append(await calendar.create_event(
+                    item, "the user requested this fixed-time event",
+                    category=item.get("category"), kind=FIXED_EVENT_KIND,
+                ))
+            local_events = []
+            for item, created in zip(events, created_remote, strict=True):
+                local = dict(item)
+                local["source"] = "bot"
+                local["gcal_event_id"] = created["gcal_event_id"]
+                local_events.append(local)
+            records = await store.add_events(local_events)
+        except Exception as exc:
+            compensated = True
+            for created in created_remote:
+                try:
+                    await calendar.delete_event(str(created["gcal_event_id"]))
+                except Exception:
+                    # A later reconciliation can find an orphaned owned event;
+                    # never hide the original failure by replacing it here.
+                    compensated = False
+            raise _EventApplyError(
+                "event creation failed", compensated=compensated
+            ) from exc
+        schedule_changes: list[Any] = []
+        reconciliation_pending = False
+        try:
+            for item in events:
+                schedule_changes.extend(await scheduler.detect_conflicts(item["start"], item["end"]))
+        except Exception:
+            # The event and its local record have committed.  Do not turn a
+            # delayed reconciliation failure into a retryable event write.
+            logger.exception("event_conflict_reconciliation_failed")
+            schedule_changes = []
+            reconciliation_pending = True
+        result: dict[str, Any] = {"events": records, "schedule_changes": schedule_changes}
+        if reconciliation_pending:
+            result["reconciliation_pending"] = True
+            result["warning"] = "The event was added, but schedule reconciliation will retry shortly."
+        return result
+
+    async def _proposal(
+        operation: str, payload: dict[str, Any], conflicts: list[dict[str, Any]]
+    ) -> dict[str, Any]:
+        proposal = await store.create_event_change_proposal(
+            operation, jsonable(payload), jsonable(conflicts),
+            timeutil.now_utc() + timedelta(minutes=15),
+        )
+        return {
+            "confirmation_required": True,
+            "proposal_id": proposal["id"],
+            "expires_at": proposal["expires_at"],
+            "conflicts": conflicts,
+        }
+
+    def _conflict_key(conflict: dict[str, Any]) -> tuple[Any, ...]:
+        """Stable identity for a disclosed blocking interval."""
+        block = conflict.get("conflict", {})
+        return (
+            conflict.get("event_index"), block.get("source"),
+            str(block.get("source_id")), block.get("start"), block.get("end"),
+        )
+
+    def _new_conflicts(
+        current: list[dict[str, Any]], disclosed: list[dict[str, Any]]
+    ) -> list[dict[str, Any]]:
+        disclosed_keys = {_conflict_key(item) for item in disclosed}
+        return [item for item in current if _conflict_key(item) not in disclosed_keys]
+
+    async def _claim_proposal(proposal_id: str, now: datetime) -> tuple[str, dict[str, Any]] | None:
+        try:
+            claimed = await store.claim_event_change_proposal(proposal_id, now)
+        except (KeyError, ValueError):
+            return None
+        return str(claimed["claim_token"]), claimed
 
     async def add_event(events: list[dict[str, Any]]) -> Any:
         validated: list[dict[str, Any]] = []
         for event in events:
-            item = dict(event)
-            item["start"] = _aware(item.get("start"), "start")
-            item["end"] = _aware(item.get("end"), "end")
-            if item["start"] is None or item["end"] is None or item["end"] <= item["start"]:
-                raise ValueError("event end must be later than start")
-            validated.append(item)
-        records: list[dict[str, Any]] = []
-        schedule_changes: list[Any] = []
-        for item in validated:
-            created = await calendar.create_event(
-                item,
-                "the user requested this fixed-time event",
-            )
-            local = dict(item)
-            local["source"] = "bot"
-            local["gcal_event_id"] = created["gcal_event_id"]
-            try:
-                records.extend(await store.add_events([local]))
-            except Exception:
-                await calendar.delete_event(str(created["gcal_event_id"]))
-                raise
-            schedule_changes.extend(
-                await scheduler.detect_conflicts(item["start"], item["end"])
-            )
-        return jsonable({"events": records, "schedule_changes": schedule_changes})
+            validated.append(_validate_event(event))
+        conflicts = await _conflicts_for(validated)
+        if conflicts:
+            return jsonable(await _proposal("create", {"events": validated}, conflicts))
+        # Recheck after planning, immediately before calendar mutation.
+        conflicts = await _conflicts_for(validated)
+        if conflicts:
+            return jsonable(await _proposal("create", {"events": validated}, conflicts))
+        return jsonable(await _apply_event_create(validated))
 
     async def update_task(task_id: int, clear_fields: list[str], **changes: Any) -> Any:
         current = await store.get_task(task_id)
@@ -142,6 +278,45 @@ async def build_tool_handlers(
         for key in ("start", "end"):
             if key in payload:
                 payload[key] = _aware(payload[key], key)
+        proposed = dict(current)
+        proposed.update(payload)
+        proposed["start"] = payload.get("start", proposed.get("start_time"))
+        proposed["end"] = payload.get("end", proposed.get("end_time"))
+        proposed = _validate_event(proposed)
+        conflicts = await _conflicts_for([proposed], ignore_event_id=event_id)
+        proposal_payload = {
+            "event_id": event_id,
+            "clear_fields": clear_fields,
+            "changes": payload,
+        }
+        if conflicts:
+            return jsonable(await _proposal("update", proposal_payload, conflicts))
+        # Freshly read the merged schedule immediately before the external
+        # mutation; a concurrent calendar edit becomes a new proposal.
+        conflicts = await _conflicts_for([proposed], ignore_event_id=event_id)
+        if conflicts:
+            return jsonable(await _proposal("update", proposal_payload, conflicts))
+        return jsonable(await _apply_event_update(
+            event_id, current, payload, clear_fields, recheck=False
+        ))
+
+    async def _apply_event_update(
+        event_id: int,
+        current: dict[str, Any],
+        payload: dict[str, Any],
+        clear_fields: list[str],
+        *,
+        recheck: bool,
+    ) -> dict[str, Any]:
+        proposed = dict(current)
+        proposed.update(payload)
+        proposed["start"] = payload.get("start", proposed.get("start_time"))
+        proposed["end"] = payload.get("end", proposed.get("end_time"))
+        proposed = _validate_event(proposed)
+        if recheck:
+            conflicts = await _conflicts_for([proposed], ignore_event_id=event_id)
+            if conflicts:
+                raise ValueError("the calendar changed and this event still conflicts")
         gcal_id = str(current.get("gcal_event_id") or "")
         if gcal_id:
             calendar_payload = dict(payload)
@@ -149,31 +324,108 @@ async def build_tool_handlers(
                 calendar_payload[field] = None
             if set(calendar_payload) & {
                 "title", "description", "start", "end", "start_time",
-                "end_time", "location",
+                "end_time", "location", "category",
             }:
-                await calendar.update_event(gcal_id, calendar_payload)
+                await calendar.update_event(
+                    gcal_id, calendar_payload,
+                    category=proposed.get("category"), kind=FIXED_EVENT_KIND,
+                )
         payload["clear_fields"] = clear_fields
         try:
             updated = await store.update_event(event_id, payload)
-        except Exception:
+        except Exception as exc:
             if gcal_id:
-                await calendar.update_event(gcal_id, {
-                    "title": current.get("title"),
-                    "description": current.get("description"),
-                    "start_time": current.get("start_time"),
-                    "end_time": current.get("end_time"),
-                    "location": current.get("location"),
-                })
-            raise
+                try:
+                    await calendar.update_event(gcal_id, {
+                        "title": current.get("title"),
+                        "description": current.get("description"),
+                        "start_time": current.get("start_time"),
+                        "end_time": current.get("end_time"),
+                        "location": current.get("location"),
+                        "category": current.get("category"),
+                    }, category=current.get("category"), kind=FIXED_EVENT_KIND)
+                except Exception as rollback_error:
+                    raise _EventApplyError(
+                        "event update failed and calendar rollback could not be verified",
+                        compensated=False,
+                    ) from rollback_error
+            raise _EventApplyError("event update failed", compensated=True) from exc
         start = updated.get("start_time")
         end = updated.get("end_time")
-        schedule_changes = (
-            await scheduler.detect_conflicts(start, end)
-            if isinstance(start, datetime) and isinstance(end, datetime)
-            else []
-        )
+        reconciliation_pending = False
+        try:
+            schedule_changes = (
+                await scheduler.detect_conflicts(start, end)
+                if isinstance(start, datetime) and isinstance(end, datetime)
+                else []
+            )
+        except Exception:
+            logger.exception("event_conflict_reconciliation_failed")
+            schedule_changes = []
+            reconciliation_pending = True
         result = dict(updated)
         result["schedule_changes"] = schedule_changes
+        if reconciliation_pending:
+            result["reconciliation_pending"] = True
+            result["warning"] = "The event was updated, but schedule reconciliation will retry shortly."
+        return result
+
+    async def confirm_event_change(proposal_id: str) -> Any:
+        proposal = await store.get_event_change_proposal(proposal_id)
+        if proposal is None:
+            return {"applied": False, "reason": "proposal_not_found"}
+        now = timeutil.now_utc()
+        if proposal["consumed_at"] is not None:
+            return {"applied": False, "reason": "proposal_already_used"}
+        if proposal["expires_at"] <= now:
+            return {"applied": False, "reason": "proposal_expired"}
+        payload = proposal["payload"]
+        operation = proposal["operation"]
+        if operation == "create":
+            events = [_validate_event(event) for event in payload["events"]]
+            conflicts = await _conflicts_for(events)
+            if _new_conflicts(conflicts, proposal["conflicts"]):
+                return jsonable(await _proposal("create", {"events": events}, conflicts))
+            claim = await _claim_proposal(proposal_id, now)
+            if claim is None:
+                return {"applied": False, "reason": "proposal_unavailable"}
+            token, _ = claim
+            try:
+                result = await _apply_event_create(events)
+            except _EventApplyError as exc:
+                if exc.compensated:
+                    await store.release_event_change_proposal(proposal_id, token)
+                raise
+            await store.finalize_event_change_proposal(proposal_id, token)
+            return jsonable(result)
+        event_id = int(payload["event_id"])
+        current = await store.get_event(event_id)
+        if current is None:
+            return {"applied": False, "reason": "event_not_found"}
+        changes = dict(payload["changes"])
+        for key in ("start", "end"):
+            if key in changes:
+                changes[key] = _aware(changes[key], key)
+        proposed = dict(current)
+        proposed.update(changes)
+        proposed["start"] = changes.get("start", proposed.get("start_time"))
+        proposed["end"] = changes.get("end", proposed.get("end_time"))
+        conflicts = await _conflicts_for([_validate_event(proposed)], ignore_event_id=event_id)
+        if _new_conflicts(conflicts, proposal["conflicts"]):
+            return jsonable(await _proposal("update", payload, conflicts))
+        claim = await _claim_proposal(proposal_id, now)
+        if claim is None:
+            return {"applied": False, "reason": "proposal_unavailable"}
+        token, _ = claim
+        try:
+            result = await _apply_event_update(
+                event_id, current, changes, list(payload["clear_fields"]), recheck=False
+            )
+        except _EventApplyError as exc:
+            if exc.compensated:
+                await store.release_event_change_proposal(proposal_id, token)
+            raise
+        await store.finalize_event_change_proposal(proposal_id, token)
         return jsonable(result)
 
     async def complete_task(task_id: int, actual_minutes: int | None) -> Any:
@@ -306,6 +558,7 @@ async def build_tool_handlers(
         "add_event": add_event,
         "update_task": update_task,
         "update_event": update_event,
+        "confirm_event_change": confirm_event_change,
         "complete_task": complete_task,
         "delete_task": delete_task,
         "delete_event": delete_event,

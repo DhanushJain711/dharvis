@@ -381,11 +381,28 @@ def _schedule_block(record: Mapping[str, Any], source: Literal["gcal", "event", 
 
 
 async def query_schedule(
-    store: Store, calendar: CalendarService, start: datetime, end: datetime
+    store: Store,
+    calendar: CalendarService,
+    start: datetime,
+    end: datetime,
+    *,
+    force_refresh: bool = False,
 ) -> list[ScheduleBlock]:
-    """Return a merged, sorted view of all occupied schedule sources."""
+    """Return a merged, sorted view of all occupied sources.
+
+    ``force_refresh`` is for write-adjacent availability checks, where a
+    cached Google result could otherwise permit a stale placement.
+    """
     range_start, range_end = _validate_range(start, end)
-    google_records = await calendar.list_events(range_start, range_end)
+    # Avoid passing the new keyword on ordinary reads so existing lightweight
+    # calendar adapters that implement the old two-argument method remain
+    # compatible.
+    if force_refresh:
+        google_records = await calendar.list_events(
+            range_start, range_end, force_refresh=True
+        )
+    else:
+        google_records = await calendar.list_events(range_start, range_end)
     if getattr(calendar, "_last_query_complete", True) is False:
         raise CalendarQueryIncompleteError(
             "Google Calendar returned an incomplete event set; availability is unknown"
@@ -495,11 +512,24 @@ async def find_free_blocks(
     )
 
 
-def has_conflict(blocks: list[ScheduleBlock], start: datetime, end: datetime) -> bool:
-    """Return whether a proposed aware UTC block overlaps an occupied block."""
+def overlapping_blocks(
+    blocks: Sequence[ScheduleBlock], start: datetime, end: datetime
+) -> list[ScheduleBlock]:
+    """Return blocks intersecting a proposed half-open aware UTC interval.
+
+    Touching boundaries are not conflicts.  Callers that are updating an
+    existing event can filter its source id from the returned records without
+    weakening the shared interval semantics.
+    """
     proposed_start, proposed_end = _validate_range(start, end)
+    overlaps: list[ScheduleBlock] = []
     for block in blocks:
         block_start, block_end = _validate_range(block.start, block.end)
         if block_start < proposed_end and proposed_start < block_end:
-            return True
-    return False
+            overlaps.append(block)
+    return sorted(overlaps, key=lambda block: (block.start, block.end, block.title))
+
+
+def has_conflict(blocks: list[ScheduleBlock], start: datetime, end: datetime) -> bool:
+    """Return whether a proposed aware UTC block overlaps an occupied block."""
+    return bool(overlapping_blocks(blocks, start, end))

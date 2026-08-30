@@ -14,6 +14,7 @@ TaskStatus = Literal["pending", "scheduled", "completed", "dropped"]
 DecisionAction = Literal["scheduled", "moved", "unscheduled", "shortened", "extended"]
 Trigger = Literal["daily_plan", "conflict", "user_request", "deadline_shift", "goal_quota"]
 ProgressSource = Literal["task", "manual", "inferred"]
+ActualMinutesSource = Literal["user", "debrief", "calendar", "inferred"]
 MessageRole = Literal["user", "assistant", "tool"]
 ScheduleSource = Literal["gcal", "event", "task"]
 ReasoningVerbosity = Literal["brief", "full"]
@@ -81,7 +82,8 @@ get_tool_schemas() -> list[ToolSchema]
 
 ```text
 add_task             add_event              update_task
-update_event         complete_task          delete_task
+update_event         confirm_event_change   complete_task
+delete_task
 delete_event         query_schedule         query_tasks
 find_free_blocks     schedule_task          explain_schedule
 add_fact             update_fact            query_facts
@@ -89,7 +91,7 @@ add_goal             log_goal_progress      query_goals
 resolve_date
 ```
 
-`schedule_task.reasoning` is required and is a one-sentence explanation recorded at decision time. Its handler must call `Store.apply_schedule_decision` so placement and rationale commit atomically. `add_task` and `add_event` accept arrays. Strict update schemas require every field: `null` means unchanged, while nullable values are cleared only through the required `clear_fields` array (`[]` means clear nothing).
+`schedule_task.reasoning` is required and is a one-sentence explanation recorded at decision time. Its handler must call `Store.apply_schedule_decision` so placement and rationale commit atomically. `add_task` and `add_event` accept arrays. Tasks include a nullable `series_key`, which groups recurring work for deterministic duration inference; an explicit `estimated_minutes` wins over inferred evidence and the configured default. Conflicting fixed-event changes return a one-time proposal and require `confirm_event_change` in a later user turn. Strict update schemas require every field: `null` means unchanged, while nullable values are cleared only through the required `clear_fields` array (`[]` means clear nothing).
 
 ## Schema migration (`src.migrate`)
 
@@ -113,7 +115,14 @@ Store.get_task(task_id: int) -> Record | None  # async
 Store.get_event(event_id: int) -> Record | None  # async
 Store.update_task(task_id: int, changes: Record) -> Record  # async
 Store.update_event(event_id: int, changes: Record) -> Record  # async
-Store.complete_task(task_id: int, actual_minutes: int | None = None) -> Record  # async
+Store.create_event_change_proposal(operation: Literal["create", "update"], payload: Record, conflicts: list[Record], expires_at: datetime) -> Record  # async
+Store.get_event_change_proposal(proposal_id: str) -> Record | None  # async
+Store.consume_event_change_proposal(proposal_id: str, consumed_at: datetime | None = None) -> Record  # async
+Store.claim_event_change_proposal(proposal_id: str, claimed_at: datetime | None = None) -> Record  # async
+Store.finalize_event_change_proposal(proposal_id: str, claim_token: str, consumed_at: datetime | None = None) -> Record  # async
+Store.release_event_change_proposal(proposal_id: str, claim_token: str) -> Record  # async
+Store.infer_task_duration(title: str, category: str, energy: str, series_key: str | None = None, limit: int = 5) -> Record  # async
+Store.complete_task(task_id: int, actual_minutes: int | None = None, actual_minutes_source: ActualMinutesSource | None = None) -> Record  # async
 Store.drop_task(task_id: int) -> Record  # async
 Store.delete_task(task_id: int) -> Record  # async; drops without erasing history
 Store.delete_event(event_id: int) -> bool  # async
@@ -121,15 +130,24 @@ Store.query_tasks(status: TaskStatus | None = None, category: str | None = None,
 Store.query_events(start: datetime, end: datetime) -> list[Record]  # async
 Store.apply_schedule_decision(task_id: int, action: DecisionAction, start: datetime, end: datetime, previous_start: datetime | None, previous_end: datetime | None, trigger: Trigger, reasoning: str, facts_used: list[int], gcal_event_id: str | None) -> Record  # async, one DB transaction
 Store.get_schedule_decisions(task_id: int) -> list[Record]  # async
+Store.get_decisions_for_task(task_id: int) -> list[Record]  # async
+Store.get_unsurfaced_decisions(since: datetime) -> list[Record]  # async
+Store.get_schedule_decisions_between(start: datetime, end: datetime) -> list[Record]  # async
 Store.mark_decision_surfaced(decision_id: int) -> None  # async
 Store.add_fact(fact: Record) -> Record  # async
 Store.update_fact(fact_id: int, changes: Record) -> Record  # async
 Store.query_facts(category: str | None = None, active: bool | None = True, min_confidence: float | None = None) -> list[Record]  # async
 Store.add_goal(goal: Record) -> Record  # async
-Store.log_goal_progress(goal_id: int, amount: float, source: ProgressSource, logged_at: datetime) -> Record  # async
+Store.log_goal_progress(goal_id: int, amount: float, source: ProgressSource, logged_at: datetime, task_id: int | None = None) -> Record  # async
+Store.get_goal_progress(goal_id: int, period_start: datetime) -> Record  # async
+Store.ensure_goal_schedule_item(goal_id: int, task: Record, period_start: datetime, period_end: datetime, ordinal: int, planned_amount: float) -> Record  # async
+Store.get_goal_schedule_items(goal_id: int, period_start: datetime, period_end: datetime) -> list[Record]  # async
+Store.cancel_goal_schedule_items(goal_id: int, period_start: datetime, period_end: datetime, keep_count: int) -> list[Record]  # async
+Store.finalize_cancelled_goal_schedule_items(goal_id: int, period_start: datetime, period_end: datetime, *, task_ids: Sequence[int]) -> list[Record]  # async
 Store.query_goals(active: bool | None = True, category: str | None = None) -> list[Record]  # async
 Store.append_message(role: MessageRole, content: str, tool_calls: list[Record], session_id: str) -> Record  # async
 Store.get_messages(session_id: str, limit: int = 100) -> list[Record]  # async
+Store.get_messages_between(start: datetime, end: datetime) -> list[Record]  # async
 Store.get_daily_log(local_date: date) -> Record | None  # async
 Store.upsert_daily_log(local_date: date, changes: Record) -> Record  # async
 Store.record_usage(component: Literal["agent_loop", "session_summary", "scheduler", "facts"], model: str, usage: Record, estimated_cost_usd: float | None, session_id: str | None = None) -> None  # async
@@ -137,7 +155,7 @@ Store.usage_summary(start: datetime, end: datetime) -> list[Record]  # async
 create_store(db_path: str | Path | None = None) -> Store  # async
 ```
 
-Every Store connection enables `PRAGMA foreign_keys = ON`. `apply_schedule_decision` is the only placement mutation contract: it updates the task placement and inserts the nonblank `schedule_decisions` row in one transaction. `facts_used` accepts only existing integer fact IDs.
+Every Store connection enables `PRAGMA foreign_keys = ON`. `apply_schedule_decision` is the only placement mutation contract: it updates the task placement and inserts the nonblank `schedule_decisions` row in one transaction. `facts_used` accepts only existing integer fact IDs. Event-change proposals are one-time, expiring records: callers claim a proposal before the external write, finalize it only after the write succeeds, and release the claim only after compensated failure. Goal-session cancellation is likewise two phase: retain its local calendar ID until the owned remote block is deleted, then finalize the local cleanup. `infer_task_duration` uses only recent completed tasks with the same normalized `series_key`, category, and energy; it takes a robust median of recorded `actual_minutes`, returns evidence task IDs, and uses neither a model nor a vector index.
 
 ## Calendar (`src.calendar_service`)
 
@@ -147,23 +165,23 @@ CalendarReconnectRequiredError(CalendarError)
 CalendarReconnectRequired = CalendarReconnectRequiredError
 CalendarService(credentials_path: Path | None = None, token_path: Path | None = None, calendar_id: str | None = None)
 CalendarService.is_available() -> bool
-CalendarService.list_events(start: datetime, end: datetime) -> list[CalendarRecord]  # async
-CalendarService.get_events_between(start: datetime, end: datetime) -> list[CalendarRecord]  # async
+CalendarService.list_events(start: datetime, end: datetime, *, force_refresh: bool = False) -> list[CalendarRecord]  # async
+CalendarService.get_events_between(start: datetime, end: datetime, *, force_refresh: bool = False) -> list[CalendarRecord]  # async
 CalendarService.get_today_events() -> list[CalendarRecord]  # async
 CalendarService.get_upcoming_events(days: int = 7) -> list[CalendarRecord]  # async
 CalendarService.check_availability(start: datetime, end: datetime) -> bool  # async
-CalendarService.create_event(event: CalendarRecord, reasoning: str | None = None) -> CalendarRecord  # async
-CalendarService.update_event(gcal_event_id: str, changes: CalendarRecord) -> CalendarRecord  # async
+CalendarService.create_event(event: CalendarRecord, reasoning: str | None = None, *, category: str | None = None, kind: str = "fixed-event") -> CalendarRecord  # async
+CalendarService.update_event(gcal_event_id: str, changes: CalendarRecord, *, category: str | None = None, kind: str | None = None) -> CalendarRecord  # async
 CalendarService.delete_event(gcal_event_id: str) -> None  # async
 CalendarService.clear_kalendra_range(start: datetime, end: datetime) -> None  # async
-CalendarService.create_work_block(task_id: int, title: str, start: datetime, end: datetime, reasoning: str | None = None) -> str  # async
-CalendarService.update_work_block(gcal_event_id: str, title: str, start: datetime, end: datetime, reasoning: str | None = None) -> None  # async
+CalendarService.create_work_block(task_id: int, title: str, start: datetime, end: datetime, reasoning: str | None = None, *, category: str | None = None, kind: str = "task-block", goal_id: int | None = None) -> str  # async
+CalendarService.update_work_block(gcal_event_id: str, title: str, start: datetime, end: datetime, reasoning: str | None = None, *, category: str | None = None, kind: str = "task-block", goal_id: int | None = None) -> None  # async
 CalendarService.delete_work_block(gcal_event_id: str) -> None  # async
 run_oauth_flow(credentials_path: Path | None = None, token_path: Path | None = None) -> bool
 create_calendar_service() -> CalendarService  # async
 ```
 
-OAuth uses the read/write Calendar scope. Reads cover every visible calendar and cache complete results in memory for 60 seconds. Writes are restricted to marked, application-owned events on a dedicated secondary calendar named `Kalendra`; its ID is persisted beside the OAuth token, and primary-calendar events are never mutated. Creating a block requires a nonblank rationale, supplied as `reasoning` or `event["reasoning"]`, which is rendered in the Google event description. `clear_kalendra_range` deletes only marked Kalendra blocks. Credential refresh is transparent; absent, invalid, rejected, or unrefreshable credentials raise `CalendarReconnectRequiredError` so callers can request reconnection.
+OAuth uses the read/write Calendar scope. Reads cover every visible calendar and cache complete results in memory for 60 seconds; `force_refresh=True` bypasses that cache for write-adjacent safety checks. Returned Google records retain visible-calendar metadata (summary, primary/access role, and colors). Writes are restricted to marked, application-owned events on a dedicated secondary calendar named `Kalendra`; its ID is persisted beside the OAuth token, and primary-calendar events are never mutated. New owned events carry `kalendra_owned=v1` and canonical `kalendra_kind` values `fixed-event`, `task-block`, or `goal-session` (the legacy work-block marker remains readable). Category and kind select deterministic Google color IDs unless the user supplied a valid color; a manual nondefault color survives later metadata updates. Creating a block requires a nonblank rationale, supplied as `reasoning` or `event["reasoning"]`, which is rendered in the Google event description. `clear_kalendra_range` and `delete_work_block` delete only owned movable task/goal blocks, never fixed events; remote 404 deletion is retry-safe. Credential refresh is transparent; absent, invalid, rejected, or unrefreshable credentials raise `CalendarReconnectRequiredError` so callers can request reconnection.
 
 Every returned `start_time` and `end_time` is UTC-aware ISO-8601 text. Google `dateTime` offsets are converted to UTC; all-day `date` values become the UTC instants for local midnight boundaries. Event end times are required and later than starts.
 
@@ -178,13 +196,16 @@ CalendarQueryIncompleteError(CalendarError)
 compute_free_blocks(start: datetime, end: datetime, min_minutes: int, constraints: Any) -> list[FreeBlock]
 is_free(start: datetime, end: datetime, constraints: Any) -> bool
 next_free_block(after: datetime, min_minutes: int, constraints: Any, *, search_end: datetime) -> FreeBlock | None
-query_schedule(store: Store, calendar: CalendarService, start: datetime, end: datetime) -> list[ScheduleBlock]  # async
+query_schedule(store: Store, calendar: CalendarService, start: datetime, end: datetime, *, force_refresh: bool = False) -> list[ScheduleBlock]  # async
 merge_blocks(blocks: list[ScheduleBlock]) -> list[ScheduleBlock]
 find_free_blocks(store: Store, calendar: CalendarService, start: datetime, end: datetime, min_minutes: int) -> list[FreeBlock]  # async
+overlapping_blocks(blocks: Sequence[ScheduleBlock], start: datetime, end: datetime) -> list[ScheduleBlock]
 has_conflict(blocks: list[ScheduleBlock], start: datetime, end: datetime) -> bool
 ```
 
 `compute_free_blocks` is deterministic and accepts mapping- or object-style constraints. Busy values may be supplied as `busy_intervals`, `busy_blocks`, or `busy`; waking and quiet hours accept clock pairs or `{start, end}` mappings; `timezone` selects the IANA zone; and `buffer_minutes` defaults to 15. It merges overlapping buffered busy intervals, respects cross-midnight waking and quiet hours, interprets all-day boundaries at local midnight, and constructs each local day independently so DST transitions retain their real elapsed length. Free blocks identify their adjacent blockers through `after` and `before` (also exposed by the compatibility properties `after_title` and `before_title`).
+
+`query_schedule(..., force_refresh=True)` makes the Google portion a cache-bypassing read and still fails closed when that response is incomplete. `overlapping_blocks` uses half-open intervals, so touching boundaries are not conflicts.
 
 ## Agent and history (`src.agent`, `src.history`)
 
@@ -226,14 +247,20 @@ SchedulerEngine(store: Store, calendar: CalendarService)
 SchedulerEngine.choose_slot(task_id: int, candidates: list[FreeBlock], trigger: Trigger) -> ScheduleDecision  # async
 SchedulerEngine.schedule_task(task_id: int, start: datetime, end: datetime, reasoning: str, trigger: Trigger, facts_used: list[int] | None = None) -> ScheduleDecision  # async
 SchedulerEngine.plan_day(local_date: date) -> list[ScheduleDecision]  # async
+SchedulerEngine.reconcile_goal_schedule(reference: date | datetime | None = None, **kwargs: Any) -> list[ScheduleDecision]  # async
+SchedulerEngine.replan_missed_goal_sessions(reference: date | datetime | None = None, **kwargs: Any) -> list[ScheduleDecision]  # async
+SchedulerEngine.refresh_goal_plan(reference: date | datetime | None = None, **kwargs: Any) -> list[ScheduleDecision]  # async
 SchedulerEngine.build_daily_plan(local_date: date) -> list[ScheduleDecision]  # async
 SchedulerEngine.reschedule(reason: str, affected_range: Any, *, trigger: Trigger = "conflict") -> list[ScheduleDecision]  # async
 SchedulerEngine.detect_conflicts(start: datetime | None = None, end: datetime | None = None) -> list[ScheduleDecision]  # async
 SchedulerEngine.format_change_summary(decisions: Sequence[Any], *, mark_surfaced: bool = True) -> str  # async
+SchedulerEngine.mark_decisions_surfaced(decisions: Sequence[Any]) -> None  # async
 SchedulerEngine.resolve_conflicts(start: datetime, end: datetime) -> list[ScheduleDecision]  # async
 SchedulerEngine.explain_schedule(task_id: int) -> list[dict[str, object]]  # async
 create_scheduler_engine(store: Store, calendar: CalendarService) -> SchedulerEngine  # async
 ```
+
+`reconcile_goal_schedule` materializes idempotent goal-session tasks for outstanding weekly or monthly quota, schedules urgent ordinary work first, and paces goal sessions across remaining local dates. Elapsed automatic sessions are rescheduled; manually requested placements remain fixed. It also retries durable two-phase cleanup of surplus goal sessions. Conflict detection repairs manual Google moves, removes owned orphan work blocks when safe, and emits a durable repair-required signal if a remote repair cannot complete.
 
 ## Proactive jobs (`src.jobs`)
 
@@ -254,6 +281,7 @@ run_startup_catchup() -> None  # async
 ```python
 FactsEngine(store: Store)
 FactsEngine.extract_facts(user_message: str, assistant_message: str) -> list[Fact]  # async
+FactsEngine.extract_from_day(daily_log: Mapping[str, Any] | Sequence[Any] | str | None, conversation: Sequence[Any] | Mapping[str, Any] | str | None, decisions: Sequence[Any] | Mapping[str, Any] | str | None) -> list[Fact]  # async
 FactsEngine.consolidate(candidates: list[Fact]) -> list[Fact]  # async
 FactsEngine.relevant_facts(context: str, category: str | None = None, limit: int = 20) -> list[Fact]  # async
 FactsEngine.seed_facts(facts: list[Fact]) -> list[Fact]  # async

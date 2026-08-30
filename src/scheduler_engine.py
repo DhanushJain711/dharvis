@@ -10,8 +10,10 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
+import inspect
 import json
 import logging
+import math
 import re
 from time import monotonic
 from typing import Any, Literal, Mapping, Sequence
@@ -213,6 +215,58 @@ def _planning_floor(now: datetime | None = None) -> datetime:
     return (current + timedelta(minutes=2)).replace(second=0, microsecond=0)
 
 
+def _is_generated_goal_task(task: Mapping[str, Any]) -> bool:
+    """Return whether a task is an application-generated goal occurrence."""
+    return (
+        task.get("estimate_source") == "goal"
+        or str(task.get("series_key") or "").startswith("goal:")
+    ) and type(task.get("goal_id")) is int
+
+
+def _goal_period_bounds(
+    goal: Mapping[str, Any], reference: date | datetime | None = None
+) -> tuple[datetime, datetime]:
+    """Return the goal's local calendar period as a half-open UTC range."""
+    if reference is None:
+        local_day = timeutil.now_local().date()
+    elif isinstance(reference, datetime):
+        if reference.tzinfo is None or reference.utcoffset() is None:
+            raise ValueError("goal planning reference must be timezone-aware")
+        local_day = timeutil.to_local(reference).date()
+    elif isinstance(reference, date):
+        local_day = reference
+    else:
+        raise TypeError("goal planning reference must be a date or aware datetime")
+    if goal.get("period") == "week":
+        start_day = local_day - timedelta(days=local_day.weekday())
+        end_day = start_day + timedelta(days=7)
+    elif goal.get("period") == "month":
+        start_day = local_day.replace(day=1)
+        end_day = (
+            date(start_day.year + 1, 1, 1)
+            if start_day.month == 12
+            else date(start_day.year, start_day.month + 1, 1)
+        )
+    else:
+        raise ValueError(f"Unsupported goal period: {goal.get('period')!r}")
+    return timeutil.day_bounds(start_day)[0], timeutil.day_bounds(end_day)[0]
+
+
+def _goal_energy(category: str) -> str:
+    if category in {"school", "work", "career"}:
+        return "deep_focus"
+    if category == "errand":
+        return "errand"
+    return "light"
+
+
+def _item_task(item: Mapping[str, Any]) -> dict[str, Any] | None:
+    task = item.get("task")
+    if isinstance(task, Mapping):
+        return dict(task)
+    return None
+
+
 class SchedulerEngine:
     """Coordinate model ranking, deterministic validation, and atomic logging."""
 
@@ -240,6 +294,60 @@ class SchedulerEngine:
             self._client = AsyncOpenAI(api_key=config.OPENAI_API_KEY or None)
         return self._client
 
+    @staticmethod
+    def _calendar_metadata(task: Mapping[str, Any]) -> dict[str, Any]:
+        """Build optional Calendar metadata without breaking older adapters."""
+        if not _is_generated_goal_task(task):
+            return {"category": task.get("category"), "kind": "task-block"}
+        return {
+            "category": task.get("category"),
+            "kind": "goal-session",
+            "goal_id": int(task["goal_id"]),
+        }
+
+    @staticmethod
+    def _supported_kwargs(callable_object: Any, values: Mapping[str, Any]) -> dict[str, Any]:
+        """Pass new optional metadata only when a calendar adapter accepts it."""
+        try:
+            parameters = inspect.signature(callable_object).parameters.values()
+        except (TypeError, ValueError):
+            return {}
+        if any(parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in parameters):
+            return dict(values)
+        names = {parameter.name for parameter in parameters}
+        return {key: value for key, value in values.items() if key in names}
+
+    async def _create_work_block(
+        self,
+        task: Mapping[str, Any],
+        title: str,
+        start: datetime,
+        end: datetime,
+        reasoning: str,
+    ) -> str:
+        kwargs = self._supported_kwargs(
+            self.calendar.create_work_block, self._calendar_metadata(task)
+        )
+        return await self.calendar.create_work_block(
+            int(task["id"]), title, start, end, reasoning, **kwargs
+        )
+
+    async def _update_work_block(
+        self,
+        task: Mapping[str, Any],
+        gcal_event_id: str,
+        title: str,
+        start: datetime,
+        end: datetime,
+        reasoning: str,
+    ) -> None:
+        kwargs = self._supported_kwargs(
+            self.calendar.update_work_block, self._calendar_metadata(task)
+        )
+        await self.calendar.update_work_block(
+            gcal_event_id, title, start, end, reasoning, **kwargs
+        )
+
     async def _response_json(self, payload: dict[str, Any], retry_error: str | None) -> dict[str, Any]:
         system = (
             "You place personal tasks into precomputed free blocks. You rank and assign only; "
@@ -248,7 +356,10 @@ class SchedulerEngine:
             "from that block's start. You may omit tasks that cannot safely fit. Weigh deadline "
             "urgency, estimated duration versus block capacity, deep-focus energy earlier in the "
             "user's productive day, explicit learned habits, goals behind quota, and the user's "
-            "real priority ordering in the facts even when paper priority differs. Every reasoning "
+            "real priority ordering in the facts even when paper priority differs. Goal occurrences "
+            "must be paced across the remaining period: honor reserved_goal_dates, put session goals "
+            "on different local dates, and do not crowd goal work ahead of a high-priority task with "
+            "an earlier deadline. Every reasoning "
             "field must name the concrete constraint that drove it: a deadline, duration or block "
             "boundary, energy/time-of-day match, cited habit fact, behind goal quota, or priority. "
             "Before emitting an assignment, verify its reason contains at least one literal value "
@@ -565,6 +676,7 @@ class SchedulerEngine:
         cursors = {block_id: block.start for block_id, block in blocks}
         seen_tasks: set[int] = set()
         placements: list[_Placement] = []
+        goal_dates: dict[int, set[str]] = {}
         for index, assignment in enumerate(assignments):
             if not isinstance(assignment, dict) or set(assignment) != {
                 "task_id", "block_id", "reasoning", "facts_used"
@@ -607,6 +719,24 @@ class SchedulerEngine:
             deadline = task.get("deadline")
             if deadline is not None and end > _utc(deadline, f"task {task_id} deadline"):
                 raise SchedulingPlanError(f"task {task_id} would end after its deadline")
+            if _is_generated_goal_task(task):
+                goal_id = int(task["goal_id"])
+                goal = next((item for item in goals if item.get("id") == goal_id), None)
+                if goal is None:
+                    raise SchedulingPlanError(
+                        f"generated goal task {task_id} references unknown goal {goal_id}"
+                    )
+                local_day = timeutil.to_local(start).date().isoformat()
+                reserved = {
+                    str(value) for value in task.get("reserved_goal_dates", [])
+                }
+                if goal.get("target_unit") == "sessions":
+                    used = goal_dates.setdefault(goal_id, set())
+                    if local_day in reserved or local_day in used:
+                        raise SchedulingPlanError(
+                            f"session goal {goal_id} has more than one occurrence on {local_day}"
+                        )
+                    used.add(local_day)
             placements.append(_Placement(
                 task, block_id, start, end, " ".join(reason.split()), list(fact_ids)
             ))
@@ -632,7 +762,8 @@ class SchedulerEngine:
             "timezone": config.USER_TIMEZONE,
             "tasks": [{key: task.get(key) for key in (
                 "id", "title", "deadline", "estimated_minutes", "category", "energy",
-                "priority", "goal_id", "urgency_score",
+                "priority", "goal_id", "urgency_score", "series_key", "estimate_source",
+                "reserved_goal_dates",
             )} for task in tasks],
             "free_blocks": [{
                 "block_id": block_id,
@@ -706,15 +837,18 @@ class SchedulerEngine:
         end: datetime,
         releasing_intervals: Mapping[int, tuple[datetime, datetime]] | None = None,
     ) -> bool:
-        # Use unique, slightly wider read bounds to bypass CalendarService's
-        # 60-second cache. Availability checks are safety barriers and must see
-        # events added after the planning snapshot.
-        cache_buster = timedelta(
-            microseconds=1 + int(monotonic() * 1_000_000) % 1_000_000
-        )
-        occupied = await query_schedule(
-            self.store, self.calendar, start - cache_buster, end + cache_buster
-        )
+        # This is the last safety barrier before a Calendar write. Force a
+        # Google refresh; changing query bounds is not a correctness guarantee.
+        try:
+            occupied = await query_schedule(
+                self.store, self.calendar, start, end, force_refresh=True
+            )
+        except TypeError as exc:
+            # Small legacy test adapters have no cache and expose only the
+            # old two-argument `list_events`; retain their compatibility.
+            if "force_refresh" not in str(exc):
+                raise
+            occupied = await query_schedule(self.store, self.calendar, start, end)
         releasing = releasing_intervals or {}
         retained: list[ScheduleBlock] = []
         for block in occupied:
@@ -798,24 +932,32 @@ class SchedulerEngine:
             history = await self.store.get_decisions_for_task(task_id)
             if history:
                 previous_reason = str(history[0].get("reasoning") or previous_reason)
-            await self.calendar.update_work_block(old_gcal_id, title, start, end, rationale)
+            await self._update_work_block(task, old_gcal_id, title, start, end, rationale)
         else:
-            gcal_id = await self.calendar.create_work_block(task_id, title, start, end, rationale)
+            gcal_id = await self._create_work_block(task, title, start, end, rationale)
         try:
             record = await self.store.apply_schedule_decision(
                 task_id, action, start, end, previous_start, previous_end, trigger,
                 rationale, facts_used, gcal_id,
             )
         except Exception:
+            repair_needed = False
             try:
                 if old_gcal_id and previous_start is not None and previous_end is not None:
-                    await self.calendar.update_work_block(
-                        old_gcal_id, title, previous_start, previous_end, previous_reason
+                    await self._update_work_block(
+                        task, old_gcal_id, title, previous_start, previous_end, previous_reason
                     )
                 elif gcal_id:
                     await self.calendar.delete_work_block(gcal_id)
             except Exception:
+                repair_needed = True
                 logger.exception("calendar_schedule_rollback_failed")
+            if repair_needed:
+                await self._emit_scheduler_signal({
+                    "kind": "calendar_sqlite_repair_required", "task_id": task_id,
+                    "gcal_event_id": gcal_id, "action": action,
+                    "uncertainty": "calendar mutation may not match rejected SQLite placement",
+                })
             raise
         decision = self._decision(record, task, gcal_id)
         logger.info(
@@ -931,8 +1073,194 @@ class SchedulerEngine:
         """Compatibility alias for :meth:`build_daily_plan`."""
         return await self.build_daily_plan(local_date)
 
-    async def _calendar_records(self, start: datetime, end: datetime) -> list[dict[str, Any]]:
-        records = await self.calendar.list_events(start, end)
+    @staticmethod
+    def _goal_chunks(goal: Mapping[str, Any]) -> list[tuple[int, float]]:
+        """Return deterministic (minutes, credited amount) goal occurrences."""
+        progress = goal.get("progress") if isinstance(goal.get("progress"), Mapping) else {}
+        remaining = max(0.0, float(progress.get("amount_remaining", 0.0) or 0.0))
+        session_minutes = int(goal.get("session_minutes") or 60)
+        if goal.get("target_unit") == "sessions":
+            return [(session_minutes, 1.0) for _ in range(math.ceil(remaining))]
+        remaining_minutes = math.ceil(remaining * 60)
+        chunks: list[tuple[int, float]] = []
+        while remaining_minutes:
+            minutes = min(session_minutes, remaining_minutes)
+            chunks.append((minutes, minutes / 60.0))
+            remaining_minutes -= minutes
+        return chunks
+
+    async def reconcile_goal_schedule(
+        self, reference: date | datetime | None = None, **_: Any
+    ) -> list[ScheduleDecision]:
+        """Materialize and safely place the outstanding quota for the current period.
+
+        Goal occurrences are ordinary tasks so their placement remains governed by
+        the same free/busy, calendar-write, and audit path as user-created tasks.
+        """
+        if reference is not None and not isinstance(reference, (date, datetime)):
+            raise TypeError("reference must be a date or timezone-aware datetime")
+        if isinstance(reference, datetime) and (reference.tzinfo is None or reference.utcoffset() is None):
+            raise ValueError("reference must be timezone-aware")
+        now = _utc(reference, "reference") if isinstance(reference, datetime) else timeutil.now_utc()
+        floor = _planning_floor(now)
+        async with self._mutation_lock:
+            goals, facts, ordinary = await asyncio.gather(
+                self.store.query_goals(active=True), self.store.query_facts(active=True),
+                self.store.get_schedulable_tasks(),
+            )
+            enabled = [goal for goal in goals if bool(goal.get("scheduling_enabled", True))]
+            generated: list[dict[str, Any]] = []
+            for goal in enabled:
+                period_start, period_end = _goal_period_bounds(goal, reference)
+                chunks = self._goal_chunks(goal)
+                existing = await self.store.get_goal_schedule_items(
+                    int(goal["id"]), period_start, period_end
+                )
+                # A prior remote deletion may have failed after the Store
+                # recorded cancellation. Retry those exact owned IDs before
+                # doing any new quota work; their local intervals deliberately
+                # remain busy until this cleanup is confirmed.
+                pending_cleanup = [
+                    item for item in existing if item.get("cancelled_at")
+                ]
+                for item in pending_cleanup:
+                    task = _item_task(item)
+                    if task and task.get("gcal_event_id"):
+                        await self.calendar.delete_work_block(str(task["gcal_event_id"]))
+                if pending_cleanup:
+                    await self.store.finalize_cancelled_goal_schedule_items(
+                        int(goal["id"]),
+                        period_start,
+                        period_end,
+                        task_ids=[int(item["task_id"]) for item in pending_cleanup],
+                    )
+                active_items = [item for item in existing if not item.get("cancelled_at")]
+                # Create stable ordinals before attempting placement, so retries
+                # and restarts cannot duplicate a quota occurrence.
+                for ordinal, (minutes, amount) in enumerate(chunks, 1):
+                    item = await self.store.ensure_goal_schedule_item(
+                        int(goal["id"]),
+                        {
+                            "title": f"{goal['title']} — session {ordinal}",
+                            "deadline": period_end,
+                            "estimated_minutes": minutes,
+                            "category": goal["category"],
+                            "energy": _goal_energy(str(goal["category"])),
+                            "priority": "medium",
+                            "series_key": f"goal:{goal['id']}",
+                            "estimate_source": "goal",
+                        }, period_start, period_end, ordinal, amount,
+                    )
+                    if not item.get("cancelled_at"):
+                        active_items.append(item)
+                cancelled = await self.store.cancel_goal_schedule_items(
+                    int(goal["id"]), period_start, period_end, len(chunks)
+                )
+                for item in cancelled:
+                    task = _item_task(item)
+                    if task and task.get("gcal_event_id"):
+                        # Retain the local event ID until this succeeds; then the
+                        # Store finalizer removes the no-longer-real local busy
+                        # interval without ever clearing a calendar range.
+                        await self.calendar.delete_work_block(str(task["gcal_event_id"]))
+                if cancelled:
+                    await self.store.finalize_cancelled_goal_schedule_items(
+                        int(goal["id"]),
+                        period_start,
+                        period_end,
+                        task_ids=[int(item["task_id"]) for item in cancelled],
+                    )
+
+                reserved_dates = {
+                    timeutil.to_local(_utc(item["task"]["scheduled_start"], "scheduled_start")).date().isoformat()
+                    for item in active_items
+                    if isinstance(item.get("task"), Mapping)
+                    and item["task"].get("scheduled_start")
+                    and item["task"].get("scheduled_end")
+                    and _utc(item["task"]["scheduled_end"], "scheduled_end") > floor
+                }
+                unique_items = {
+                    int(item["task_id"]): item for item in active_items
+                    if item.get("task_id") is not None
+                }.values()
+                for item in unique_items:
+                    task = _item_task(item)
+                    if task is None or task.get("status") in {"completed", "dropped"}:
+                        continue
+                    elapsed = task.get("scheduled_end") and _utc(task["scheduled_end"], "scheduled_end") <= floor
+                    if task.get("scheduled_start") and not elapsed:
+                        continue
+                    if elapsed:
+                        history = await self.store.get_decisions_for_task(int(task["id"]))
+                        if history and history[0].get("trigger") == "user_request":
+                            continue
+                        task["goal_session_elapsed"] = True
+                    if period_end <= floor:
+                        continue
+                    task["reserved_goal_dates"] = sorted(reserved_dates)
+                    generated.append(task)
+
+            horizon_end = max((_goal_period_bounds(goal, reference)[1] for goal in enabled), default=floor)
+            if horizon_end <= floor:
+                return []
+
+            async def place(tasks: list[dict[str, Any]], trigger: Trigger, context: str) -> list[ScheduleDecision]:
+                if not tasks:
+                    return []
+                occupied = await query_schedule(self.store, self.calendar, floor, horizon_end)
+                minimum = min(_task_duration(task) for task in tasks)
+                free = compute_free_blocks(floor, horizon_end, minimum, _constraints(occupied, buffer_minutes=15))
+                placements = await self._plan_assignments(
+                    tasks, [(f"block_{i}", block) for i, block in enumerate(free, 1)], facts, goals,
+                    context=context,
+                )
+                result: list[ScheduleDecision] = []
+                for placement in placements:
+                    rationale = placement.reasoning
+                    if placement.task.get("goal_session_elapsed"):
+                        rationale = (
+                            "The earlier unconfirmed goal session elapsed, so "
+                            + rationale[:1].lower() + rationale[1:]
+                        )
+                    result.append(await self._schedule_task_locked(
+                        int(placement.task["id"]), placement.start, placement.end,
+                        rationale, trigger, placement.facts_used,
+                    ))
+                return result
+
+            # Commit deadline-bearing ordinary work first. This keeps quota work
+            # from consuming the only viable gap for an urgent regular task.
+            regular = [task for task in ordinary if not _is_generated_goal_task(task)]
+            decisions: list[ScheduleDecision] = []
+            try:
+                decisions.extend(await place(regular, "daily_plan", "Schedule urgent regular tasks before optional goal quota work."))
+                decisions.extend(await place(generated, "goal_quota", "Pace goal quota sessions through the remaining period; preserve one session per local day."))
+            except SchedulingPlanError:
+                logger.exception("goal_plan_aborted_without_additional_writes")
+            return decisions
+
+    async def replan_missed_goal_sessions(self, reference: date | datetime | None = None, **kwargs: Any) -> list[ScheduleDecision]:
+        """Compatibility entry point used by the debrief job."""
+        return await self.reconcile_goal_schedule(reference, **kwargs)
+
+    async def refresh_goal_plan(self, reference: date | datetime | None = None, **kwargs: Any) -> list[ScheduleDecision]:
+        """Compatibility entry point for older job adapters."""
+        return await self.reconcile_goal_schedule(reference, **kwargs)
+
+    async def _calendar_records(
+        self, start: datetime, end: datetime, *, force_refresh: bool = False
+    ) -> list[dict[str, Any]]:
+        if force_refresh:
+            try:
+                records = await self.calendar.list_events(start, end, force_refresh=True)
+            except TypeError as exc:
+                # Legacy lightweight adapters do not cache reads and expose
+                # only the previous two-argument surface.
+                if "force_refresh" not in str(exc):
+                    raise
+                records = await self.calendar.list_events(start, end)
+        else:
+            records = await self.calendar.list_events(start, end)
         if getattr(self.calendar, "_last_query_complete", True) is False:
             raise CalendarQueryIncompleteError(
                 "Google Calendar returned an incomplete event set; reconciliation is unsafe"
@@ -945,7 +1273,7 @@ class SchedulerEngine:
         start: datetime,
         end: datetime,
     ) -> tuple[list[dict[str, Any]], datetime, datetime]:
-        """Read a cache-busted bounded horizon covering tasks and the operation."""
+        """Read a freshly fetched bounded horizon covering tasks and the operation."""
         padding = timedelta(days=max(1, config.SCHEDULER_LOOKAHEAD_DAYS))
         known_starts = [
             _utc(task["scheduled_start"], "scheduled_start")
@@ -956,13 +1284,8 @@ class SchedulerEngine:
             for task in tasks if task.get("scheduled_end")
         ]
         query_start = min([start, *known_starts]) - padding
-        # CalendarService caches reads by exact bounds for 60 seconds. A tiny,
-        # bounded end variation forces safety checks to observe later edits.
-        cache_buster = timedelta(
-            microseconds=1 + int(monotonic() * 1_000_000) % 1_000_000
-        )
-        query_end = max([end, *known_ends]) + padding + cache_buster
-        records = await self._calendar_records(query_start, query_end)
+        query_end = max([end, *known_ends]) + padding
+        records = await self._calendar_records(query_start, query_end, force_refresh=True)
         return records, query_start, query_end
 
     async def _emit_scheduler_signal(self, payload: dict[str, Any]) -> None:
@@ -1050,8 +1373,8 @@ class SchedulerEngine:
             if history:
                 previous_reason = str(history[0].get("reasoning") or previous_reason)
             try:
-                await self.calendar.update_work_block(
-                    gcal_id, str(task.get("title") or "Untitled Task"),
+                await self._update_work_block(
+                    task, gcal_id, str(task.get("title") or "Untitled Task"),
                     google_start, google_end, rationale,
                 )
                 record = await self.store.apply_schedule_decision(
@@ -1063,12 +1386,9 @@ class SchedulerEngine:
                     # Preserve the user's chosen time while rolling back our
                     # description mutation; changing it back would discard the
                     # very manual correction we are trying to learn from.
-                    await self.calendar.update_work_block(
-                        gcal_id,
-                        str(task.get("title") or "Untitled Task"),
-                        google_start,
-                        google_end,
-                        previous_reason,
+                    await self._update_work_block(
+                        task, gcal_id, str(task.get("title") or "Untitled Task"),
+                        google_start, google_end, previous_reason,
                     )
                 except Exception:
                     logger.exception("manual_correction_calendar_rollback_failed")
@@ -1141,10 +1461,18 @@ class SchedulerEngine:
             compensation_reason = (
                 "calendar deletion failed, so the original block and event id were restored"
             )
-            restored = await self.store.apply_schedule_decision(
-                task_id, "scheduled", old_start, old_end, None, None,
-                trigger, compensation_reason, [], gcal_id,
-            )
+            try:
+                restored = await self.store.apply_schedule_decision(
+                    task_id, "scheduled", old_start, old_end, None, None,
+                    trigger, compensation_reason, [], gcal_id,
+                )
+            except Exception:
+                await self._emit_scheduler_signal({
+                    "kind": "calendar_sqlite_repair_required", "task_id": task_id,
+                    "gcal_event_id": gcal_id, "action": "unscheduled",
+                    "uncertainty": "SQLite cleared the block but Calendar deletion and compensation failed",
+                })
+                raise
             try:
                 # This transient decision is represented by the immediately
                 # following compensation and must not be surfaced later as a
@@ -1491,6 +1819,32 @@ class SchedulerEngine:
             "a new calendar conflict was added", (start, end), trigger="conflict"
         )
 
+    async def _remove_owned_orphans(self, records: Sequence[Mapping[str, Any]]) -> None:
+        """Delete marked work blocks whose SQLite placement no longer owns them."""
+        tasks = await self.store.query_tasks()
+        by_id = {int(task["id"]): task for task in tasks if task.get("id") is not None}
+        for record in records:
+            if not record.get("kalendra_owned") or record.get("kalendra_kind") not in {"task-block", "goal-session"}:
+                continue
+            private = (record.get("extended_properties") or {}).get("private") or {}
+            try:
+                task_id = int(private.get("task_id"))
+            except (TypeError, ValueError):
+                continue
+            event_id = _event_id(record)
+            task = by_id.get(task_id)
+            if task and task.get("status") == "scheduled" and str(task.get("gcal_event_id") or "") == event_id:
+                continue
+            try:
+                await self.calendar.delete_work_block(event_id)
+            except Exception as exc:
+                await self._emit_scheduler_signal({
+                    "kind": "calendar_orphan_repair_required", "task_id": task_id,
+                    "gcal_event_id": event_id, "action": "delete_orphan",
+                    "uncertainty": f"owned orphan deletion failed: {exc}",
+                })
+                logger.exception("owned_calendar_orphan_delete_failed")
+
     async def detect_conflicts(
         self,
         start: datetime | None = None,
@@ -1512,14 +1866,15 @@ class SchedulerEngine:
             scheduled = [task for task in scheduled if (
                 task.get("scheduled_start") and task.get("scheduled_end")
             )]
-            if not scheduled:
-                return []
             # Reconcile every managed scheduled block before selecting by the
             # requested range. A hand-dragged block may have moved into the
             # range even though its stale SQLite interval was outside it.
             calendar_snapshot = await self._fresh_calendar_snapshot(
                 scheduled, range_start, range_end
             )
+            await self._remove_owned_orphans(calendar_snapshot[0])
+            if not scheduled:
+                return []
             _fixed, corrections = await self._manual_fixed_points(
                 scheduled,
                 range_start,

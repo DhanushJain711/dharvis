@@ -46,6 +46,11 @@ _task_input = _object(
         "energy": {"type": "string", "enum": ["deep_focus", "light", "errand"], "description": "The attention or mobility mode the task requires."},
         "priority": {"type": "string", "enum": ["low", "medium", "high"], "description": "User importance, not deadline urgency."},
         "goal_id": _nullable("integer", "Associated goal id, or null when the task is unrelated to a goal.", minimum=1),
+        "series_key": _nullable(
+            "string",
+            "Stable task-family label used to reuse actual durations from similar completed tasks, such as 'math pset'; null lets deterministic title normalization choose it.",
+            minLength=1,
+        ),
     }
 )
 
@@ -69,7 +74,7 @@ TOOLS: list[ToolSchema] = [
     ),
     _tool(
         "add_event",
-        "Create one or more fixed-time calendar events. Use this for appointments or commitments with known start and end times, not flexible work. Send all events from one user message in one call.",
+        "Propose or create one or more fixed-time calendar events. Use this for appointments or commitments with known start and end times, not flexible work. Send all events from one user message in one call. The handler checks the merged calendar first: if anything overlaps, it creates nothing and returns confirmation_required with a proposal_id. Warn the user and wait for a later user message; never call confirm_event_change in the same turn.",
         {"events": {"type": "array", "description": "Every event to create.", "items": _event_input, "minItems": 1}},
     ),
     _tool(
@@ -86,16 +91,17 @@ TOOLS: list[ToolSchema] = [
             "priority": _nullable("string", "Replacement priority, or null to leave unchanged.", enum=["low", "medium", "high", None]),
             "status": _nullable("string", "Replacement lifecycle status, or null to leave unchanged.", enum=TASK_STATUSES + [None]),
             "goal_id": _nullable("integer", "Replacement goal id, or null to leave unchanged.", minimum=1),
+            "series_key": _nullable("string", "Replacement task-family label, or null to leave unchanged.", minLength=1),
             "clear_fields": {
                 "type": "array",
-                "items": {"type": "string", "enum": ["description", "deadline", "estimated_minutes", "goal_id"]},
+                "items": {"type": "string", "enum": ["description", "deadline", "estimated_minutes", "goal_id", "series_key"]},
                 "description": "Nullable fields to set to null. Use an empty array when clearing nothing, and leave each named field's value null.",
             },
         },
     ),
     _tool(
         "update_event",
-        "Change a bot-created event identified by its integer local event id. Query the schedule first when the id is ambiguous. External Google events are read-only. Null field values mean unchanged; nullable fields are cleared only by naming them in clear_fields.",
+        "Propose or change a bot-created event identified by its integer local event id. Query the schedule first when the id is ambiguous. External Google events are read-only. The handler checks the merged calendar first: an overlap changes nothing and returns confirmation_required with a proposal_id. Warn the user and wait for a later user message; never call confirm_event_change in the same turn. Null field values mean unchanged; nullable fields are cleared only by naming them in clear_fields.",
         {
             "event_id": {"type": "integer", "minimum": 1, "description": "Exact local event id."},
             "title": _nullable("string", "Replacement title, or null to leave unchanged."),
@@ -109,6 +115,17 @@ TOOLS: list[ToolSchema] = [
                 "items": {"type": "string", "enum": ["description", "location", "category"]},
                 "description": "Nullable fields to set to null. Use an empty array when clearing nothing, and leave each named field's value null.",
             },
+        },
+    ),
+    _tool(
+        "confirm_event_change",
+        "Apply a previously proposed conflicting event creation or update only after the user explicitly confirms in a later message. Pass the exact proposal_id returned by add_event or update_event. This rechecks the live calendar before writing. Never call it in the same user turn that created the proposal, and never infer or invent a proposal id.",
+        {
+            "proposal_id": {
+                "type": "string",
+                "minLength": 1,
+                "description": "Exact unexpired proposal id from a prior turn's conflict warning.",
+            }
         },
     ),
     _tool(
@@ -199,6 +216,15 @@ TOOLS: list[ToolSchema] = [
             "target_unit": {"type": "string", "enum": ["hours", "sessions"], "description": "How progress is measured."},
             "period": {"type": "string", "enum": ["week", "month"], "description": "Goal reset period."},
             "category": {"type": "string", "description": "Life-area category for the goal."},
+            "session_minutes": {
+                "type": "integer",
+                "minimum": 1,
+                "description": "Minutes per generated calendar session. For hour goals this controls chunk size; for session goals it is the length of each session.",
+            },
+            "scheduling_enabled": {
+                "type": "boolean",
+                "description": "True when Dharvis should generate and continuously reschedule calendar sessions for this goal; false only for tracking without calendar planning.",
+            },
         },
     ),
     _tool(

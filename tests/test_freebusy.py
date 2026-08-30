@@ -18,6 +18,7 @@ from src.freebusy import (
     is_free,
     merge_blocks,
     next_free_block,
+    overlapping_blocks,
     query_schedule,
 )
 
@@ -367,6 +368,22 @@ async def test_query_schedule_deduplicates_task_backed_google_work_block():
 
 
 @pytest.mark.asyncio
+async def test_query_schedule_forwards_force_refresh_to_calendar():
+    calendar = AsyncMock()
+    calendar._last_query_complete = True
+    calendar.list_events.return_value = []
+    store = AsyncMock()
+    store.query_events.return_value = []
+    store.query_tasks.return_value = []
+
+    await query_schedule(store, calendar, utc(9), utc(18), force_refresh=True)
+
+    calendar.list_events.assert_awaited_once_with(
+        utc(9), utc(18), force_refresh=True
+    )
+
+
+@pytest.mark.asyncio
 async def test_query_schedule_fails_closed_when_calendar_read_is_incomplete():
     calendar = AsyncMock()
     calendar._last_query_complete = False
@@ -395,6 +412,19 @@ def test_has_conflict_uses_half_open_interval_semantics():
     assert has_conflict(blocks, utc(9, 30), utc(10)) is False
     assert has_conflict(blocks, utc(11), utc(12)) is False
     assert has_conflict(blocks, utc(10, 30), utc(11, 30)) is True
+
+
+def test_overlapping_blocks_returns_conflict_details_in_time_order():
+    blocks = [
+        ScheduleBlock(utc(11), utc(12), "Later", "event", "2", {}),
+        ScheduleBlock(utc(9), utc(10), "Touching", "gcal", "1", {}),
+        ScheduleBlock(utc(10), utc(11), "Class", "gcal", "3", {}),
+    ]
+
+    assert overlapping_blocks(blocks, utc(10), utc(11, 30)) == [
+        blocks[2],
+        blocks[0],
+    ]
 
 
 @pytest.mark.parametrize(

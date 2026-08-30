@@ -24,9 +24,35 @@ CalendarRecord = dict[str, Any]
 SCOPES = ["https://www.googleapis.com/auth/calendar"]
 CACHE_TTL_SECONDS = 60.0
 CALENDAR_OWNERSHIP_MARKER = "kalendra-managed-calendar:v1"
+# New events use an explicit ownership marker and kind.  The old
+# ``kalendra=work-block`` marker remains readable so deployed calendars can be
+# upgraded without orphaning existing task blocks.
+OWNERSHIP_MARKER_KEY = "kalendra_owned"
+OWNERSHIP_MARKER_VALUE = "v1"
+KIND_MARKER_KEY = "kalendra_kind"
+FIXED_EVENT_KIND = "fixed-event"
+TASK_BLOCK_KIND = "task-block"
+GOAL_SESSION_KIND = "goal-session"
+FLEXIBLE_BLOCK_KINDS = frozenset({TASK_BLOCK_KIND, GOAL_SESSION_KIND})
 WORK_BLOCK_MARKER_KEY = "kalendra"
 WORK_BLOCK_MARKER_VALUE = "work-block"
 RATIONALE_PREFIX = "Scheduling rationale:"
+# Google Calendar event color ids are stable palette references (1-11).  Keep
+# category colors deterministic so tasks, fixed commitments, and goal work are
+# visually consistent across restarts and devices.
+CATEGORY_COLOR_IDS: dict[str, str] = {
+    "school": "9",
+    "work": "7",
+    "personal": "2",
+    "fitness": "10",
+    "career": "5",
+    "errand": "6",
+}
+KIND_COLOR_IDS: dict[str, str] = {
+    FIXED_EVENT_KIND: "11",
+    TASK_BLOCK_KIND: "9",
+    GOAL_SESSION_KIND: "10",
+}
 logger = logging.getLogger(__name__)
 
 
@@ -95,6 +121,11 @@ def _validate_range(start: datetime, end: datetime) -> tuple[datetime, datetime]
 
 def _http_status(exc: HttpError) -> int | None:
     return getattr(getattr(exc, "resp", None), "status", None)
+
+
+def _is_not_found(exc: HttpError) -> bool:
+    """Return whether Google reports an event already absent."""
+    return _http_status(exc) == 404
 
 
 class CalendarService:
@@ -230,9 +261,9 @@ class CalendarService:
                 "Google Calendar authorization was rejected; reconnect your calendar"
             ) from exc
 
-    def _calendar_ids(self, service: Any) -> list[str]:
-        """Return every visible calendar id, paginating the calendar list."""
-        ids: list[str] = []
+    def _calendar_entries(self, service: Any) -> list[CalendarRecord]:
+        """Return metadata for every visible calendar, fully paginated."""
+        entries: list[CalendarRecord] = []
         page_token: str | None = None
         while True:
             response = self._execute(
@@ -240,24 +271,36 @@ class CalendarService:
             )
             items = response.get("items", [])
             if isinstance(items, list):
-                ids.extend(
-                    str(item["id"])
+                entries.extend(
+                    deepcopy(item)
                     for item in items
                     if isinstance(item, dict) and item.get("id")
                 )
             page_token = response.get("nextPageToken")
             if not isinstance(page_token, str) or not page_token:
                 break
-        if self.calendar_id and self.calendar_id not in ids:
-            ids.append(self.calendar_id)
-        return list(dict.fromkeys(ids))
+        # ``calendarList.list`` is the authoritative set of calendars the
+        # account can read.  ``calendar_id`` is retained as a constructor
+        # compatibility setting, but it must not add an unverified alias here:
+        # doing so can issue a duplicate query (or invent a source with no
+        # calendar metadata) when the configured id is not in this response.
+        deduplicated: dict[str, CalendarRecord] = {}
+        for entry in entries:
+            deduplicated.setdefault(str(entry["id"]), entry)
+        return list(deduplicated.values())
 
-    async def list_events(self, start: datetime, end: datetime) -> list[CalendarRecord]:
-        """List overlapping events across all visible calendars, with a 60s cache."""
+    def _calendar_ids(self, service: Any) -> list[str]:
+        """Compatibility helper returning every visible calendar id."""
+        return [str(entry["id"]) for entry in self._calendar_entries(service)]
+
+    async def list_events(
+        self, start: datetime, end: datetime, *, force_refresh: bool = False
+    ) -> list[CalendarRecord]:
+        """List overlapping events across visible calendars, optionally bypassing cache."""
         start_utc, end_utc = _validate_range(start, end)
         cache_key = (start_utc.isoformat(), end_utc.isoformat())
         cached = self._event_cache.get(cache_key)
-        if cached and monotonic() - cached[0] < CACHE_TTL_SECONDS:
+        if not force_refresh and cached and monotonic() - cached[0] < CACHE_TTL_SECONDS:
             self._last_query_complete = True
             return deepcopy(cached[1])
 
@@ -268,7 +311,8 @@ class CalendarService:
         normalized: list[CalendarRecord] = []
         complete = True
         try:
-            for calendar_id in self._calendar_ids(service):
+            for calendar_entry in self._calendar_entries(service):
+                calendar_id = str(calendar_entry["id"])
                 page_token: str | None = None
                 while True:
                     response = self._execute(
@@ -285,6 +329,22 @@ class CalendarService:
                         try:
                             formatted = self._format_event(event)
                             formatted["calendar_id"] = calendar_id
+                            formatted["calendar_summary"] = calendar_entry.get("summary")
+                            formatted["calendar_primary"] = bool(
+                                calendar_entry.get("primary", False)
+                            )
+                            formatted["calendar_access_role"] = calendar_entry.get(
+                                "accessRole"
+                            )
+                            formatted["calendar_color_id"] = calendar_entry.get(
+                                "colorId"
+                            )
+                            formatted["calendar_background_color"] = calendar_entry.get(
+                                "backgroundColor"
+                            )
+                            formatted["calendar_foreground_color"] = calendar_entry.get(
+                                "foregroundColor"
+                            )
                             normalized.append(formatted)
                         except (TypeError, ValueError):
                             complete = False
@@ -310,8 +370,10 @@ class CalendarService:
             self._event_cache[cache_key] = (monotonic(), deepcopy(normalized))
         return normalized
 
-    async def get_events_between(self, start: datetime, end: datetime) -> list[CalendarRecord]:
-        return await self.list_events(start, end)
+    async def get_events_between(
+        self, start: datetime, end: datetime, *, force_refresh: bool = False
+    ) -> list[CalendarRecord]:
+        return await self.list_events(start, end, force_refresh=force_refresh)
 
     async def get_today_events(self) -> list[CalendarRecord]:
         start, end = day_bounds(now_local())
@@ -405,9 +467,61 @@ class CalendarService:
         )
 
     @staticmethod
-    def _is_work_block(event: CalendarRecord) -> bool:
+    def _private_properties(event: CalendarRecord) -> dict[str, Any]:
         private = (event.get("extendedProperties") or {}).get("private") or {}
-        return private.get(WORK_BLOCK_MARKER_KEY) == WORK_BLOCK_MARKER_VALUE
+        return private if isinstance(private, dict) else {}
+
+    @classmethod
+    def _event_kind(cls, event: CalendarRecord) -> str | None:
+        private = cls._private_properties(event)
+        kind = private.get(KIND_MARKER_KEY)
+        if kind in {FIXED_EVENT_KIND, TASK_BLOCK_KIND, GOAL_SESSION_KIND}:
+            return str(kind)
+        if private.get(WORK_BLOCK_MARKER_KEY) == WORK_BLOCK_MARKER_VALUE:
+            return TASK_BLOCK_KIND
+        return None
+
+    @classmethod
+    def _is_owned_event(cls, event: CalendarRecord) -> bool:
+        private = cls._private_properties(event)
+        return bool(
+            private.get(OWNERSHIP_MARKER_KEY) == OWNERSHIP_MARKER_VALUE
+            or private.get(WORK_BLOCK_MARKER_KEY) == WORK_BLOCK_MARKER_VALUE
+        )
+
+    @classmethod
+    def _is_work_block(cls, event: CalendarRecord) -> bool:
+        """Return whether an event is an automatically movable work block."""
+        return cls._event_kind(event) in FLEXIBLE_BLOCK_KINDS
+
+    @staticmethod
+    def _normalize_kind(kind: Any) -> str:
+        normalized = str(kind or FIXED_EVENT_KIND).strip().lower()
+        # Earlier in-progress callers used the Python-style spelling.  Keep
+        # accepting it at this boundary while always persisting the documented
+        # hyphenated Google metadata value.
+        if normalized == "fixed_event":
+            normalized = FIXED_EVENT_KIND
+        if normalized not in {FIXED_EVENT_KIND, TASK_BLOCK_KIND, GOAL_SESSION_KIND}:
+            raise ValueError(
+                "kind must be fixed-event, task-block, or goal-session"
+            )
+        return normalized
+
+    @staticmethod
+    def _normalize_color_id(value: Any) -> str:
+        color_id = str(value).strip()
+        if color_id not in {str(item) for item in range(1, 12)}:
+            raise ValueError("color_id must be a Google Calendar event color id from 1 to 11")
+        return color_id
+
+    @classmethod
+    def _default_color_id(cls, category: Any, kind: Any) -> str:
+        normalized_category = str(category or "").strip().lower()
+        normalized_kind = cls._normalize_kind(kind)
+        return CATEGORY_COLOR_IDS.get(
+            normalized_category, KIND_COLOR_IDS[normalized_kind]
+        )
 
     @staticmethod
     def _description_with_reasoning(description: Any, reasoning: Any) -> str:
@@ -421,7 +535,12 @@ class CalendarService:
         return f"{base}\n\n{rendered}" if base else rendered
 
     def _event_body(
-        self, event: CalendarRecord, reasoning: str | None = None
+        self,
+        event: CalendarRecord,
+        reasoning: str | None = None,
+        *,
+        category: str | None = None,
+        kind: str = FIXED_EVENT_KIND,
     ) -> CalendarRecord:
         start_value = event.get("start_time", event.get("start"))
         end_value = event.get("end_time", event.get("end"))
@@ -448,16 +567,33 @@ class CalendarService:
             body["description"] = description
         if event.get("location"):
             body["location"] = event["location"]
+        normalized_kind = self._normalize_kind(event.get("kind", kind))
+        normalized_category = str(event.get("category", category) or "").strip().lower()
         extended = deepcopy(event.get("extendedProperties") or {})
         private = extended.setdefault("private", {})
         if not isinstance(private, dict):
             raise ValueError("extendedProperties.private must be an object")
-        private[WORK_BLOCK_MARKER_KEY] = WORK_BLOCK_MARKER_VALUE
+        private.pop(WORK_BLOCK_MARKER_KEY, None)
+        private[OWNERSHIP_MARKER_KEY] = OWNERSHIP_MARKER_VALUE
+        private[KIND_MARKER_KEY] = normalized_kind
+        if normalized_category:
+            private["category"] = normalized_category
         body["extendedProperties"] = extended
+        explicit_color = event.get("color_id", event.get("colorId"))
+        body["colorId"] = (
+            self._normalize_color_id(explicit_color)
+            if explicit_color is not None
+            else self._default_color_id(normalized_category, normalized_kind)
+        )
         return body
 
     async def create_event(
-        self, event: CalendarRecord, reasoning: str | None = None
+        self,
+        event: CalendarRecord,
+        reasoning: str | None = None,
+        *,
+        category: str | None = None,
+        kind: str = FIXED_EVENT_KIND,
     ) -> CalendarRecord:
         """Create a reasoned, application-owned event on Kalendra."""
         service = self._get_service()
@@ -469,7 +605,10 @@ class CalendarService:
         try:
             created = self._execute(
                 service.events().insert(
-                    calendarId=calendar_id, body=self._event_body(event, reasoning)
+                    calendarId=calendar_id,
+                    body=self._event_body(
+                        event, reasoning, category=category, kind=kind
+                    ),
                 )
             )
         except HttpError as exc:
@@ -481,7 +620,12 @@ class CalendarService:
         return formatted
 
     async def update_event(
-        self, gcal_event_id: str, changes: CalendarRecord
+        self,
+        gcal_event_id: str,
+        changes: CalendarRecord,
+        *,
+        category: str | None = None,
+        kind: str | None = None,
     ) -> CalendarRecord:
         """Patch an event in Kalendra; primary and other calendars are untouched."""
         if not gcal_event_id:
@@ -505,8 +649,64 @@ class CalendarService:
                     calendarId=calendar_id, eventId=gcal_event_id
                 )
             )
-            if not self._is_work_block(current):
+            if not self._is_owned_event(current):
                 raise CalendarError("Refusing to update an event not owned by Kalendra")
+            current_private = self._private_properties(current)
+            current_kind = self._event_kind(current) or FIXED_EVENT_KIND
+            requested_kind = self._normalize_kind(
+                changes.get("kind", kind if kind is not None else current_kind)
+            )
+            requested_category = str(
+                changes.get(
+                    "category",
+                    category if category is not None else current_private.get("category", ""),
+                )
+                or ""
+            ).strip().lower()
+            marker_change_requested = (
+                kind is not None
+                or category is not None
+                or "kind" in changes
+                or "category" in changes
+                or "task_id" in changes
+                or "goal_id" in changes
+                or current_private.get(OWNERSHIP_MARKER_KEY) != OWNERSHIP_MARKER_VALUE
+            )
+            if marker_change_requested:
+                extended = deepcopy(current.get("extendedProperties") or {})
+                private = extended.setdefault("private", {})
+                if not isinstance(private, dict):
+                    raise CalendarError("Owned event has invalid private metadata")
+                private.pop(WORK_BLOCK_MARKER_KEY, None)
+                private[OWNERSHIP_MARKER_KEY] = OWNERSHIP_MARKER_VALUE
+                private[KIND_MARKER_KEY] = requested_kind
+                if requested_category:
+                    private["category"] = requested_category
+                else:
+                    private.pop("category", None)
+                for identifier in ("task_id", "goal_id"):
+                    if identifier in changes:
+                        identifier_value = changes[identifier]
+                        if identifier_value is None:
+                            private.pop(identifier, None)
+                        else:
+                            private[identifier] = str(identifier_value)
+                body["extendedProperties"] = extended
+            explicit_color = changes.get("color_id", changes.get("colorId"))
+            if explicit_color is not None:
+                body["colorId"] = self._normalize_color_id(explicit_color)
+            elif marker_change_requested:
+                old_default = self._default_color_id(
+                    current_private.get("category", ""), current_kind
+                )
+                current_color = current.get("colorId")
+                # No color or our prior deterministic color means it is safe to
+                # follow a category/kind change.  A different value is a manual
+                # user choice and is deliberately preserved.
+                if current_color is None or str(current_color) == old_default:
+                    body["colorId"] = self._default_color_id(
+                        requested_category, requested_kind
+                    )
             if "reasoning" in changes:
                 body["description"] = self._description_with_reasoning(
                     changes.get("description", current.get("description")),
@@ -554,7 +754,7 @@ class CalendarService:
             current = self._execute(
                 service.events().get(calendarId=calendar_id, eventId=gcal_event_id)
             )
-            if not self._is_work_block(current):
+            if not self._is_owned_event(current):
                 raise CalendarError("Refusing to delete an event not owned by Kalendra")
             self._execute(
                 service.events().delete(
@@ -562,12 +762,17 @@ class CalendarService:
                 )
             )
         except HttpError as exc:
+            if _is_not_found(exc):
+                # A retry after a successful remote delete must not prevent
+                # the caller from finalizing its local state.
+                self._invalidate_cache()
+                return
             self._raise_if_reconnect_required(exc)
             raise CalendarError("Could not delete the calendar event") from exc
         self._invalidate_cache()
 
     async def clear_kalendra_range(self, start: datetime, end: datetime) -> None:
-        """Delete every Kalendra block overlapping an aware half-open range."""
+        """Delete movable task/goal blocks, never fixed events, in the range."""
         start_utc, end_utc = _validate_range(start, end)
         service = self._get_service()
         if service is None:
@@ -612,21 +817,33 @@ class CalendarService:
         start: datetime,
         end: datetime,
         reasoning: str | None = None,
+        *,
+        category: str | None = None,
+        kind: str = TASK_BLOCK_KIND,
+        goal_id: int | None = None,
     ) -> str:
         """Create a reasoned task block on the dedicated Kalendra calendar."""
         rationale = str(reasoning or "").strip()
         if not rationale:
             raise ValueError("reasoning must contain non-whitespace text")
+        normalized_kind = self._normalize_kind(kind)
+        if normalized_kind not in FLEXIBLE_BLOCK_KINDS:
+            raise ValueError("work block kind must be task-block or goal-session")
+        private: dict[str, str] = {"task_id": str(task_id)}
+        if goal_id is not None:
+            private["goal_id"] = str(goal_id)
         created = await self.create_event(
             {
                 "title": title,
                 "start_time": start,
                 "end_time": end,
-                "extendedProperties": {
-                    "private": {"kalendra": "work-block", "task_id": str(task_id)}
-                },
+                "category": category,
+                "kind": normalized_kind,
+                "extendedProperties": {"private": private},
             },
             rationale,
+            category=category,
+            kind=normalized_kind,
         )
         return str(created["gcal_event_id"])
 
@@ -637,6 +854,10 @@ class CalendarService:
         start: datetime,
         end: datetime,
         reasoning: str | None = None,
+        *,
+        category: str | None = None,
+        kind: str = TASK_BLOCK_KIND,
+        goal_id: int | None = None,
     ) -> None:
         changes: CalendarRecord = {
             "title": title,
@@ -645,13 +866,48 @@ class CalendarService:
         }
         if reasoning is not None:
             changes["reasoning"] = reasoning
+        if goal_id is not None:
+            changes["goal_id"] = goal_id
         await self.update_event(
             gcal_event_id,
             changes,
+            category=category,
+            kind=kind,
         )
 
     async def delete_work_block(self, gcal_event_id: str) -> None:
-        await self.delete_event(gcal_event_id)
+        """Delete only an owned movable task or goal block.
+
+        ``delete_event`` intentionally permits deleting owned fixed events for
+        explicit user event deletion.  This narrower compatibility method is
+        used by the scheduler, so it must not make fixed commitments movable.
+        """
+        if not gcal_event_id:
+            raise ValueError("gcal_event_id must be non-empty")
+        service = self._get_service()
+        if service is None:
+            raise CalendarReconnectRequiredError(
+                "Google Calendar is not connected; reconnect your calendar"
+            )
+        calendar_id = self._ensure_kalendra_calendar()
+        try:
+            current = self._execute(
+                service.events().get(calendarId=calendar_id, eventId=gcal_event_id)
+            )
+            if not self._is_work_block(current):
+                raise CalendarError("Refusing to delete an event that is not a movable work block")
+            self._execute(
+                service.events().delete(calendarId=calendar_id, eventId=gcal_event_id)
+            )
+        except HttpError as exc:
+            if _is_not_found(exc):
+                # The work block may have been deleted before a crash or
+                # restart; absence is the desired end state for this retry.
+                self._invalidate_cache()
+                return
+            self._raise_if_reconnect_required(exc)
+            raise CalendarError("Could not delete the calendar work block") from exc
+        self._invalidate_cache()
 
     def _format_event(self, event: CalendarRecord) -> CalendarRecord:
         """Normalize a raw Google event into the shared schedule shape."""
@@ -672,6 +928,11 @@ class CalendarService:
             "location": event.get("location"),
             "source": "gcal",
             "gcal_event_id": event.get("id", ""),
+            "color_id": event.get("colorId"),
+            "extended_properties": deepcopy(event.get("extendedProperties") or {}),
+            "kalendra_owned": self._is_owned_event(event),
+            "kalendra_kind": self._event_kind(event),
+            "category": self._private_properties(event).get("category"),
         }
 
 

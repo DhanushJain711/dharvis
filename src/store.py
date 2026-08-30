@@ -5,7 +5,9 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+import statistics
 import unicodedata
+import uuid
 from contextlib import asynccontextmanager
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
@@ -23,13 +25,18 @@ TaskStatus = Literal["pending", "scheduled", "completed", "dropped"]
 _TASK_FIELDS = {
     "title", "description", "deadline", "estimated_minutes", "category", "energy",
     "priority", "status", "scheduled_start", "scheduled_end", "gcal_event_id",
-    "goal_id", "completed_at", "actual_minutes",
+    "goal_id", "completed_at", "actual_minutes", "series_key",
+    "estimate_source", "actual_minutes_source",
 }
 _TASK_UPDATE_FIELDS = {
     "title", "description", "deadline", "estimated_minutes", "category", "energy",
-    "priority", "status", "goal_id",
+    "priority", "status", "goal_id", "series_key", "estimate_source",
+    "actual_minutes_source",
 }
-_TASK_CLEARABLE = {"description", "deadline", "estimated_minutes", "goal_id"}
+_TASK_CLEARABLE = {
+    "description", "deadline", "estimated_minutes", "goal_id", "series_key",
+    "estimate_source", "actual_minutes_source",
+}
 _EVENT_FIELDS = {
     "title", "description", "start_time", "end_time", "location", "category",
     "source", "gcal_event_id",
@@ -44,9 +51,10 @@ _DATETIME_FIELDS = {
     "deadline", "scheduled_start", "scheduled_end", "created_at", "completed_at",
     "start_time", "end_time", "decided_at", "start", "end", "previous_start",
     "previous_end", "last_confirmed_at", "logged_at", "brief_sent_at", "debrief_sent_at",
+    "period_start", "period_end", "cancelled_at", "expires_at", "claimed_at", "consumed_at",
 }
-_JSON_FIELDS = {"facts_used", "tool_calls", "planned", "completed"}
-_BOOL_FIELDS = {"active", "surfaced_to_user"}
+_JSON_FIELDS = {"facts_used", "tool_calls", "planned", "completed", "payload", "conflicts"}
+_BOOL_FIELDS = {"active", "surfaced_to_user", "scheduling_enabled"}
 _PLACEHOLDER_REASONING = {
     "", "because", "because reason", "because reasons", "dummy", "example", "n a",
     "na", "no reason", "none", "placeholder", "reason", "reasons", "some reason",
@@ -65,6 +73,12 @@ _STOP_WORDS = {
     "go", "going", "me", "my", "of", "on", "please", "that", "the", "thing", "this", "to", "user",
     "wants", "would",
 }
+_SERIES_STOP_WORDS = {
+    "assignment", "complete", "finish", "homework", "next", "problem", "set",
+    "this", "week", "worksheet", "work",
+}
+_ORDINAL_RE = re.compile(r"^\d+(?:st|nd|rd|th)?$")
+_NUMBERED_TOKEN_RE = re.compile(r"^([a-z]+)[-_#]?\d+$")
 
 
 def _utc_text(value: datetime, name: str = "datetime") -> str:
@@ -183,6 +197,32 @@ def _text_similarity(left: str, right: str) -> float:
     return min(1.0, 0.55 * overlap + 0.25 * jaccard + 0.20 * trigram)
 
 
+def normalize_series_key(title: str) -> str:
+    """Return a stable lexical key for recurring tasks without semantic search.
+
+    Sequence numbers, dates, and generic action words are discarded, while the
+    subject-bearing tokens remain. For example, ``Math pset #4`` and
+    ``finish math pset 5`` both normalize to ``math pset``.
+    """
+    clean = _require_nonempty_text(title, "title")
+    normalized = unicodedata.normalize("NFKD", clean.casefold())
+    tokens: list[str] = []
+    for token in _WORD_RE.findall(normalized):
+        if _ORDINAL_RE.fullmatch(token) or re.fullmatch(r"20\d{2}", token):
+            continue
+        numbered = _NUMBERED_TOKEN_RE.fullmatch(token)
+        if numbered:
+            token = numbered.group(1)
+        if token in _SERIES_STOP_WORDS:
+            continue
+        tokens.append(token)
+    # If every word was generic, retain normalized words rather than producing
+    # a key shared by unrelated empty-looking task names.
+    if not tokens:
+        tokens = _WORD_RE.findall(normalized)
+    return " ".join(tokens)
+
+
 def _fact_similarity(left: str, right: str) -> float:
     """Similarity with a guard against merging contradictory time preferences."""
     left_words, right_words = _normalized_words(left), _normalized_words(right)
@@ -265,7 +305,7 @@ class Store:
             raise ValueError("tasks must be a non-empty list")
         allowed = _TASK_FIELDS - {
             "status", "scheduled_start", "scheduled_end", "gcal_event_id",
-            "completed_at", "actual_minutes",
+            "completed_at", "actual_minutes", "actual_minutes_source",
         }
         ids: list[int] = []
         async with self.connection() as db:
@@ -279,6 +319,16 @@ class Store:
                         if key in allowed and value is not None
                     }
                     values["title"] = _require_nonempty_text(task.get("title"), "title")
+                    values["series_key"] = _require_nonempty_text(
+                        task.get("series_key") or normalize_series_key(values["title"]),
+                        "series_key",
+                    )
+                    if "estimated_minutes" in values and "estimate_source" not in values:
+                        values["estimate_source"] = "user"
+                    if "estimate_source" in values and "estimated_minutes" not in values:
+                        raise ValueError(
+                            "estimate_source requires a non-null estimated_minutes value"
+                        )
                     if "deadline" in values:
                         values["deadline"] = _db_value("deadline", values["deadline"])
                     fields = list(values)
@@ -427,19 +477,31 @@ class Store:
             {"start": "start_time", "end": "end_time"},
         )
 
-    async def complete_task(self, task_id: int, actual_minutes: int | None = None) -> Record:
+    async def complete_task(
+        self,
+        task_id: int,
+        actual_minutes: int | None = None,
+        actual_minutes_source: Literal["user", "debrief", "calendar", "inferred"] | None = None,
+    ) -> Record:
         if actual_minutes is not None and (
             not isinstance(actual_minutes, int) or isinstance(actual_minutes, bool) or actual_minutes < 0
         ):
             raise ValueError("actual_minutes must be a non-negative integer or None")
+        if actual_minutes is None and actual_minutes_source is not None:
+            raise ValueError("actual_minutes_source requires actual_minutes")
+        source = (actual_minutes_source or "user") if actual_minutes is not None else None
         async with self.connection() as db:
             if await self._get("tasks", task_id, db) is None:
                 raise KeyError(f"Task {task_id} does not exist")
             await db.execute(
                 """UPDATE tasks SET status = 'completed', completed_at = ?,
-                   actual_minutes = ?, scheduled_start = NULL, scheduled_end = NULL,
+                   actual_minutes = ?, actual_minutes_source = ?,
+                   scheduled_start = NULL, scheduled_end = NULL,
                    gcal_event_id = NULL WHERE id = ?""",
-                (_utc_text(timeutil.now_utc(), "completed_at"), actual_minutes, task_id),
+                (
+                    _utc_text(timeutil.now_utc(), "completed_at"), actual_minutes,
+                    source, task_id,
+                ),
             )
             await db.commit()
             result = await self._get("tasks", task_id, db)
@@ -467,6 +529,247 @@ class Store:
             cursor = await db.execute("DELETE FROM events WHERE id = ?", (event_id,))
             await db.commit()
             return cursor.rowcount > 0
+
+    async def create_event_change_proposal(
+        self,
+        operation: Literal["create", "update"],
+        payload: dict[str, Any],
+        conflicts: list[dict[str, Any]],
+        expires_at: datetime,
+    ) -> Record:
+        """Persist an expiring, one-time confirmation for a conflicting event change."""
+        if operation not in {"create", "update"}:
+            raise ValueError("operation must be 'create' or 'update'")
+        if not isinstance(payload, dict):
+            raise TypeError("payload must be a dictionary")
+        if not isinstance(conflicts, list) or any(
+            not isinstance(conflict, dict) for conflict in conflicts
+        ):
+            raise TypeError("conflicts must be a list of dictionaries")
+        created_at = timeutil.now_utc()
+        created_text = _utc_text(created_at, "created_at")
+        expires_text = _utc_text(expires_at, "expires_at")
+        if expires_at.astimezone(UTC) <= created_at:
+            raise ValueError("expires_at must be in the future")
+        proposal_id = uuid.uuid4().hex
+        async with self.connection() as db:
+            await db.execute(
+                """INSERT INTO event_change_proposals
+                   (id, operation, payload, conflicts, created_at, expires_at)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
+                (
+                    proposal_id, operation,
+                    json.dumps(payload, separators=(",", ":"), ensure_ascii=False),
+                    json.dumps(conflicts, separators=(",", ":"), ensure_ascii=False),
+                    created_text, expires_text,
+                ),
+            )
+            await db.commit()
+            cursor = await db.execute(
+                "SELECT * FROM event_change_proposals WHERE id = ?", (proposal_id,)
+            )
+            result = _record(await cursor.fetchone())
+        assert result is not None
+        return result
+
+    async def get_event_change_proposal(self, proposal_id: str) -> Record | None:
+        """Return a confirmation proposal, including consumed/expiry metadata."""
+        clean_id = _require_nonempty_text(proposal_id, "proposal_id")
+        async with self.connection() as db:
+            cursor = await db.execute(
+                "SELECT * FROM event_change_proposals WHERE id = ?", (clean_id,)
+            )
+            return _record(await cursor.fetchone())
+
+    async def claim_event_change_proposal(
+        self, proposal_id: str, claimed_at: datetime | None = None
+    ) -> Record:
+        """Atomically reserve one unexpired proposal for an external write.
+
+        The returned ``claim_token`` is an opaque capability that must be
+        presented to finalize or release the reservation.  It is intentionally
+        retained after finalization as an audit link between the external
+        mutation and its one-time confirmation.
+        """
+        clean_id = _require_nonempty_text(proposal_id, "proposal_id")
+        claimed = claimed_at or timeutil.now_utc()
+        claimed_text = _utc_text(claimed, "claimed_at")
+        claim_token = uuid.uuid4().hex
+        # Shared in-memory SQLite can raise SQLITE_LOCKED immediately instead
+        # of honouring a connection busy timeout. Retry only this short,
+        # idempotent acquisition transaction; after the winner commits, the
+        # loser deterministically observes its claim and receives ValueError.
+        for attempt in range(4):
+            try:
+                async with self.connection() as db:
+                    try:
+                        await db.execute("BEGIN IMMEDIATE")
+                        cursor = await db.execute(
+                            "SELECT * FROM event_change_proposals WHERE id = ?", (clean_id,)
+                        )
+                        proposal = _record(await cursor.fetchone())
+                        if proposal is None:
+                            raise KeyError(
+                                f"Event change proposal {clean_id!r} does not exist"
+                            )
+                        if proposal["consumed_at"] is not None:
+                            raise ValueError("event change proposal has already been consumed")
+                        if proposal["claimed_at"] is not None:
+                            raise ValueError("event change proposal has already been claimed")
+                        if proposal["expires_at"] <= claimed.astimezone(UTC):
+                            raise ValueError("event change proposal has expired")
+                        update = await db.execute(
+                            """UPDATE event_change_proposals
+                               SET claimed_at = ?, claim_token = ?
+                               WHERE id = ? AND consumed_at IS NULL AND claimed_at IS NULL""",
+                            (claimed_text, claim_token, clean_id),
+                        )
+                        if update.rowcount != 1:
+                            raise ValueError("event change proposal is no longer available")
+                        await db.commit()
+                        cursor = await db.execute(
+                            "SELECT * FROM event_change_proposals WHERE id = ?", (clean_id,)
+                        )
+                        result = _record(await cursor.fetchone())
+                    except Exception:
+                        await db.rollback()
+                        raise
+            except aiosqlite.OperationalError as exc:
+                if attempt == 3 or not any(
+                    token in str(exc).casefold() for token in ("locked", "busy")
+                ):
+                    raise
+                await asyncio.sleep(0.005 * (2 ** attempt))
+                continue
+            assert result is not None
+            return result
+        raise RuntimeError("unreachable claim retry exhaustion")
+
+    async def finalize_event_change_proposal(
+        self,
+        proposal_id: str,
+        claim_token: str,
+        consumed_at: datetime | None = None,
+    ) -> Record:
+        """Consume a proposal held by the matching claim after its write commits."""
+        clean_id = _require_nonempty_text(proposal_id, "proposal_id")
+        clean_token = _require_nonempty_text(claim_token, "claim_token")
+        consumed = consumed_at or timeutil.now_utc()
+        consumed_text = _utc_text(consumed, "consumed_at")
+        async with self.connection() as db:
+            try:
+                await db.execute("BEGIN IMMEDIATE")
+                cursor = await db.execute(
+                    "SELECT * FROM event_change_proposals WHERE id = ?", (clean_id,)
+                )
+                proposal = _record(await cursor.fetchone())
+                if proposal is None:
+                    raise KeyError(f"Event change proposal {clean_id!r} does not exist")
+                if proposal["consumed_at"] is not None:
+                    raise ValueError("event change proposal has already been consumed")
+                if proposal["claim_token"] != clean_token:
+                    raise ValueError("event change proposal claim token is invalid")
+                update = await db.execute(
+                    """UPDATE event_change_proposals SET consumed_at = ?
+                       WHERE id = ? AND claim_token = ? AND consumed_at IS NULL""",
+                    (consumed_text, clean_id, clean_token),
+                )
+                if update.rowcount != 1:
+                    raise ValueError("event change proposal claim is no longer available")
+                await db.commit()
+                cursor = await db.execute(
+                    "SELECT * FROM event_change_proposals WHERE id = ?", (clean_id,)
+                )
+                result = _record(await cursor.fetchone())
+            except Exception:
+                await db.rollback()
+                raise
+        assert result is not None
+        return result
+
+    async def release_event_change_proposal(
+        self, proposal_id: str, claim_token: str
+    ) -> Record:
+        """Release a claim only after the caller has compensated its write.
+
+        Possession of the opaque token is required; callers must invoke this
+        only when no lasting remote or local side effect remains.
+        """
+        clean_id = _require_nonempty_text(proposal_id, "proposal_id")
+        clean_token = _require_nonempty_text(claim_token, "claim_token")
+        async with self.connection() as db:
+            try:
+                await db.execute("BEGIN IMMEDIATE")
+                cursor = await db.execute(
+                    "SELECT * FROM event_change_proposals WHERE id = ?", (clean_id,)
+                )
+                proposal = _record(await cursor.fetchone())
+                if proposal is None:
+                    raise KeyError(f"Event change proposal {clean_id!r} does not exist")
+                if proposal["consumed_at"] is not None:
+                    raise ValueError("event change proposal has already been consumed")
+                if proposal["claim_token"] != clean_token:
+                    raise ValueError("event change proposal claim token is invalid")
+                update = await db.execute(
+                    """UPDATE event_change_proposals
+                       SET claimed_at = NULL, claim_token = NULL
+                       WHERE id = ? AND claim_token = ? AND consumed_at IS NULL""",
+                    (clean_id, clean_token),
+                )
+                if update.rowcount != 1:
+                    raise ValueError("event change proposal claim is no longer available")
+                await db.commit()
+                cursor = await db.execute(
+                    "SELECT * FROM event_change_proposals WHERE id = ?", (clean_id,)
+                )
+                result = _record(await cursor.fetchone())
+            except Exception:
+                await db.rollback()
+                raise
+        assert result is not None
+        return result
+
+    async def consume_event_change_proposal(
+        self, proposal_id: str, consumed_at: datetime | None = None
+    ) -> Record:
+        """Atomically consume an unexpired proposal exactly once."""
+        clean_id = _require_nonempty_text(proposal_id, "proposal_id")
+        consumed = consumed_at or timeutil.now_utc()
+        consumed_text = _utc_text(consumed, "consumed_at")
+        async with self.connection() as db:
+            try:
+                await db.execute("BEGIN IMMEDIATE")
+                cursor = await db.execute(
+                    "SELECT * FROM event_change_proposals WHERE id = ?", (clean_id,)
+                )
+                proposal = _record(await cursor.fetchone())
+                if proposal is None:
+                    raise KeyError(f"Event change proposal {clean_id!r} does not exist")
+                if proposal["consumed_at"] is not None:
+                    raise ValueError("event change proposal has already been consumed")
+                if proposal["claimed_at"] is not None:
+                    raise ValueError(
+                        "event change proposal has been claimed and must be finalized"
+                    )
+                if proposal["expires_at"] <= consumed.astimezone(UTC):
+                    raise ValueError("event change proposal has expired")
+                update = await db.execute(
+                    """UPDATE event_change_proposals SET consumed_at = ?
+                       WHERE id = ? AND consumed_at IS NULL""",
+                    (consumed_text, clean_id),
+                )
+                if update.rowcount != 1:
+                    raise ValueError("event change proposal has already been consumed")
+                await db.commit()
+                cursor = await db.execute(
+                    "SELECT * FROM event_change_proposals WHERE id = ?", (clean_id,)
+                )
+                result = _record(await cursor.fetchone())
+            except Exception:
+                await db.rollback()
+                raise
+        assert result is not None
+        return result
 
     async def query_tasks(
         self,
@@ -679,6 +982,23 @@ class Store:
             )
             return _records(await cursor.fetchall())
 
+    async def get_schedule_decisions_between(
+        self, start: datetime, end: datetime
+    ) -> list[Record]:
+        """Return decisions in the half-open UTC interval ``[start, end)``."""
+        start_text, end_text = _utc_text(start, "start"), _utc_text(end, "end")
+        if end_text <= start_text:
+            raise ValueError("end must be later than start")
+        async with self.connection() as db:
+            cursor = await db.execute(
+                """SELECT * FROM schedule_decisions
+                   WHERE utc_epoch_us(decided_at) >= utc_epoch_us(?)
+                     AND utc_epoch_us(decided_at) < utc_epoch_us(?)
+                   ORDER BY utc_epoch_us(decided_at), id""",
+                (start_text, end_text),
+            )
+            return _records(await cursor.fetchall())
+
     async def mark_decision_surfaced(self, decision_id: int) -> None:
         async with self.connection() as db:
             cursor = await db.execute(
@@ -714,6 +1034,76 @@ class Store:
             reverse=True,
         )
         return ranked[:3]
+
+    async def infer_task_duration(
+        self,
+        title: str,
+        category: str,
+        energy: str,
+        series_key: str | None = None,
+        limit: int = 5,
+    ) -> Record:
+        """Infer a recurring task's duration from recent matching completions.
+
+        Matching is deterministic: the normalized series key, category, and
+        energy must all agree. The estimate is a median after removing extreme
+        median-absolute-deviation outliers when enough samples exist. No vector
+        index or model call is involved.
+        """
+        clean_title = _require_nonempty_text(title, "title")
+        clean_category = _require_nonempty_text(category, "category")
+        clean_energy = _require_nonempty_text(energy, "energy")
+        if not isinstance(limit, int) or isinstance(limit, bool) or limit <= 0:
+            raise ValueError("limit must be a positive integer")
+        key = _require_nonempty_text(
+            series_key or normalize_series_key(clean_title), "series_key"
+        )
+        async with self.connection() as db:
+            cursor = await db.execute(
+                """SELECT * FROM tasks
+                   WHERE status = 'completed'
+                     AND actual_minutes IS NOT NULL AND actual_minutes > 0
+                     AND category = ? AND energy = ?
+                   ORDER BY utc_epoch_us(completed_at) DESC, id DESC""",
+                (clean_category, clean_energy),
+            )
+            rows = _records(await cursor.fetchall())
+        matching = [
+            task for task in rows
+            if (task.get("series_key") or normalize_series_key(task["title"])) == key
+        ]
+        # The SQL ordering establishes recency, but the limit must be applied
+        # after deterministic series matching.  Otherwise a busy category can
+        # hide valid older completions behind unrelated recent tasks.
+        matching = matching[:limit]
+        if not matching:
+            return {
+                "series_key": key,
+                "estimated_minutes": None,
+                "estimate_source": "default",
+                "evidence_task_ids": [],
+            }
+
+        retained = matching
+        durations = [int(task["actual_minutes"]) for task in matching]
+        if len(durations) >= 4:
+            center = float(statistics.median(durations))
+            deviation = float(
+                statistics.median(abs(duration - center) for duration in durations)
+            )
+            if deviation > 0:
+                retained = [
+                    task for task in matching
+                    if abs(int(task["actual_minutes"]) - center) <= 3 * deviation
+                ]
+                durations = [int(task["actual_minutes"]) for task in retained]
+        estimate = max(5, int(5 * round(float(statistics.median(durations)) / 5)))
+        return {
+            "series_key": key,
+            "estimated_minutes": estimate,
+            "estimate_source": "history",
+            "evidence_task_ids": [int(task["id"]) for task in retained],
+        }
 
     async def add_fact(self, fact: Record) -> Record:
         unknown = set(fact) - _FACT_FIELDS
@@ -848,7 +1238,10 @@ class Store:
         return "\n".join(lines)
 
     async def add_goal(self, goal: Record) -> Record:
-        allowed = {"title", "target_amount", "target_unit", "period", "category", "active"}
+        allowed = {
+            "title", "target_amount", "target_unit", "period", "category", "active",
+            "session_minutes", "scheduling_enabled",
+        }
         unknown = set(goal) - allowed
         if unknown:
             raise ValueError(f"Unsupported goal fields: {sorted(unknown)}")
@@ -859,8 +1252,15 @@ class Store:
         values = dict(goal)
         values["title"] = _require_nonempty_text(values["title"], "title")
         values["category"] = _require_nonempty_text(values["category"], "category")
-        if "active" in values:
-            values["active"] = int(bool(values["active"]))
+        for field in ("active", "scheduling_enabled"):
+            if field in values:
+                values[field] = int(bool(values[field]))
+        if "session_minutes" in values and (
+            not isinstance(values["session_minutes"], int)
+            or isinstance(values["session_minutes"], bool)
+            or values["session_minutes"] <= 0
+        ):
+            raise ValueError("session_minutes must be a positive integer")
         fields = list(values)
         async with self.connection() as db:
             cursor = await db.execute(
@@ -878,6 +1278,7 @@ class Store:
         amount: float,
         source: Literal["task", "manual", "inferred"],
         logged_at: datetime,
+        task_id: int | None = None,
     ) -> Record:
         logged_text = _utc_text(logged_at, "logged_at")
         if (
@@ -887,13 +1288,35 @@ class Store:
         ):
             raise ValueError("amount must be positive")
         async with self.connection() as db:
-            cursor = await db.execute(
-                """INSERT INTO goal_progress (goal_id, amount, source, logged_at)
-                   VALUES (?, ?, ?, ?)""",
-                (goal_id, amount, source, logged_text),
-            )
-            await db.commit()
-            result = await self._get("goal_progress", int(cursor.lastrowid), db)
+            try:
+                await db.execute("BEGIN IMMEDIATE")
+                if await self._get("goals", goal_id, db) is None:
+                    raise KeyError(f"Goal {goal_id} does not exist")
+                if task_id is not None:
+                    task = await self._get("tasks", task_id, db)
+                    if task is None:
+                        raise KeyError(f"Task {task_id} does not exist")
+                    if task.get("goal_id") != goal_id:
+                        raise ValueError("task_id must refer to a task linked to this goal")
+                    existing = await db.execute(
+                        "SELECT * FROM goal_progress WHERE goal_id = ? AND task_id = ?",
+                        (goal_id, task_id),
+                    )
+                    prior = _record(await existing.fetchone())
+                    if prior is not None:
+                        await db.commit()
+                        return prior
+                cursor = await db.execute(
+                    """INSERT INTO goal_progress
+                       (goal_id, amount, source, logged_at, task_id)
+                       VALUES (?, ?, ?, ?, ?)""",
+                    (goal_id, amount, source, logged_text, task_id),
+                )
+                await db.commit()
+                result = await self._get("goal_progress", int(cursor.lastrowid), db)
+            except Exception:
+                await db.rollback()
+                raise
         assert result is not None
         return result
 
@@ -934,6 +1357,300 @@ class Store:
             "amount_remaining": max(0.0, target - amount_done),
             "days_left": max(0, (local_end_date - timeutil.now_local().date()).days),
         }
+
+    async def _goal_schedule_item(
+        self, db: aiosqlite.Connection, row: aiosqlite.Row | None
+    ) -> Record | None:
+        item = _record(row)
+        if item is None:
+            return None
+        item["task"] = await self._get("tasks", int(item["task_id"]), db)
+        return item
+
+    async def ensure_goal_schedule_item(
+        self,
+        goal_id: int,
+        task: Record,
+        period_start: datetime,
+        period_end: datetime,
+        ordinal: int,
+        planned_amount: float,
+    ) -> Record:
+        """Idempotently create one generated goal task and its period linkage."""
+        start_text = _utc_text(period_start, "period_start")
+        end_text = _utc_text(period_end, "period_end")
+        if end_text <= start_text:
+            raise ValueError("period_end must be later than period_start")
+        if not isinstance(ordinal, int) or isinstance(ordinal, bool) or ordinal <= 0:
+            raise ValueError("ordinal must be a positive integer")
+        if (
+            not isinstance(planned_amount, (int, float))
+            or isinstance(planned_amount, bool)
+            or planned_amount <= 0
+        ):
+            raise ValueError("planned_amount must be positive")
+        allowed = _TASK_FIELDS - {
+            "status", "scheduled_start", "scheduled_end", "gcal_event_id", "goal_id",
+            "completed_at", "actual_minutes", "actual_minutes_source",
+        }
+        unknown = set(task) - allowed
+        if unknown:
+            raise ValueError(f"Unsupported generated task fields: {sorted(unknown)}")
+        title = _require_nonempty_text(task.get("title"), "title")
+
+        async with self.connection() as db:
+            try:
+                await db.execute("BEGIN IMMEDIATE")
+                goal = await self._get("goals", goal_id, db)
+                if goal is None:
+                    raise KeyError(f"Goal {goal_id} does not exist")
+                existing_cursor = await db.execute(
+                    """SELECT * FROM goal_schedule_items
+                       WHERE goal_id = ? AND period_start = ? AND ordinal = ?""",
+                    (goal_id, start_text, ordinal),
+                )
+                existing = await self._goal_schedule_item(
+                    db, await existing_cursor.fetchone()
+                )
+                if existing is not None:
+                    await db.commit()
+                    return existing
+
+                values = {
+                    key: value for key, value in task.items()
+                    if key in allowed and value is not None
+                }
+                values["title"] = title
+                values["goal_id"] = goal_id
+                values["series_key"] = _require_nonempty_text(
+                    task.get("series_key") or f"goal:{goal_id}", "series_key"
+                )
+                if "deadline" not in values:
+                    values["deadline"] = period_end
+                if "estimated_minutes" in values:
+                    values.setdefault("estimate_source", "goal")
+                for field in tuple(values):
+                    values[field] = _db_value(field, values[field])
+                fields = list(values)
+                task_cursor = await db.execute(
+                    f"INSERT INTO tasks ({', '.join(fields)}) "
+                    f"VALUES ({', '.join('?' for _ in fields)})",
+                    [values[field] for field in fields],
+                )
+                task_id = int(task_cursor.lastrowid)
+                item_cursor = await db.execute(
+                    """INSERT INTO goal_schedule_items
+                       (goal_id, task_id, period_start, period_end, ordinal, planned_amount)
+                       VALUES (?, ?, ?, ?, ?, ?)""",
+                    (
+                        goal_id, task_id, start_text, end_text, ordinal,
+                        float(planned_amount),
+                    ),
+                )
+                await db.commit()
+                row = await (
+                    await db.execute(
+                        "SELECT * FROM goal_schedule_items WHERE id = ?",
+                        (int(item_cursor.lastrowid),),
+                    )
+                ).fetchone()
+                result = await self._goal_schedule_item(db, row)
+            except Exception:
+                await db.rollback()
+                raise
+        assert result is not None
+        return result
+
+    async def get_goal_schedule_items(
+        self, goal_id: int, period_start: datetime, period_end: datetime
+    ) -> list[Record]:
+        """Return goal items whose periods overlap the supplied UTC range."""
+        start_text = _utc_text(period_start, "period_start")
+        end_text = _utc_text(period_end, "period_end")
+        if end_text <= start_text:
+            raise ValueError("period_end must be later than period_start")
+        async with self.connection() as db:
+            cursor = await db.execute(
+                """SELECT * FROM goal_schedule_items
+                   WHERE goal_id = ?
+                     AND utc_epoch_us(period_start) < utc_epoch_us(?)
+                     AND utc_epoch_us(period_end) > utc_epoch_us(?)
+                   ORDER BY utc_epoch_us(period_start), ordinal, id""",
+                (goal_id, end_text, start_text),
+            )
+            result: list[Record] = []
+            for row in await cursor.fetchall():
+                item = await self._goal_schedule_item(db, row)
+                assert item is not None
+                result.append(item)
+            return result
+
+    async def cancel_goal_schedule_items(
+        self,
+        goal_id: int,
+        period_start: datetime,
+        period_end: datetime,
+        keep_count: int,
+    ) -> list[Record]:
+        """Mark surplus generated items cancelled, retaining remote IDs for cleanup.
+
+        Call :meth:`finalize_cancelled_goal_schedule_items` only after the
+        caller has successfully deleted each returned task's owned calendar
+        block.  This two-phase ordering prevents the local availability view
+        from claiming a block is free while its remote counterpart survives.
+        """
+        start_text = _utc_text(period_start, "period_start")
+        end_text = _utc_text(period_end, "period_end")
+        if end_text <= start_text:
+            raise ValueError("period_end must be later than period_start")
+        if not isinstance(keep_count, int) or isinstance(keep_count, bool) or keep_count < 0:
+            raise ValueError("keep_count must be a non-negative integer")
+        cancelled_at = _utc_text(timeutil.now_utc(), "cancelled_at")
+        async with self.connection() as db:
+            try:
+                await db.execute("BEGIN IMMEDIATE")
+                cursor = await db.execute(
+                    """SELECT gsi.*, t.status AS task_status,
+                              EXISTS (
+                                  SELECT 1 FROM schedule_decisions sd
+                                  WHERE sd.task_id = gsi.task_id
+                                    AND sd.trigger = 'user_request'
+                              ) AS manually_fixed
+                       FROM goal_schedule_items gsi
+                       JOIN tasks t ON t.id = gsi.task_id
+                       WHERE gsi.goal_id = ? AND gsi.period_start = ?
+                         AND gsi.period_end = ? AND gsi.cancelled_at IS NULL
+                       ORDER BY gsi.ordinal, gsi.id""",
+                    (goal_id, start_text, end_text),
+                )
+                rows = await cursor.fetchall()
+                completed_ids = {
+                    int(row["id"]) for row in rows
+                    if row["task_status"] == "completed"
+                }
+                manually_fixed_ids = {
+                    int(row["id"]) for row in rows
+                    if bool(row["manually_fixed"])
+                    and int(row["id"]) not in completed_ids
+                }
+                open_rows = [
+                    row for row in rows
+                    if int(row["id"]) not in completed_ids | manually_fixed_ids
+                ]
+                # Completed occurrences have already contributed progress and
+                # therefore do not consume the outstanding quota. A manually
+                # placed open occurrence still does, because it represents an
+                # intentionally preserved future session.
+                keep_open = max(0, keep_count - len(manually_fixed_ids))
+                to_cancel = open_rows[keep_open:]
+                snapshots: list[Record] = []
+                for row in to_cancel:
+                    base_row = await (
+                        await db.execute(
+                            "SELECT * FROM goal_schedule_items WHERE id = ?",
+                            (row["id"],),
+                        )
+                    ).fetchone()
+                    snapshot = await self._goal_schedule_item(db, base_row)
+                    assert snapshot is not None
+                    snapshots.append(snapshot)
+                    await db.execute(
+                        "UPDATE goal_schedule_items SET cancelled_at = ? WHERE id = ?",
+                        (cancelled_at, row["id"]),
+                    )
+                    await db.execute(
+                        """UPDATE tasks SET status = 'dropped', completed_at = NULL
+                           WHERE id = ? AND status IN ('pending', 'scheduled')""",
+                        (row["task_id"],),
+                    )
+                await db.commit()
+            except Exception:
+                await db.rollback()
+                raise
+        for snapshot in snapshots:
+            snapshot["cancelled_at"] = _utc_datetime(cancelled_at)
+            if snapshot.get("task", {}).get("status") in {"pending", "scheduled"}:
+                snapshot["task"]["status"] = "dropped"
+        return snapshots
+
+    async def finalize_cancelled_goal_schedule_items(
+        self,
+        goal_id: int,
+        period_start: datetime,
+        period_end: datetime,
+        *,
+        task_ids: Sequence[int],
+    ) -> list[Record]:
+        """Clear local blocks for cancelled items after owned events are deleted.
+
+        ``task_ids`` must be the task IDs returned by
+        :meth:`cancel_goal_schedule_items`; restricting finalization to those
+        rows makes a remote-delete retry safe and avoids clearing an unrelated
+        manual placement.
+        """
+        start_text = _utc_text(period_start, "period_start")
+        end_text = _utc_text(period_end, "period_end")
+        if end_text <= start_text:
+            raise ValueError("period_end must be later than period_start")
+        if not isinstance(task_ids, Sequence) or isinstance(task_ids, (str, bytes)):
+            raise TypeError("task_ids must be a sequence of positive integers")
+        normalized_ids = list(task_ids)
+        if any(
+            not isinstance(task_id, int)
+            or isinstance(task_id, bool)
+            or task_id <= 0
+            for task_id in normalized_ids
+        ):
+            raise ValueError("task_ids must be a sequence of positive integers")
+        if len(set(normalized_ids)) != len(normalized_ids):
+            raise ValueError("task_ids must not contain duplicates")
+        if not normalized_ids:
+            return []
+
+        async with self.connection() as db:
+            try:
+                await db.execute("BEGIN IMMEDIATE")
+                placeholders = ", ".join("?" for _ in normalized_ids)
+                cursor = await db.execute(
+                    f"""SELECT * FROM goal_schedule_items
+                        WHERE goal_id = ? AND period_start = ? AND period_end = ?
+                          AND cancelled_at IS NOT NULL
+                          AND task_id IN ({placeholders})
+                        ORDER BY ordinal, id""",
+                    (goal_id, start_text, end_text, *normalized_ids),
+                )
+                rows = await cursor.fetchall()
+                found_ids = {int(row["task_id"]) for row in rows}
+                missing_ids = set(normalized_ids) - found_ids
+                if missing_ids:
+                    raise ValueError(
+                        "task_ids must identify cancelled items in the supplied goal period: "
+                        f"{sorted(missing_ids)}"
+                    )
+                for row in rows:
+                    await db.execute(
+                        """UPDATE tasks
+                           SET status = 'dropped', completed_at = NULL,
+                               scheduled_start = NULL, scheduled_end = NULL,
+                               gcal_event_id = NULL
+                           WHERE id = ?""",
+                        (row["task_id"],),
+                    )
+                await db.commit()
+                result: list[Record] = []
+                for row in rows:
+                    refreshed = await (
+                        await db.execute(
+                            "SELECT * FROM goal_schedule_items WHERE id = ?", (row["id"],)
+                        )
+                    ).fetchone()
+                    item = await self._goal_schedule_item(db, refreshed)
+                    assert item is not None
+                    result.append(item)
+            except Exception:
+                await db.rollback()
+                raise
+        return result
 
     async def query_goals(
         self, active: bool | None = True, category: str | None = None
@@ -1033,6 +1750,23 @@ class Store:
                        ORDER BY utc_epoch_us(created_at) DESC, id DESC LIMIT ?
                    ) ORDER BY utc_epoch_us(created_at), id""",
                 (session_id, limit),
+            )
+            return _records(await cursor.fetchall())
+
+    async def get_messages_between(
+        self, start: datetime, end: datetime
+    ) -> list[Record]:
+        """Return conversation records in the half-open UTC interval ``[start, end)``."""
+        start_text, end_text = _utc_text(start, "start"), _utc_text(end, "end")
+        if end_text <= start_text:
+            raise ValueError("end must be later than start")
+        async with self.connection() as db:
+            cursor = await db.execute(
+                """SELECT * FROM messages
+                   WHERE utc_epoch_us(created_at) >= utc_epoch_us(?)
+                     AND utc_epoch_us(created_at) < utc_epoch_us(?)
+                   ORDER BY utc_epoch_us(created_at), id""",
+                (start_text, end_text),
             )
             return _records(await cursor.fetchall())
 

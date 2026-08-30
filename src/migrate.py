@@ -23,6 +23,33 @@ _EVENT_COLUMNS = {
     "category", "source", "gcal_event_id", "created_at",
 }
 
+_ADDITIVE_COLUMNS: dict[str, dict[str, str]] = {
+    "tasks": {
+        "series_key": "TEXT",
+        "estimate_source": (
+            "TEXT CHECK (estimate_source IS NULL OR "
+            "estimate_source IN ('user', 'history', 'default', 'goal'))"
+        ),
+        "actual_minutes_source": (
+            "TEXT CHECK (actual_minutes_source IS NULL OR "
+            "actual_minutes_source IN ('user', 'debrief', 'calendar', 'inferred'))"
+        ),
+    },
+    "goals": {
+        "session_minutes": "INTEGER NOT NULL DEFAULT 60 CHECK (session_minutes > 0)",
+        "scheduling_enabled": (
+            "INTEGER NOT NULL DEFAULT 1 CHECK (scheduling_enabled IN (0, 1))"
+        ),
+    },
+    "goal_progress": {
+        "task_id": "INTEGER REFERENCES tasks(id) ON DELETE SET NULL",
+    },
+    "event_change_proposals": {
+        "claimed_at": "TEXT",
+        "claim_token": "TEXT",
+    },
+}
+
 
 def _enum(value: Any, allowed: set[str], default: str) -> str:
     """Return a valid legacy enum value or its safe canonical default."""
@@ -159,6 +186,7 @@ async def run_migrations(db_path: str | Path | None = None) -> None:
             index_names = (
                 "idx_tasks_status_deadline", "idx_tasks_scheduled_start", "idx_tasks_goal_id",
                 "idx_events_time_range", "idx_events_gcal_id",
+                "idx_event_change_proposals_pending",
             )
             prefix = ["BEGIN IMMEDIATE;"]
             prefix.extend(f'DROP INDEX IF EXISTS "{name}";' for name in index_names)
@@ -166,6 +194,19 @@ async def run_migrations(db_path: str | Path | None = None) -> None:
                 prefix.append("ALTER TABLE tasks RENAME TO tasks__legacy;")
             if events_legacy:
                 prefix.append("ALTER TABLE events RENAME TO events__legacy;")
+            for table, definitions in _ADDITIVE_COLUMNS.items():
+                if not await _table_exists(db, table):
+                    continue
+                # A legacy tasks table is rebuilt below; adding its new columns
+                # before the rename would only do disposable work.
+                if table == "tasks" and tasks_legacy:
+                    continue
+                existing = await _table_columns(db, table)
+                for column, definition in definitions.items():
+                    if column not in existing:
+                        prefix.append(
+                            f'ALTER TABLE "{table}" ADD COLUMN "{column}" {definition};'
+                        )
             await db.executescript("\n".join(prefix) + "\n" + schema)
             if tasks_legacy:
                 await _copy_legacy_tasks(db)
@@ -176,6 +217,7 @@ async def run_migrations(db_path: str | Path | None = None) -> None:
             if conversations_legacy:
                 await _copy_legacy_conversations(db)
                 await db.execute("DROP TABLE conversation_context")
+            await db.execute("PRAGMA user_version = 3")
             violations = await (await db.execute("PRAGMA foreign_key_check")).fetchall()
             if violations:
                 raise RuntimeError(f"foreign key violations after migration: {violations!r}")

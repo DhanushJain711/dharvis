@@ -7,6 +7,8 @@ CREATE TABLE IF NOT EXISTS goals (
     target_unit TEXT NOT NULL CHECK (target_unit IN ('hours', 'sessions')),
     period TEXT NOT NULL CHECK (period IN ('week', 'month')),
     category TEXT NOT NULL,
+    session_minutes INTEGER NOT NULL DEFAULT 60 CHECK (session_minutes > 0),
+    scheduling_enabled INTEGER NOT NULL DEFAULT 1 CHECK (scheduling_enabled IN (0, 1)),
     active INTEGER NOT NULL DEFAULT 1 CHECK (active IN (0, 1)),
     created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
         CHECK (substr(created_at, -1) = 'Z' OR substr(created_at, -6) = '+00:00'),
@@ -46,6 +48,14 @@ CREATE TABLE IF NOT EXISTS tasks (
         OR substr(completed_at, -6) = '+00:00'
     ),
     actual_minutes INTEGER CHECK (actual_minutes IS NULL OR actual_minutes >= 0),
+    series_key TEXT,
+    estimate_source TEXT CHECK (
+        estimate_source IS NULL OR estimate_source IN ('user', 'history', 'default', 'goal')
+    ),
+    actual_minutes_source TEXT CHECK (
+        actual_minutes_source IS NULL
+        OR actual_minutes_source IN ('user', 'debrief', 'calendar', 'inferred')
+    ),
     CHECK (
         (scheduled_start IS NULL AND scheduled_end IS NULL)
         OR (scheduled_start IS NOT NULL AND scheduled_end IS NOT NULL
@@ -139,7 +149,61 @@ CREATE TABLE IF NOT EXISTS goal_progress (
         CHECK (substr(logged_at, -1) = 'Z' OR substr(logged_at, -6) = '+00:00'),
     amount REAL NOT NULL CHECK (amount > 0),
     source TEXT NOT NULL CHECK (source IN ('task', 'manual', 'inferred')),
+    task_id INTEGER REFERENCES tasks(id) ON DELETE SET NULL,
     CHECK (julianday(logged_at) IS NOT NULL AND instr(logged_at, 'T') = 11)
+);
+
+CREATE TABLE IF NOT EXISTS goal_schedule_items (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    goal_id INTEGER NOT NULL REFERENCES goals(id) ON DELETE CASCADE,
+    task_id INTEGER NOT NULL UNIQUE REFERENCES tasks(id) ON DELETE RESTRICT,
+    period_start TEXT NOT NULL
+        CHECK (substr(period_start, -1) = 'Z' OR substr(period_start, -6) = '+00:00'),
+    period_end TEXT NOT NULL
+        CHECK (substr(period_end, -1) = 'Z' OR substr(period_end, -6) = '+00:00'),
+    ordinal INTEGER NOT NULL CHECK (ordinal > 0),
+    planned_amount REAL NOT NULL CHECK (planned_amount > 0),
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+        CHECK (substr(created_at, -1) = 'Z' OR substr(created_at, -6) = '+00:00'),
+    cancelled_at TEXT CHECK (
+        cancelled_at IS NULL OR substr(cancelled_at, -1) = 'Z'
+        OR substr(cancelled_at, -6) = '+00:00'
+    ),
+    UNIQUE (goal_id, period_start, ordinal),
+    CHECK (period_end > period_start),
+    CHECK (julianday(period_start) IS NOT NULL AND instr(period_start, 'T') = 11),
+    CHECK (julianday(period_end) IS NOT NULL AND instr(period_end, 'T') = 11),
+    CHECK (julianday(created_at) IS NOT NULL AND instr(created_at, 'T') = 11),
+    CHECK (cancelled_at IS NULL OR (julianday(cancelled_at) IS NOT NULL AND instr(cancelled_at, 'T') = 11))
+);
+
+CREATE TABLE IF NOT EXISTS event_change_proposals (
+    id TEXT PRIMARY KEY,
+    operation TEXT NOT NULL CHECK (operation IN ('create', 'update')),
+    payload TEXT NOT NULL CHECK (json_valid(payload) AND json_type(payload) = 'object'),
+    conflicts TEXT NOT NULL CHECK (json_valid(conflicts) AND json_type(conflicts) = 'array'),
+    created_at TEXT NOT NULL
+        CHECK (substr(created_at, -1) = 'Z' OR substr(created_at, -6) = '+00:00'),
+    expires_at TEXT NOT NULL
+        CHECK (substr(expires_at, -1) = 'Z' OR substr(expires_at, -6) = '+00:00'),
+    claimed_at TEXT CHECK (
+        claimed_at IS NULL OR substr(claimed_at, -1) = 'Z'
+        OR substr(claimed_at, -6) = '+00:00'
+    ),
+    claim_token TEXT,
+    consumed_at TEXT CHECK (
+        consumed_at IS NULL OR substr(consumed_at, -1) = 'Z'
+        OR substr(consumed_at, -6) = '+00:00'
+    ),
+    CHECK (expires_at > created_at),
+    CHECK (
+        (claimed_at IS NULL AND claim_token IS NULL)
+        OR (claimed_at IS NOT NULL AND claim_token IS NOT NULL)
+    ),
+    CHECK (julianday(created_at) IS NOT NULL AND instr(created_at, 'T') = 11),
+    CHECK (julianday(expires_at) IS NOT NULL AND instr(expires_at, 'T') = 11),
+    CHECK (claimed_at IS NULL OR (julianday(claimed_at) IS NOT NULL AND instr(claimed_at, 'T') = 11)),
+    CHECK (consumed_at IS NULL OR (julianday(consumed_at) IS NOT NULL AND instr(consumed_at, 'T') = 11))
 );
 
 CREATE TABLE IF NOT EXISTS messages (
@@ -214,6 +278,8 @@ CREATE TABLE IF NOT EXISTS usage_events (
 CREATE INDEX IF NOT EXISTS idx_tasks_status_deadline ON tasks(status, deadline);
 CREATE INDEX IF NOT EXISTS idx_tasks_scheduled_start ON tasks(scheduled_start);
 CREATE INDEX IF NOT EXISTS idx_tasks_goal_id ON tasks(goal_id);
+CREATE INDEX IF NOT EXISTS idx_tasks_series_history
+    ON tasks(series_key, category, energy, status, completed_at);
 CREATE INDEX IF NOT EXISTS idx_events_time_range ON events(start_time, end_time);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_events_gcal_id
     ON events(gcal_event_id) WHERE gcal_event_id IS NOT NULL;
@@ -228,6 +294,12 @@ CREATE INDEX IF NOT EXISTS idx_schedule_decisions_task_time
     ON schedule_decisions(task_id, decided_at);
 CREATE INDEX IF NOT EXISTS idx_facts_active_category ON facts(active, category);
 CREATE INDEX IF NOT EXISTS idx_goal_progress_goal_time ON goal_progress(goal_id, logged_at);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_goal_progress_task_once
+    ON goal_progress(goal_id, task_id) WHERE task_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_goal_schedule_period
+    ON goal_schedule_items(goal_id, period_start, period_end, ordinal);
+CREATE INDEX IF NOT EXISTS idx_event_change_proposals_pending
+    ON event_change_proposals(expires_at, consumed_at, claimed_at);
 CREATE INDEX IF NOT EXISTS idx_messages_session_time ON messages(session_id, created_at);
 
 CREATE TRIGGER IF NOT EXISTS validate_schedule_reasoning_insert

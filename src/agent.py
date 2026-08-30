@@ -7,6 +7,7 @@ import inspect
 import json
 import logging
 import os
+import re
 import time
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from pathlib import Path
@@ -392,6 +393,13 @@ class Agent:
 
         lock = self._conversation_locks.setdefault(session_id, asyncio.Lock())
         async with lock:
+            normalized_confirmation = " ".join(
+                re.findall(r"[a-z]+", message.lower())
+            )
+            affirmative_confirmation = bool(re.fullmatch(
+                r"(?:yes|yeah|yep|confirm|confirmed|do it|go ahead|keep it|please do|make it)",
+                normalized_confirmation,
+            ))
             turn_started = time.perf_counter()
             usage_total = {
                 "input_tokens": 0,
@@ -404,6 +412,10 @@ class Agent:
             cost_total: float | None = 0.0
             iterations = 0
             tool_call_count = 0
+            # A conflicting event proposal requires a new user message.  This
+            # guards against a model attempting to approve its own warning in a
+            # later tool-loop iteration of the same turn.
+            event_confirmation_pending = False
             try:
                 physical_session = session_id
                 history_messages: list[dict[str, Any]] = []
@@ -527,9 +539,28 @@ class Agent:
                         return terminal_text
 
                     tool_call_count += len(calls)
+                    async def execute_with_confirmation_guard(call: Any) -> tuple[str, str]:
+                        name = str(_field(call, "name", ""))
+                        call_id = str(_field(call, "call_id", ""))
+                        if name == "confirm_event_change" and (
+                            event_confirmation_pending
+                            or not affirmative_confirmation
+                            or any(
+                                str(_field(other, "name", "")) in {"add_event", "update_event"}
+                                for other in calls
+                            )
+                        ):
+                            return (
+                                call_id,
+                                "Tool error (ValueError): event changes require an explicit affirmative confirmation in a later user message",
+                            )
+                        return await self._execute_call(call)
+
                     results = await asyncio.gather(
-                        *(self._execute_call(call) for call in calls)
+                        *(execute_with_confirmation_guard(call) for call in calls)
                     )
+                    if any("\"confirmation_required\":true" in output.replace(" ", "") for _, output in results):
+                        event_confirmation_pending = True
                     for call_id, output in results:
                         output_item = {
                             "type": "function_call_output",

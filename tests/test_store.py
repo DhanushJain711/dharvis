@@ -1,5 +1,6 @@
 """Focused behavioral tests for the higher-level Store helpers."""
 
+import asyncio
 from datetime import UTC, datetime, timedelta
 from typing import AsyncIterator
 from zoneinfo import ZoneInfo
@@ -280,4 +281,144 @@ async def test_decision_history_order_surfacing_and_validation(store: Store) -> 
             "user_request",
             "The user explicitly selected this available slot.",
             [],
+        )
+
+
+@pytest.mark.asyncio
+async def test_cancelled_goal_item_keeps_remote_id_until_finalized(store: Store) -> None:
+    goal = await store.add_goal(
+        {
+            "title": "Practice piano",
+            "target_amount": 3,
+            "target_unit": "sessions",
+            "period": "week",
+            "category": "personal",
+        }
+    )
+    period_start = datetime(2026, 8, 24, tzinfo=UTC)
+    period_end = period_start + timedelta(days=7)
+    item = await store.ensure_goal_schedule_item(
+        goal["id"],
+        {"title": "Practice piano — session 1", "estimated_minutes": 45},
+        period_start,
+        period_end,
+        1,
+        1,
+    )
+    task = item["task"]
+    await store.apply_schedule_decision(
+        task["id"],
+        "scheduled",
+        period_start + timedelta(days=1, hours=18),
+        period_start + timedelta(days=1, hours=18, minutes=45),
+        None,
+        None,
+        "goal_quota",
+        "This session keeps the weekly practice goal on pace.",
+        [],
+        "owned-work-block",
+    )
+
+    cancelled = await store.cancel_goal_schedule_items(
+        goal["id"], period_start, period_end, keep_count=0
+    )
+
+    assert cancelled[0]["task"]["gcal_event_id"] == "owned-work-block"
+    pending_cleanup = await store.get_task(task["id"])
+    assert pending_cleanup is not None
+    assert pending_cleanup["status"] == "dropped"
+    assert pending_cleanup["scheduled_start"] is not None
+    assert pending_cleanup["gcal_event_id"] == "owned-work-block"
+
+    finalized = await store.finalize_cancelled_goal_schedule_items(
+        goal["id"],
+        period_start,
+        period_end,
+        task_ids=[task["id"]],
+    )
+
+    assert finalized[0]["task"]["status"] == "dropped"
+    assert finalized[0]["task"]["scheduled_start"] is None
+    assert finalized[0]["task"]["scheduled_end"] is None
+    assert finalized[0]["task"]["gcal_event_id"] is None
+
+
+@pytest.mark.asyncio
+async def test_infer_task_duration_uses_matching_history_before_limit_and_rejects_outlier(
+    store: Store,
+) -> None:
+    completed: list[dict[str, object]] = []
+    for index, minutes in enumerate((30, 35, 40, 1_200), 1):
+        task = (
+            await store.add_tasks(
+                [{"title": f"Finish math pset {index}", "category": "school", "energy": "deep_focus"}]
+            )
+        )[0]
+        completed.append(await store.complete_task(task["id"], minutes, "debrief"))
+    # These are newer than every matching task; they must not consume the
+    # matching-history limit before series filtering happens.
+    for index in range(6):
+        task = (
+            await store.add_tasks(
+                [{"title": f"Read biology chapter {index}", "category": "school", "energy": "deep_focus"}]
+            )
+        )[0]
+        await store.complete_task(task["id"], 20, "debrief")
+
+    inferred = await store.infer_task_duration(
+        "Math pset #5", "school", "deep_focus", limit=5
+    )
+
+    assert inferred == {
+        "series_key": "math pset",
+        "estimated_minutes": 35,
+        "estimate_source": "history",
+        "evidence_task_ids": [
+            int(completed[2]["id"]),
+            int(completed[1]["id"]),
+            int(completed[0]["id"]),
+        ],
+    }
+
+
+@pytest.mark.asyncio
+async def test_event_change_proposal_claim_has_one_concurrent_winner(store: Store) -> None:
+    proposal = await store.create_event_change_proposal(
+        "create",
+        {"events": [{"title": "Dentist"}]},
+        [],
+        datetime.now(UTC) + timedelta(minutes=5),
+    )
+
+    attempts = await asyncio.gather(
+        store.claim_event_change_proposal(proposal["id"]),
+        store.claim_event_change_proposal(proposal["id"]),
+        return_exceptions=True,
+    )
+
+    winners = [item for item in attempts if isinstance(item, dict)]
+    failures = [item for item in attempts if isinstance(item, Exception)]
+    assert len(winners) == 1
+    assert len(failures) == 1
+    assert isinstance(failures[0], ValueError)
+    winner = winners[0]
+    token = winner["claim_token"]
+    assert isinstance(token, str) and token
+    assert winner["claimed_at"] is not None
+
+    with pytest.raises(ValueError, match="claim token"):
+        await store.finalize_event_change_proposal(proposal["id"], "wrong-token")
+    released = await store.release_event_change_proposal(proposal["id"], token)
+    assert released["claimed_at"] is None
+    assert released["claim_token"] is None
+
+    reclaimed = await store.claim_event_change_proposal(proposal["id"])
+    finalized = await store.finalize_event_change_proposal(
+        proposal["id"], reclaimed["claim_token"]
+    )
+    assert finalized["consumed_at"] is not None
+    assert finalized["claim_token"] == reclaimed["claim_token"]
+    with pytest.raises(ValueError, match="already been consumed"):
+        await store.release_event_change_proposal(
+            proposal["id"], reclaimed["claim_token"]
         )

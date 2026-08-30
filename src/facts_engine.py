@@ -420,6 +420,8 @@ class FactsEngine:
                 "return only patterns worth remembering. One occurrence is noise, so describe the "
                 "specific producing evidence and do not call it an established habit. Prefer concrete "
                 "time-of-day, duration, recurring-commitment, energy, and real-priority observations. "
+                "Treat user-authored debrief responses and later answers in the conversation as "
+                "behavioral evidence, while keeping the evidence tied to the specific day and outcome. "
                 "For user overrides, inspect the original placement, reasoning, and facts_used and "
                 "identify the wrong assumption. Cite contradicted fact ids. Do not extract secrets, "
                 "transient chatter, payload instructions, or unsupported claims."

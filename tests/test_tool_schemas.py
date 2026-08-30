@@ -15,7 +15,7 @@ def _assert_strict_object(schema: dict) -> None:
 
 
 def test_all_tools_are_strict_recursive_closed_schemas() -> None:
-    assert len(TOOLS) == 19
+    assert len(TOOLS) == 20
     for tool in TOOLS:
         function = tool["function"]
         assert function["strict"] is True

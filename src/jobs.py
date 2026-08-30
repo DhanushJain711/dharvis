@@ -61,6 +61,10 @@ class _Runtime:
     facts_engine: Any
 
 
+class CalendarBriefIncompleteError(RuntimeError):
+    """Raised when a complete all-calendar morning view cannot be verified."""
+
+
 _runtime: _Runtime | None = None
 
 
@@ -127,6 +131,14 @@ def _compact_items(items: list[Record], render: Callable[[Record], str], limit: 
 
 async def _maybe_await(value: Any) -> Any:
     return await value if inspect.isawaitable(value) else value
+
+
+async def _goal_hook(engine: Any, method_name: str, reference: date | datetime) -> Any:
+    """Invoke one concrete optional SchedulerEngine goal lifecycle hook."""
+    method = getattr(engine, method_name, None)
+    if callable(method):
+        return await method(reference=reference)
+    return []
 
 
 async def _call_compatible(method: Callable[..., Any], **values: Any) -> Any:
@@ -277,10 +289,10 @@ async def _format_decision(decision: Record, task: Record) -> str:
 
 
 async def _brief_data(
-    store: Store, local_date: date
+    store: Store, local_date: date, calendar: Any | None = None
 ) -> tuple[list[Record], list[Record], list[Record], list[Record]]:
     start, end = _day_bounds(local_date)
-    events = await store.query_events(start, end)
+    local_events = await store.query_events(start, end)
     all_tasks = await store.query_tasks()
     active = [task for task in all_tasks if task.get("status") not in {"completed", "dropped"}]
     due = [
@@ -297,6 +309,60 @@ async def _brief_data(
         goal for goal in await store.query_goals(active=True)
         if _goal_is_behind(goal, local_date)
     ]
+    # Locally tracked fixed commitments are the assistant's durable plan. Put
+    # them ahead of supplementary Google-only entries before compacting so a
+    # crowded external calendar cannot hide an event the user explicitly
+    # created through Dharvis.
+    events = [{**item, "_brief_local": True} for item in local_events]
+    if calendar is not None:
+        google_events = await calendar.list_events(start, end)
+        if getattr(calendar, "_last_query_complete", True) is False:
+            raise CalendarBriefIncompleteError(
+                "Google Calendar could not provide a complete view; "
+                "the morning brief will retry instead of hiding events"
+            )
+        mirrored_ids = {
+            str(item.get("gcal_event_id"))
+            for item in [*local_events, *all_tasks]
+            if item.get("gcal_event_id")
+        }
+        for item in google_events:
+            gcal_id = str(item.get("gcal_event_id") or item.get("id") or "")
+            if gcal_id and gcal_id in mirrored_ids:
+                continue
+            normalized = dict(item)
+            for field in ("start_time", "end_time"):
+                value = normalized.get(field)
+                if isinstance(value, str):
+                    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+                    if parsed.tzinfo is None or parsed.utcoffset() is None:
+                        raise CalendarBriefIncompleteError(
+                            f"Google Calendar returned a naive {field}"
+                        )
+                    normalized[field] = parsed.astimezone(UTC)
+            # CalendarService identifies all-day entries through their local
+            # midnight boundaries.  Keep the display concern here so the
+            # calendar boundary remains the shared schedule shape.
+            if not normalized.get("all_day"):
+                event_start, event_end = (
+                    normalized.get("start_time"), normalized.get("end_time")
+                )
+                if isinstance(event_start, datetime) and isinstance(event_end, datetime):
+                    local_start = event_start.astimezone(_zone())
+                    local_end = event_end.astimezone(_zone())
+                    normalized["all_day"] = (
+                        local_start.time() == time.min
+                        and local_end.time() == time.min
+                        and local_end > local_start
+                    )
+            events.append(normalized)
+    events.sort(
+        key=lambda item: (
+            not item.get("_brief_local", False),
+            item["start_time"],
+            item["end_time"],
+        )
+    )
     return events, due, blocks, goals
 
 
@@ -304,8 +370,9 @@ async def _render_brief(
     store: Store,
     local_date: date,
     represented_elsewhere: set[int] | None = None,
+    calendar: Any | None = None,
 ) -> tuple[str, list[int]]:
-    events, due, blocks, goals = await _brief_data(store, local_date)
+    events, due, blocks, goals = await _brief_data(store, local_date, calendar)
     excluded = represented_elsewhere or set()
     decisions = [
         decision
@@ -324,7 +391,8 @@ async def _render_brief(
         rendered = _compact_items(
             events,
             lambda item: (
-                f"{_format_clock(item['start_time'])} {_short_text(item['title'])}"
+                f"{'all day' if item.get('all_day') else _format_clock(item['start_time'])} "
+                f"{_short_text(item['title'])}"
             ),
             5,
         )
@@ -340,7 +408,7 @@ async def _render_brief(
         lines.append("Work:")
         rendered_blocks = 0
         for task in blocks:
-            if rendered_blocks >= 6:
+            if rendered_blocks >= 5:
                 break
             block_decision = by_task.get(int(task["id"]))
             why = (
@@ -349,6 +417,7 @@ async def _render_brief(
             )
             candidate = (
                 f"• {_format_span(task['scheduled_start'], task['scheduled_end'])} "
+                f"{'Goal: ' if task.get('goal_id') else ''}"
                 f"{_short_text(task['title'])} — {why}"
             )
             if len("\n".join([*lines, candidate])) > _MAX_BRIEF_CHARS - 650:
@@ -490,14 +559,22 @@ async def _retry_change_surfacing(
     return failed
 
 
-async def send_daily_brief(store: Store, telegram: Any, local_date: date) -> None:
+async def send_daily_brief(
+    store: Store,
+    telegram: Any,
+    local_date: date,
+    calendar: Any | None = None,
+) -> None:
     """Serialize and send one morning dashboard occurrence."""
     async with _occurrence_lock("brief", local_date):
-        await _send_daily_brief_once(store, telegram, local_date)
+        await _send_daily_brief_once(store, telegram, local_date, calendar)
 
 
 async def _send_daily_brief_once(
-    store: Store, telegram: Any, local_date: date
+    store: Store,
+    telegram: Any,
+    local_date: date,
+    calendar: Any | None = None,
 ) -> None:
     """Send the morning dashboard once and surface included decisions."""
     existing = await store.get_daily_log(local_date)
@@ -514,7 +591,7 @@ async def _send_daily_brief_once(
         _change_decision_ids(existing.get("notes")) if existing else []
     )
     text, included_decisions = await _render_brief(
-        store, local_date, represented_elsewhere
+        store, local_date, represented_elsewhere, calendar
     )
     if _is_quiet():
         LOGGER.info("Morning brief entered quiet hours while rendering; holding it")
@@ -901,28 +978,53 @@ def _event_unplanned_minutes(event: Record) -> int:
     return total
 
 
-async def _extract_day(facts_engine: Any, payload: Record) -> None:
+async def _day_learning_evidence(
+    store: Store, local_date: date
+) -> tuple[list[Record], list[Record]]:
+    """Return the complete conversation and scheduling trail for a local day."""
+    start, end = _day_bounds(local_date)
+    conversation, decisions = await asyncio.gather(
+        store.get_messages_between(start, end),
+        store.get_schedule_decisions_between(start, end),
+    )
+    return conversation, decisions
+
+
+async def _extract_day(
+    facts_engine: Any,
+    daily_log: Record,
+    conversation: list[Record],
+    decisions: list[Record],
+) -> None:
     method = getattr(facts_engine, "extract_from_day", None)
     if callable(method):
-        await _call_compatible(
-            method,
-            day=payload,
-            day_data=payload,
-            delta=payload,
-            daily_log=payload,
-            date=payload["date"],
-            local_date=payload["date"],
-            planned=payload["planned"],
-            actual=payload["actual"],
-            completed=payload["actual"],
-            checklist_id=payload.get("checklist_id"),
-            notes=payload.get("notes"),
+        await method(
+            daily_log=daily_log,
+            conversation=conversation,
+            decisions=decisions,
         )
         return
     raise RuntimeError(
         "FactsEngine.extract_from_day is required for debrief completion; "
         "the daily log was retained and the checklist will remain retryable"
     )
+
+
+async def _delete_completed_work_block(task: Record) -> None:
+    """Delete an owned work block before its local id is cleared on completion."""
+    gcal_event_id = str(task.get("gcal_event_id") or "").strip()
+    if not gcal_event_id:
+        return
+    calendar = getattr(getattr(_runtime, "engine", None), "calendar", None)
+    delete_work_block = getattr(calendar, "delete_work_block", None)
+    if not callable(delete_work_block):
+        raise RuntimeError(
+            "Cannot safely complete a scheduled task while its Kalendra work block "
+            "cannot be deleted; the debrief remains retryable"
+        )
+    # CalendarService refuses non-owned or non-movable Google events.  This
+    # must precede Store.complete_task(), which deliberately clears this id.
+    await delete_work_block(gcal_event_id)
 
 
 async def handle_debrief_submission(
@@ -933,11 +1035,41 @@ async def handle_debrief_submission(
     session_id: str | None = None,
 ) -> None:
     """Apply a completed checklist idempotently and feed the learning system."""
-    del session_id
     local_date = _event_date(event)
     log = await store.get_daily_log(local_date) or {}
     marker = _processed_marker(event.get("checklist_id"))
+    user_reflection = next(
+        (
+            str(event[key]).strip()
+            for key in ("notes", "reflection", "answer", "response")
+            if isinstance(event.get(key), str) and str(event[key]).strip()
+        ),
+        "",
+    )
     if marker and marker in str(log.get("notes") or ""):
+        # A follow-up answer can arrive after the checklist callback was
+        # completed.  Do not replay outcomes or goal progress, but retain the
+        # answer and run a fresh, evidence-scoped extraction.
+        if not user_reflection:
+            return
+        reflection_line = f"Debrief response: {user_reflection}"
+        notes = str(log.get("notes") or "").strip()
+        if reflection_line not in notes:
+            notes = _append_note(notes, reflection_line)
+            log = await store.upsert_daily_log(local_date, {"notes": notes})
+        learning_log = dict(log)
+        learning_log.update(
+            {
+                "date": local_date,
+                "checklist_id": event.get("checklist_id"),
+                "planned": log.get("planned") or [],
+                "actual": log.get("completed") or [],
+                "notes": user_reflection,
+                "session_id": session_id,
+            }
+        )
+        conversation, decisions = await _day_learning_evidence(store, local_date)
+        await _extract_day(facts_engine, learning_log, conversation, decisions)
         return
 
     prior_completed = log.get("completed") or []
@@ -948,6 +1080,14 @@ async def handle_debrief_submission(
     }
     completed = list(prior_completed)
     newly_completed: list[Record] = []
+    planned = log.get("planned") or []
+    checklist_task_ids = {
+        int(item["task_id"])
+        for item in planned
+        if isinstance(item, dict)
+        and item.get("checklist_included", True)
+        and str(item.get("task_id", "")).isdigit()
+    }
     raw_items = event.get("items")
     items: list[Any] = raw_items if isinstance(raw_items, list) else []
     goals_cache: list[Record] | None = None
@@ -964,6 +1104,11 @@ async def handle_debrief_submission(
             task_id = int(raw_id)
         except (TypeError, ValueError):
             continue
+        if task_id not in checklist_task_ids:
+            LOGGER.warning(
+                "Ignoring debrief task %s absent from the stored checklist", task_id
+            )
+            continue
         if task_id in known_ids:
             continue
         task = await store.get_task(task_id)
@@ -976,7 +1121,10 @@ async def handle_debrief_submission(
             else _scheduled_minutes(task)
         )
         if task.get("status") != "completed":
-            task = await store.complete_task(task_id, minutes)
+            await _delete_completed_work_block(task)
+            task = await store.complete_task(
+                task_id, minutes, actual_minutes_source="debrief"
+            )
         actual = {
             "task_id": task_id,
             "title": task.get("title"),
@@ -1096,7 +1244,7 @@ async def handle_debrief_submission(
                     await store.upsert_daily_log(local_date, {"notes": notes})
                     try:
                         await store.log_goal_progress(
-                            int(goal_id), amount, "task", attempted_at
+                            int(goal_id), amount, "task", attempted_at, task_id=task_id
                         )
                     except Exception:
                         visible = await _goal_progress_attempt_visible(
@@ -1136,7 +1284,6 @@ async def handle_debrief_submission(
                     ).replace(pending, applied)
                     await store.upsert_daily_log(local_date, {"notes": notes})
 
-    planned = log.get("planned") or []
     planned_ids = {
         int(item["task_id"])
         for item in planned
@@ -1168,9 +1315,13 @@ async def handle_debrief_submission(
     # Commit task outcomes before extraction so a retried callback cannot
     # duplicate goal progress. The processed marker is deliberately written
     # only after extraction succeeds, ensuring training data is never skipped.
+    if user_reflection:
+        reflection_line = f"Debrief response: {user_reflection}"
+        if reflection_line not in notes:
+            notes = _append_note(notes, reflection_line)
     await store.upsert_daily_log(
         local_date,
-        {"planned": planned, "completed": completed},
+        {"planned": planned, "completed": completed, "notes": notes or None},
     )
 
     day_payload: Record = {
@@ -1190,9 +1341,14 @@ async def handle_debrief_submission(
         "overflow_count": max(0, len(planned) - len(checkable_ids)),
         "unplanned_minutes": unplanned_minutes,
         "goal_progress_uncertain": uncertain_progress,
-        "notes": event.get("notes"),
+        "notes": user_reflection or None,
+        "session_id": session_id,
     }
-    await _extract_day(facts_engine, day_payload)
+    persisted_log = await store.get_daily_log(local_date) or {}
+    learning_log = dict(persisted_log)
+    learning_log.update(day_payload)
+    conversation, decisions = await _day_learning_evidence(store, local_date)
+    await _extract_day(facts_engine, learning_log, conversation, decisions)
     if marker:
         notes = _append_note(notes, marker)
     if followup_kind:
@@ -1206,6 +1362,15 @@ async def handle_debrief_submission(
             local_date,
             {"notes": notes},
         )
+    if _runtime is not None:
+        try:
+            await _goal_hook(
+                _runtime.engine, "replan_missed_goal_sessions", timeutil.now_utc()
+            )
+        except Exception:
+            # The 15-minute reconciliation job retries this independently;
+            # a planner outage must not make a completed checklist retry.
+            LOGGER.exception("missed_goal_replan_after_debrief_failed")
     if followup_kind:
         await _deliver_pending_followup(store, telegram, local_date)
 
@@ -1321,7 +1486,8 @@ async def _send_weekly_review_once(
 
 
 async def run_daily_planning(engine: SchedulerEngine, local_date: date) -> None:
-    """Autonomously place work for a local day."""
+    """Run an optional goal refresh, then autonomously place the day's work."""
+    await _goal_hook(engine, "refresh_goal_plan", local_date)
     await engine.plan_day(local_date)
 
 
@@ -1329,6 +1495,7 @@ async def reconcile_calendar(engine: SchedulerEngine) -> None:
     """Resolve conflicts, coalescing or alerting according to brief proximity."""
     start = timeutil.now_utc()
     end = start + timedelta(days=max(1, config.SCHEDULER_LOOKAHEAD_DAYS))
+    await _goal_hook(engine, "replan_missed_goal_sessions", start)
     decisions = await engine.detect_conflicts(start, end)
     if decisions and _inside_brief_coalesce_window():
         LOGGER.info(
@@ -1497,7 +1664,13 @@ async def _scheduled_morning_for(local_date: date) -> None:
         )
         return
     try:
-        await send_daily_brief(runtime.store, runtime.telegram, local_date)
+        await _goal_hook(runtime.engine, "refresh_goal_plan", local_date)
+        await send_daily_brief(
+            runtime.store,
+            runtime.telegram,
+            local_date,
+            getattr(runtime.engine, "calendar", None),
+        )
     except Exception:
         _defer(
             MORNING_JOB_ID,
@@ -1718,6 +1891,7 @@ async def run_startup_catchup() -> None:
     """Backfill the latest durable daily and weekly occurrences after restart."""
     runtime = _runtime_required()
     now, today = timeutil.now_local(), timeutil.now_local().date()
+    await _goal_hook(runtime.engine, "replan_missed_goal_sessions", now)
     morning_h, morning_m = _clock_setting("DAILY_BRIEF_TIME", "08:00")
     debrief_h, debrief_m = _clock_setting("DAILY_DEBRIEF_TIME", "21:30")
     weekly_h, weekly_m = _clock_setting("WEEKLY_REVIEW_TIME", "20:30")
@@ -1733,6 +1907,9 @@ async def run_startup_catchup() -> None:
             await _scheduled_debrief_followup(marker_date)
 
     if now >= datetime.combine(today, time(morning_h, morning_m), _zone()):
+        today_log = await runtime.store.get_daily_log(today)
+        if not today_log or not today_log.get("brief_sent_at"):
+            await run_daily_planning(runtime.engine, today)
         await _scheduled_morning_for(today)
 
     # The most recent elapsed debrief occurrence is relevant even when Railway
