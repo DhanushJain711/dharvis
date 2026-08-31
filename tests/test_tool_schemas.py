@@ -15,7 +15,7 @@ def _assert_strict_object(schema: dict) -> None:
 
 
 def test_all_tools_are_strict_recursive_closed_schemas() -> None:
-    assert len(TOOLS) == 20
+    assert len(TOOLS) == 24
     for tool in TOOLS:
         function = tool["function"]
         assert function["strict"] is True
@@ -28,3 +28,18 @@ def test_batch_create_and_required_schedule_reasoning() -> None:
     schedule = TOOLS_BY_NAME["schedule_task"]["function"]["parameters"]
     assert "reasoning" in schedule["required"]
     assert "one-sentence" in schedule["properties"]["reasoning"]["description"]
+
+
+def test_reminder_tools_are_separate_from_calendar_scheduling() -> None:
+    add = TOOLS_BY_NAME["add_reminder"]["function"]
+    assert add["parameters"]["properties"]["reminders"]["type"] == "array"
+    assert "never becomes a task, Google Calendar event, free/busy block" in add["description"]
+
+    update = TOOLS_BY_NAME["update_reminder"]["function"]["parameters"]
+    assert update["properties"]["message"]["type"] == ["string", "null"]
+    assert update["properties"]["remind_at"]["type"] == ["string", "null"]
+
+    query = TOOLS_BY_NAME["query_reminders"]["function"]["parameters"]
+    assert set(query["properties"]["status"]["enum"]) == {
+        "pending", "delivered", "cancelled", None,
+    }

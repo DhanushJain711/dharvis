@@ -1,10 +1,11 @@
 # Dharvis project context
 
-Dharvis is a stateful Telegram personal assistant for one authorized user. It turns natural-language messages into tasks, fixed calendar events, flexible work blocks, recurring goals, durable facts, and proactive daily planning. OpenAI models decide which typed tool to call and, for flexible tasks, which precomputed free block is the best fit. Deterministic Python owns time arithmetic, validation, persistence, and calendar safety.
+Dharvis is a stateful Telegram personal assistant for one authorized user. It turns natural-language messages into tasks, one-time reminders, fixed calendar events, flexible work blocks, recurring goals, durable facts, and proactive daily planning. OpenAI models decide which typed tool to call and, for flexible tasks, which precomputed free block is the best fit. Deterministic Python owns time arithmetic, validation, persistence, and calendar safety.
 
 ## Mental model
 
 - An **event** is a fixed-time commitment such as a meeting or appointment.
+- A **reminder** is a quick, one-time Telegram nudge at a requested instant. It is SQLite-only and never reserves calendar time.
 - A **task** is flexible work with a deadline, estimated duration, category, energy mode, and priority.
 - A **work block** is a task's scheduled interval on the dedicated Google Calendar named `Kalendra`.
 - A **schedule decision** is the immutable audit record explaining why a task was placed, moved, shortened, extended, or left unscheduled.
@@ -22,7 +23,7 @@ production uses `src/main.py`; webhook production uses FastAPI in `src/web.py`:
 2. Construct `CalendarService`, `SchedulerEngine`, and `FactsEngine`.
 3. Bind every schema in `src/tools.py` to a real handler in `src/integration.py`.
 4. Construct the stateful `Agent` and `TelegramHandler`.
-5. Register persistent APScheduler jobs for planning, briefs, debriefs, weekly reviews, and conflict reconciliation.
+5. Register persistent APScheduler jobs for reminder delivery, planning, briefs, debriefs, weekly reviews, and conflict reconciliation.
 6. Start Telegram polling plus its dependency-aware `/healthz` server, or the
    ASGI webhook lifespan which registers Telegram's webhook and owns scheduler
    startup and clean shutdown.
@@ -55,6 +56,7 @@ Memory has several layers:
 
 - `messages`: recent conversational context and tool exchanges.
 - `tasks`, `events`, `goals`, and `goal_progress`: explicit structured state.
+- `reminders`: one-time Telegram delivery state, attempts, and durable leases; it is not calendar state.
 - `schedule_decisions`: placement history, causal reasoning, and cited fact IDs.
 - `daily_log`: planned versus completed work, brief/debrief markers, and retry state.
 - `facts`: durable natural-language preferences with confidence, evidence count, source, and active state.
@@ -67,12 +69,13 @@ The evening debrief records completed tasks and actual minutes, removes the owne
 ## Proactive jobs
 
 - Daily planning runs 15 minutes before the configured morning brief.
-- The morning brief shows local commitments first, then nonduplicated external Google events, tasks due today, scheduled work blocks with reasons, behind-pace goals, and unsurfaced schedule changes. It retries rather than silently omit events when Google returns an incomplete view.
+- A durable dispatcher checks every 30 seconds for due reminders. It claims records with short leases, acknowledges only after Telegram accepts the message, and retries failures with bounded exponential backoff. Startup catch-up delivers reminders missed while the process was down.
+- The morning brief shows local commitments first, then nonduplicated external Google events, tasks due today, scheduled work blocks with reasons, behind-pace goals, pending reminders overdue through the next two local days, and unsurfaced schedule changes. Reading reminders for the brief does not mark them delivered or suppress the later due-time text. It retries rather than silently omit events when Google returns an incomplete view.
 - The evening debrief sends a checklist for scheduled or due tasks and records actual completion.
 - The Sunday review summarizes completion, goal progress, and the strongest learned behavioral pattern.
 - Calendar reconciliation checks the configured lookahead window every 15 minutes.
 
-Jobs use the user's IANA timezone, respect quiet hours, coalesce missed executions, and persist their job store and daily occurrence markers so restarts do not normally duplicate messages.
+Jobs use the user's IANA timezone, respect quiet hours, coalesce missed executions, and persist their job store and daily occurrence markers so restarts do not normally duplicate messages. An explicitly timed reminder is the exception to proactive-message deferral: it is sent during quiet hours or an active conversation because the user requested that exact instant. Reminder delivery is at least once; a crash after Telegram accepts a message but before SQLite acknowledgement can rarely produce a duplicate, which is preferable to silently losing the reminder.
 
 The scheduler also creates a SQLite backup at 03:00 local time under
 `DATA_DIR/backups` and retains dated backups for 14 days. Its nightly facts
@@ -94,7 +97,9 @@ override is intentionally configured. Azure App Service uses `DATA_DIR=/home/dat
 ## Important current boundaries
 
 - Autonomous scheduling applies to flexible tasks, not fixed events. The conversational agent can suggest or create event times after querying availability, but events do not have their own importance score or optimization engine.
+- Exam and interview events do not automatically generate study or preparation tasks. That would require a separate, deliberately designed event-to-prep workflow; today the user must ask for prep work explicitly.
 - Event-to-event conflicts are not automatically resolved. Fixed events remain fixed; only overlapping task work blocks are replanned.
+- Reminders remain separate from tasks, events, Google Calendar, free/busy, and the scheduler. Their only side effect is the requested Telegram delivery.
 - Scheduling-enabled goals materialize idempotent task-backed sessions for their outstanding weekly or monthly quota. Sessions are paced across remaining days, missed automatic sessions are rescheduled, and manual goal-session placements are preserved.
 - Calendar ownership is explicit (`kalendra_owned=v1`) and event kind is canonical hyphenated metadata: `fixed-event`, `task-block`, or `goal-session`. Deterministic category/kind Google colors distinguish these entries while preserving a user-selected nondefault color.
 - The scheduler sees durable facts and goal progress, not raw chat history. Interactive agent behavior sees recent conversation history separately.

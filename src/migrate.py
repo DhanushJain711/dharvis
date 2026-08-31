@@ -217,7 +217,7 @@ async def run_migrations(db_path: str | Path | None = None) -> None:
             if conversations_legacy:
                 await _copy_legacy_conversations(db)
                 await db.execute("DROP TABLE conversation_context")
-            await db.execute("PRAGMA user_version = 3")
+            await db.execute("PRAGMA user_version = 4")
             violations = await (await db.execute("PRAGMA foreign_key_check")).fetchall()
             if violations:
                 raise RuntimeError(f"foreign key violations after migration: {violations!r}")

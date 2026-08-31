@@ -65,6 +65,20 @@ _event_input = _object(
     }
 )
 
+_reminder_input = _object(
+    {
+        "message": {
+            "type": "string",
+            "minLength": 1,
+            "description": "The short, self-contained text to send back to the user when the reminder is due.",
+        },
+        "remind_at": {
+            "type": "string",
+            "description": "The resolved aware UTC ISO-8601 instant when the Telegram reminder must be sent.",
+        },
+    }
+)
+
 
 TOOLS: list[ToolSchema] = [
     _tool(
@@ -154,6 +168,41 @@ TOOLS: list[ToolSchema] = [
             "category": _nullable("string", "Category filter, or null for every category.", enum=CATEGORIES + [None]),
             "due_before": _nullable("string", "Exclusive aware UTC deadline upper bound, or null."),
             "due_after": _nullable("string", "Inclusive aware UTC deadline lower bound, or null."),
+        },
+    ),
+    _tool(
+        "add_reminder",
+        "Create one or more one-time Telegram reminders for quick nudges such as calling or emailing someone. A reminder is stored separately and sent at its due time; it never becomes a task, Google Calendar event, free/busy block, or scheduled work block. Send every reminder from one user message in one call. Resolve relative date phrases with resolve_date first.",
+        {
+            "reminders": {
+                "type": "array",
+                "description": "Every one-time reminder to create from this message.",
+                "items": _reminder_input,
+                "minItems": 1,
+            }
+        },
+    ),
+    _tool(
+        "update_reminder",
+        "Change the message or due time of a pending one-time Telegram reminder. Query reminders first when its id is not already in context. This does not touch Google Calendar, free/busy, tasks, or scheduling. Resolve a relative replacement time with resolve_date first. Null values mean unchanged.",
+        {
+            "reminder_id": {"type": "integer", "minimum": 1, "description": "Exact reminder id to update."},
+            "message": _nullable("string", "Replacement reminder text, or null to leave it unchanged.", minLength=1),
+            "remind_at": _nullable("string", "Replacement resolved aware UTC ISO-8601 due instant, or null to leave it unchanged."),
+        },
+    ),
+    _tool(
+        "cancel_reminder",
+        "Cancel a pending one-time Telegram reminder so it will not be sent. Query reminders first when its id is uncertain. This only changes the reminder record and never deletes a task or Google Calendar event.",
+        {"reminder_id": {"type": "integer", "minimum": 1, "description": "Exact pending reminder id to cancel."}},
+    ),
+    _tool(
+        "query_reminders",
+        "Read one-time Telegram reminders by lifecycle state and due-time window. Use this before updating or cancelling an ambiguous reminder, and for questions about upcoming or past reminders. This does not query Google Calendar or affect availability.",
+        {
+            "status": _nullable("string", "Lifecycle filter, or null for pending, delivered, and cancelled reminders.", enum=["pending", "delivered", "cancelled", None]),
+            "remind_before": _nullable("string", "Exclusive aware UTC due-time upper bound, or null."),
+            "remind_after": _nullable("string", "Inclusive aware UTC due-time lower bound, or null."),
         },
     ),
     _tool(

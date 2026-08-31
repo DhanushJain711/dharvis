@@ -236,6 +236,61 @@ CREATE TABLE IF NOT EXISTS daily_log (
     CHECK (debrief_sent_at IS NULL OR (julianday(debrief_sent_at) IS NOT NULL AND instr(debrief_sent_at, 'T') = 11))
 );
 
+CREATE TABLE IF NOT EXISTS reminders (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    message TEXT NOT NULL CHECK (length(trim(message)) > 0),
+    remind_at TEXT NOT NULL
+        CHECK (substr(remind_at, -1) = 'Z' OR substr(remind_at, -6) = '+00:00'),
+    status TEXT NOT NULL DEFAULT 'pending'
+        CHECK (status IN ('pending', 'delivered', 'cancelled')),
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+        CHECK (substr(created_at, -1) = 'Z' OR substr(created_at, -6) = '+00:00'),
+    updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+        CHECK (substr(updated_at, -1) = 'Z' OR substr(updated_at, -6) = '+00:00'),
+    cancelled_at TEXT CHECK (
+        cancelled_at IS NULL OR substr(cancelled_at, -1) = 'Z'
+        OR substr(cancelled_at, -6) = '+00:00'
+    ),
+    delivered_at TEXT CHECK (
+        delivered_at IS NULL OR substr(delivered_at, -1) = 'Z'
+        OR substr(delivered_at, -6) = '+00:00'
+    ),
+    delivery_attempts INTEGER NOT NULL DEFAULT 0 CHECK (delivery_attempts >= 0),
+    last_attempt_at TEXT CHECK (
+        last_attempt_at IS NULL OR substr(last_attempt_at, -1) = 'Z'
+        OR substr(last_attempt_at, -6) = '+00:00'
+    ),
+    next_attempt_at TEXT CHECK (
+        next_attempt_at IS NULL OR substr(next_attempt_at, -1) = 'Z'
+        OR substr(next_attempt_at, -6) = '+00:00'
+    ),
+    lease_token TEXT,
+    lease_expires_at TEXT CHECK (
+        lease_expires_at IS NULL OR substr(lease_expires_at, -1) = 'Z'
+        OR substr(lease_expires_at, -6) = '+00:00'
+    ),
+    CHECK (julianday(remind_at) IS NOT NULL AND instr(remind_at, 'T') = 11),
+    CHECK (julianday(created_at) IS NOT NULL AND instr(created_at, 'T') = 11),
+    CHECK (julianday(updated_at) IS NOT NULL AND instr(updated_at, 'T') = 11),
+    CHECK (cancelled_at IS NULL OR (julianday(cancelled_at) IS NOT NULL AND instr(cancelled_at, 'T') = 11)),
+    CHECK (delivered_at IS NULL OR (julianday(delivered_at) IS NOT NULL AND instr(delivered_at, 'T') = 11)),
+    CHECK (last_attempt_at IS NULL OR (julianday(last_attempt_at) IS NOT NULL AND instr(last_attempt_at, 'T') = 11)),
+    CHECK (next_attempt_at IS NULL OR (julianday(next_attempt_at) IS NOT NULL AND instr(next_attempt_at, 'T') = 11)),
+    CHECK (lease_expires_at IS NULL OR (julianday(lease_expires_at) IS NOT NULL AND instr(lease_expires_at, 'T') = 11)),
+    CHECK (
+        (lease_token IS NULL AND lease_expires_at IS NULL)
+        OR (lease_token IS NOT NULL AND lease_expires_at IS NOT NULL)
+    ),
+    CHECK (
+        (status = 'pending' AND cancelled_at IS NULL AND delivered_at IS NULL
+            AND next_attempt_at IS NOT NULL)
+        OR (status = 'delivered' AND delivered_at IS NOT NULL AND cancelled_at IS NULL
+            AND next_attempt_at IS NULL AND lease_token IS NULL AND lease_expires_at IS NULL)
+        OR (status = 'cancelled' AND cancelled_at IS NOT NULL AND delivered_at IS NULL
+            AND next_attempt_at IS NULL AND lease_token IS NULL AND lease_expires_at IS NULL)
+    )
+);
+
 CREATE TABLE IF NOT EXISTS facts_engine_evidence (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     fact_id INTEGER NOT NULL REFERENCES facts(id) ON DELETE CASCADE,
@@ -301,6 +356,8 @@ CREATE INDEX IF NOT EXISTS idx_goal_schedule_period
 CREATE INDEX IF NOT EXISTS idx_event_change_proposals_pending
     ON event_change_proposals(expires_at, consumed_at, claimed_at);
 CREATE INDEX IF NOT EXISTS idx_messages_session_time ON messages(session_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_reminders_due
+    ON reminders(status, next_attempt_at, lease_expires_at, id);
 
 CREATE TRIGGER IF NOT EXISTS validate_schedule_reasoning_insert
 BEFORE INSERT ON schedule_decisions
@@ -390,4 +447,4 @@ BEGIN
     SELECT RAISE(ABORT, 'fact is referenced by a schedule decision');
 END;
 
-PRAGMA user_version = 2;
+PRAGMA user_version = 4;

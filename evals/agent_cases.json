@@ -6,11 +6,11 @@
   {"id":"mixed_1","category":"multi_item","message":"add buy groceries and call dad as tasks","expected":["add_task"]},
   {"id":"goals_1","category":"multi_item","message":"set goals of 3 gym sessions a week and 8 study hours a week","expected":["add_goal","add_goal"],"unordered":true},
 
-  {"id":"relative_tomorrow","category":"relative_dates","message":"remind me to submit the form tomorrow","expected":["resolve_date","add_task"]},
+  {"id":"relative_tomorrow","category":"relative_dates","message":"remind me to submit the form tomorrow","expected":["resolve_date","add_reminder"]},
   {"id":"relative_friday_morning","category":"relative_dates","message":"finish the report Friday morning","expected":["resolve_date","add_task"]},
   {"id":"relative_next_tuesday","category":"relative_dates","message":"dentist next Tuesday at 3 for an hour","expected":["resolve_date","add_event"]},
   {"id":"relative_in_three_days","category":"relative_dates","message":"add the application, due in 3 days","expected":["resolve_date","add_task"]},
-  {"id":"relative_tonight","category":"relative_dates","message":"remind me to take the bins out tonight","expected":["resolve_date","add_task"]},
+  {"id":"relative_tonight","category":"relative_dates","message":"remind me to take the bins out tonight","expected":["resolve_date","add_reminder"]},
   {"id":"relative_end_week","category":"relative_dates","message":"submit expenses by the end of this week","expected":["resolve_date","add_task"]},
   {"id":"relative_weekend","category":"relative_dates","message":"brunch Sunday at noon for 90 minutes","expected":["resolve_date","add_event"]},
   {"id":"relative_after_lunch","category":"relative_dates","message":"block coffee with Sam tomorrow afternoon for 45 minutes","expected":["resolve_date","add_event"]},
@@ -19,7 +19,7 @@
   {"id":"relative_next_week","category":"relative_dates","message":"schedule a planning meeting next week Tuesday at 10 for an hour","expected":["resolve_date","add_event"]},
   {"id":"relative_monday_evening","category":"relative_dates","message":"call grandma Monday evening","expected":["resolve_date","add_task"]},
   {"id":"relative_midnight","category":"relative_dates","message":"the upload is due tomorrow at midnight","expected":["resolve_date","add_task"]},
-  {"id":"relative_later_today","category":"relative_dates","message":"remind me to stretch later today","expected":["resolve_date","add_task"]},
+  {"id":"relative_later_today","category":"relative_dates","message":"remind me to stretch later today","expected":["resolve_date","add_reminder"]},
 
   {"id":"ambiguous_it","category":"ambiguous_references","message":"move it to 4","expected":[]},
   {"id":"ambiguous_delete","category":"ambiguous_references","message":"delete that thing","expected":[]},

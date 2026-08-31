@@ -46,11 +46,15 @@ CHANGE_ACK_JOB_ID = "proactive-change-ack"
 FOLLOWUP_JOB_ID = "proactive-debrief-followup"
 BACKUP_JOB_ID = "proactive-daily-backup"
 NIGHTLY_FACTS_JOB_ID = "proactive-nightly-facts"
+REMINDER_DISPATCH_JOB_ID = "proactive-reminder-dispatch"
 _CHECKLIST_PREFIX = "daily-debrief"
 _RECENT_CONVERSATION = timedelta(minutes=5)
 _MAX_BRIEF_CHARS = 1_350
 _CHECKLIST_LIMIT = 20
 _UNSURFACED_SINCE = datetime(1970, 1, 1, tzinfo=UTC)
+_REMINDER_LEASE = timedelta(minutes=2)
+_REMINDER_BATCH_SIZE = 20
+_MATERIALLY_LATE = timedelta(minutes=5)
 _occurrence_locks: dict[str, asyncio.Lock] = {}
 _startup_tasks: set[asyncio.Task[None]] = set()
 _persistent_jobstore_enabled = False
@@ -177,6 +181,87 @@ async def _send_text(telegram: Any, text: str) -> Any:
     if app is not None and getattr(app, "bot", None) is not None and chat_id is not None:
         return await app.bot.send_message(chat_id=chat_id, text=text)
     raise TypeError("Telegram transport does not expose a proactive send method")
+
+
+def _format_reminder_due(value: datetime) -> str:
+    """Render a reminder's original due time in the user's local timezone."""
+    local = value.astimezone(_zone())
+    clock = local.strftime("%I:%M %p").lstrip("0")
+    return f"{local.strftime('%a %b')} {local.day} at {clock}"
+
+
+def _reminder_retry_at(attempts: int, failed_at: datetime) -> datetime:
+    """Return a bounded exponential retry time for a failed delivery."""
+    exponent = min(7, max(0, attempts - 1))
+    delay_seconds = min(3_600, 30 * (2 ** exponent))
+    return failed_at + timedelta(seconds=delay_seconds)
+
+
+async def deliver_due_reminders(
+    store: Store,
+    telegram: Any,
+    *,
+    now: datetime | None = None,
+) -> int:
+    """Claim and deliver a bounded batch of durable, due reminders.
+
+    Explicit reminder times are honored even during quiet hours or an active
+    conversation. A reminder is acknowledged only after Telegram accepts the
+    send; failures are released for a capped exponential retry, and one bad
+    delivery never blocks the remainder of the claimed batch.
+    """
+    reference = timeutil.to_utc(now or timeutil.now_utc())
+    reminders = await store.claim_due_reminders(
+        reference,
+        lease_for=_REMINDER_LEASE,
+        limit=_REMINDER_BATCH_SIZE,
+    )
+    delivered = 0
+    for reminder in reminders:
+        reminder_id = int(reminder["id"])
+        claim_token = reminder.get("lease_token") or reminder.get("claim_token")
+        if not claim_token:
+            LOGGER.error("Claimed reminder %s has no lease token", reminder_id)
+            continue
+        due = reminder.get("remind_at")
+        text = f"reminder: {_short_text(reminder.get('message'), 800)}"
+        if isinstance(due, datetime) and reference - due.astimezone(UTC) >= _MATERIALLY_LATE:
+            text += f" — set for {_format_reminder_due(due)}"
+        try:
+            await _send_text(telegram, text)
+        except Exception as exc:
+            failed_at = timeutil.now_utc()
+            attempts = max(1, int(reminder.get("delivery_attempts") or 1))
+            try:
+                await store.release_reminder_delivery(
+                    reminder_id,
+                    str(claim_token),
+                    failed_at,
+                    _reminder_retry_at(attempts, failed_at),
+                )
+            except Exception:
+                LOGGER.exception(
+                    "Could not release failed reminder claim id=%s", reminder_id
+                )
+            LOGGER.warning(
+                "Reminder delivery failed id=%s error_type=%s",
+                reminder_id,
+                type(exc).__name__,
+            )
+            continue
+        try:
+            await store.ack_reminder_delivery(
+                reminder_id,
+                str(claim_token),
+                delivered_at=timeutil.now_utc(),
+            )
+        except Exception:
+            # Keep the lease intact. If the process survives, the reminder is
+            # retried after expiry; a duplicate is safer than a silent loss.
+            LOGGER.exception("Could not acknowledge reminder delivery id=%s", reminder_id)
+            continue
+        delivered += 1
+    return delivered
 
 
 async def _checklist_is_active(telegram: Any, callback_prefix: str) -> bool:
@@ -371,6 +456,33 @@ async def _brief_data(
     return events, due, blocks, goals
 
 
+async def _brief_reminders(store: Store, local_date: date) -> list[Record]:
+    """Read overdue and near-term reminders without claiming or mutating them."""
+    query = getattr(store, "query_reminders", None)
+    if not callable(query):
+        # Compatibility for lightweight test doubles and staged deployments;
+        # the concrete Store always provides this method.
+        return []
+    _, window_end = _day_bounds(local_date + timedelta(days=2))
+    reminders = await query(status="pending", remind_before=window_end)
+    return sorted(
+        reminders,
+        key=lambda item: (item["remind_at"], int(item.get("id", 0))),
+    )
+
+
+def _render_brief_reminder(reminder: Record, local_date: date) -> str:
+    due = reminder["remind_at"].astimezone(_zone())
+    title = _short_text(reminder.get("message"), 48)
+    if due.date() < local_date:
+        return f"overdue {title} (was {_format_reminder_due(reminder['remind_at'])})"
+    if due.date() == local_date:
+        return f"{_format_clock(reminder['remind_at'])} {title}"
+    if due.date() == local_date + timedelta(days=1):
+        return f"tomorrow {_format_clock(reminder['remind_at'])} {title}"
+    return f"{due.strftime('%a')} {_format_clock(reminder['remind_at'])} {title}"
+
+
 async def _render_brief(
     store: Store,
     local_date: date,
@@ -378,13 +490,14 @@ async def _render_brief(
     calendar: Any | None = None,
 ) -> tuple[str, list[int]]:
     events, due, blocks, goals = await _brief_data(store, local_date, calendar)
+    reminders = await _brief_reminders(store, local_date)
     excluded = represented_elsewhere or set()
     decisions = [
         decision
         for decision in await store.get_unsurfaced_decisions(_UNSURFACED_SINCE)
         if int(decision["id"]) not in excluded
     ]
-    if not (events or due or blocks or goals or decisions):
+    if not (events or due or blocks or goals or reminders or decisions):
         return "Nothing is on the plan today.", []
 
     by_task: dict[int, Record] = {}
@@ -405,6 +518,15 @@ async def _render_brief(
     if due:
         lines.append(
             "Due: " + _compact_items(due, lambda item: _short_text(item["title"]), 5)
+        )
+    if reminders:
+        lines.append(
+            "Reminders: "
+            + _compact_items(
+                reminders,
+                lambda item: _render_brief_reminder(item, local_date),
+                5,
+            )
         )
 
     included: list[int] = []
@@ -1652,6 +1774,12 @@ async def _scheduled_change_ack(local_date: date) -> None:
         )
 
 
+async def _scheduled_reminders() -> None:
+    """Deliver due reminders without proactive-message deferral guards."""
+    runtime = _runtime_required()
+    await deliver_due_reminders(runtime.store, runtime.telegram)
+
+
 async def _scheduled_morning() -> None:
     await _scheduled_morning_for(timeutil.now_local().date())
 
@@ -1935,6 +2063,12 @@ def configure_jobs(
         **defaults,
     )
     scheduler.add_job(
+        _scheduled_reminders,
+        IntervalTrigger(seconds=30, timezone=zone),
+        id=REMINDER_DISPATCH_JOB_ID,
+        **defaults,
+    )
+    scheduler.add_job(
         _scheduled_backup,
         CronTrigger(hour=3, minute=0, timezone=zone),
         id=BACKUP_JOB_ID,
@@ -2008,6 +2142,7 @@ async def _scheduled_backup() -> None:
 async def run_startup_catchup() -> None:
     """Backfill the latest durable daily and weekly occurrences after restart."""
     runtime = _runtime_required()
+    await _scheduled_reminders()
     now, today = timeutil.now_local(), timeutil.now_local().date()
     await _goal_hook(runtime.engine, "replan_missed_goal_sessions", now)
     morning_h, morning_m = _clock_setting("DAILY_BRIEF_TIME", "08:00")

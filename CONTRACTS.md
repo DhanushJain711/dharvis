@@ -11,6 +11,7 @@ Message = dict[str, Any]
 Fact = dict[str, Any]
 ToolSchema = dict[str, Any]
 TaskStatus = Literal["pending", "scheduled", "completed", "dropped"]
+ReminderStatus = Literal["pending", "delivered", "cancelled"]
 DecisionAction = Literal["scheduled", "moved", "unscheduled", "shortened", "extended"]
 Trigger = Literal["daily_plan", "conflict", "user_request", "deadline_shift", "goal_quota"]
 ProgressSource = Literal["task", "manual", "inferred"]
@@ -90,13 +91,15 @@ add_task             add_event              update_task
 update_event         confirm_event_change   complete_task
 delete_task
 delete_event         query_schedule         query_tasks
-find_free_blocks     schedule_task          explain_schedule
+add_reminder         update_reminder        cancel_reminder
+query_reminders      find_free_blocks       schedule_task
+explain_schedule
 add_fact             update_fact            query_facts
 add_goal             log_goal_progress      query_goals
 resolve_date
 ```
 
-`schedule_task.reasoning` is required and is a one-sentence explanation recorded at decision time. Its handler must call `Store.apply_schedule_decision` so placement and rationale commit atomically. `add_task` and `add_event` accept arrays. Tasks include a nullable `series_key`, which groups recurring work for deterministic duration inference; an explicit `estimated_minutes` wins over inferred evidence and the configured default. Conflicting fixed-event changes return a one-time proposal and require `confirm_event_change` in a later user turn. Strict update schemas require every field: `null` means unchanged, while nullable values are cleared only through the required `clear_fields` array (`[]` means clear nothing).
+`schedule_task.reasoning` is required and is a one-sentence explanation recorded at decision time. Its handler must call `Store.apply_schedule_decision` so placement and rationale commit atomically. `add_task`, `add_event`, and `add_reminder` accept arrays. Reminders are one-time Telegram nudges stored only in SQLite: their tools never call Google Calendar, free/busy, or the scheduler. Tasks include a nullable `series_key`, which groups recurring work for deterministic duration inference; an explicit `estimated_minutes` wins over inferred evidence and the configured default. Conflicting fixed-event changes return a one-time proposal and require `confirm_event_change` in a later user turn. Strict update schemas require every field: `null` means unchanged, while nullable values are cleared only through the required `clear_fields` array (`[]` means clear nothing).
 
 ## Schema migration (`src.migrate`)
 
@@ -106,6 +109,7 @@ main() -> None
 ```
 
 `src/schema.sql` is the only canonical schema file. Later agents must not add migration files.
+The current canonical schema version is 4; it adds the durable `reminders` lifecycle and delivery-lease fields.
 The migration runner alone accepts naive timestamps from the retired database and interprets them in `USER_TIMEZONE` before converting to UTC. Runtime APIs reject naive datetimes; this recovery policy must not be copied into new writes.
 
 ## Store (`src.store`)
@@ -116,10 +120,18 @@ Store.initialize() -> None  # async
 Store.connection() -> AsyncIterator[aiosqlite.Connection]  # @asynccontextmanager
 Store.add_tasks(tasks: list[Record]) -> list[Record]  # async
 Store.add_events(events: list[Record]) -> list[Record]  # async
+Store.add_reminders(reminders: list[Record]) -> list[Record]  # async
 Store.get_task(task_id: int) -> Record | None  # async
 Store.get_event(event_id: int) -> Record | None  # async
+Store.get_reminder(reminder_id: int) -> Record | None  # async
 Store.update_task(task_id: int, changes: Record) -> Record  # async
 Store.update_event(event_id: int, changes: Record) -> Record  # async
+Store.update_reminder(reminder_id: int, changes: Record) -> Record  # async
+Store.cancel_reminder(reminder_id: int, cancelled_at: datetime | None = None) -> Record  # async
+Store.query_reminders(status: ReminderStatus | None = None, remind_before: datetime | None = None, remind_after: datetime | None = None) -> list[Record]  # async
+Store.claim_due_reminders(now: datetime, lease_for: timedelta = timedelta(minutes=2), limit: int = 20) -> list[Record]  # async
+Store.ack_reminder_delivery(reminder_id: int, claim_token: str, delivered_at: datetime | None = None) -> Record  # async
+Store.release_reminder_delivery(reminder_id: int, claim_token: str, failed_at: datetime, retry_at: datetime) -> Record  # async
 Store.create_event_change_proposal(operation: Literal["create", "update"], payload: Record, conflicts: list[Record], expires_at: datetime) -> Record  # async
 Store.get_event_change_proposal(proposal_id: str) -> Record | None  # async
 Store.consume_event_change_proposal(proposal_id: str, consumed_at: datetime | None = None) -> Record  # async
@@ -161,6 +173,8 @@ create_store(db_path: str | Path | None = None) -> Store  # async
 ```
 
 Every Store connection enables `PRAGMA foreign_keys = ON`. `apply_schedule_decision` is the only placement mutation contract: it updates the task placement and inserts the nonblank `schedule_decisions` row in one transaction. `facts_used` accepts only existing integer fact IDs. Event-change proposals are one-time, expiring records: callers claim a proposal before the external write, finalize it only after the write succeeds, and release the claim only after compensated failure. Goal-session cancellation is likewise two phase: retain its local calendar ID until the owned remote block is deleted, then finalize the local cleanup. `infer_task_duration` uses only recent completed tasks with the same normalized `series_key`, category, and energy; it takes a robust median of recorded `actual_minutes`, returns evidence task IDs, and uses neither a model nor a vector index.
+
+Reminder delivery uses an explicit `pending -> delivered` or `pending -> cancelled` lifecycle. The dispatcher atomically claims due records with opaque, expiring per-reminder leases, acknowledges only after Telegram accepts the send, and releases failed claims with a retry time. This provides at-least-once delivery: a crash after Telegram accepts a message but before acknowledgement can cause a rare duplicate, while expired leases and startup catch-up prevent silent loss. Delivered and cancelled reminders are immutable audit records, and a reminder under a live delivery lease cannot be edited or cancelled.
 
 ## Calendar (`src.calendar_service`)
 
@@ -274,9 +288,10 @@ create_scheduler_engine(store: Store, calendar: CalendarService) -> SchedulerEng
 ```python
 send_daily_brief(store: Store, telegram: Any, local_date: date) -> None  # async
 send_daily_debrief(store: Store, telegram: Any, local_date: date) -> None  # async
+deliver_due_reminders(store: Store, telegram: Any, *, now: datetime | None = None) -> int  # async
 run_daily_planning(engine: SchedulerEngine, local_date: date) -> None  # async
 reconcile_calendar(engine: SchedulerEngine) -> None  # async
-configure_jobs(scheduler: Any, store: Store, engine: SchedulerEngine, telegram: Any) -> None
+configure_jobs(scheduler: Any, store: Store, engine: SchedulerEngine, telegram: Any, facts_engine: Any | None = None) -> None
 create_job_scheduler() -> Any
 start_job_scheduler(scheduler: Any, *, catch_up: bool = True) -> Any
 shutdown_job_scheduler(scheduler: Any, *, wait: bool = True) -> Any
@@ -284,6 +299,8 @@ start_scheduler(application: Application) -> None
 stop_scheduler() -> None
 run_startup_catchup() -> None  # async
 ```
+
+The stable reminder dispatcher job runs every 30 seconds and is also the first startup catch-up action. Explicit reminder delivery bypasses quiet-hour and active-conversation deferral so the requested instant is honored. It processes a bounded leased batch, retries individual failures with capped exponential backoff, and continues past a failed send. The morning brief only reads reminder state: it includes pending reminders overdue through the end of the second following local day, but does not claim, acknowledge, or suppress their normal due-time delivery.
 
 ## Facts (`src.facts_engine`)
 

@@ -475,6 +475,44 @@ async def build_tool_handlers(
             due_after=_aware(due_after, "due_after"),
         ))
 
+    async def add_reminder(reminders: list[dict[str, Any]]) -> Any:
+        payloads: list[dict[str, Any]] = []
+        for reminder in reminders:
+            item = dict(reminder)
+            moment = _aware(item.get("remind_at"), "remind_at")
+            assert moment is not None
+            item["remind_at"] = moment
+            payloads.append(item)
+        return jsonable(await store.add_reminders(payloads))
+
+    async def update_reminder(
+        reminder_id: int,
+        message: str | None,
+        remind_at: str | None,
+    ) -> Any:
+        changes: dict[str, Any] = {}
+        if message is not None:
+            changes["message"] = message
+        if remind_at is not None:
+            moment = _aware(remind_at, "remind_at")
+            assert moment is not None
+            changes["remind_at"] = moment
+        if not changes:
+            raise ValueError("provide a new reminder message or due time")
+        return jsonable(await store.update_reminder(reminder_id, changes))
+
+    async def cancel_reminder(reminder_id: int) -> Any:
+        return jsonable(await store.cancel_reminder(reminder_id))
+
+    async def query_reminders(
+        status: str | None,
+        remind_before: str | None,
+        remind_after: str | None,
+    ) -> Any:
+        before = _aware(remind_before, "remind_before")
+        after = _aware(remind_after, "remind_after")
+        return jsonable(await store.query_reminders(status, before, after))
+
     async def find_free_blocks_tool(start: str, end: str, min_minutes: int) -> Any:
         start_dt, end_dt = _aware(start, "start"), _aware(end, "end")
         assert start_dt is not None and end_dt is not None
@@ -564,6 +602,10 @@ async def build_tool_handlers(
         "delete_event": delete_event,
         "query_schedule": query_schedule_tool,
         "query_tasks": query_tasks,
+        "add_reminder": add_reminder,
+        "update_reminder": update_reminder,
+        "cancel_reminder": cancel_reminder,
+        "query_reminders": query_reminders,
         "find_free_blocks": find_free_blocks_tool,
         "schedule_task": schedule_task,
         "explain_schedule": explain_schedule,

@@ -4,7 +4,7 @@ These instructions apply to the entire Dharvis repository.
 
 ## Project objective
 
-Dharvis is a stateful, single-user Telegram assistant that manages tasks, fixed events, flexible calendar work blocks, recurring goals, conversational history, and learned scheduling preferences. The system is intentionally autonomous for task scheduling but conservative about calendar safety: deterministic code computes valid gaps, while an OpenAI model only chooses among those gaps and explains the choice.
+Dharvis is a stateful, single-user Telegram assistant that manages tasks, one-time Telegram reminders, fixed events, flexible calendar work blocks, recurring goals, conversational history, and learned scheduling preferences. The system is intentionally autonomous for task scheduling but conservative about calendar safety: deterministic code computes valid gaps, while an OpenAI model only chooses among those gaps and explains the choice. Reminders are stored and delivered independently of Google Calendar and scheduling.
 
 Read `CLAUDE.md` for the complete product and architecture overview before making a substantial change.
 
@@ -110,6 +110,8 @@ Tone changes belong in `src/prompts/system.md` and its few-shot examples. Avoid 
 - Batch schedule-change notifications.
 - Do not mark a decision surfaced until Telegram delivery succeeds.
 - APScheduler job IDs must remain stable and use coalescing plus single-instance guards.
+- Explicit reminder delivery bypasses quiet hours and active-conversation deferral. Claim a durable per-reminder lease before sending, acknowledge only after Telegram accepts the message, and release failures for retry; the contract is at least once.
+- Morning briefs may read overdue and near-term reminders, but must not claim, acknowledge, or otherwise suppress their due-time delivery.
 
 ## Testing expectations
 

@@ -1,7 +1,8 @@
 # Dharvis
 
-A stateful, OpenAI-powered Telegram personal assistant foundation for tasks,
-calendar events, scheduling decisions, facts, goals, and proactive planning.
+A stateful, OpenAI-powered Telegram personal assistant for tasks, one-time
+reminders, calendar events, scheduling decisions, facts, goals, and proactive
+planning.
 
 The public contracts for parallel implementation work are indexed in
 [`CONTRACTS.md`](CONTRACTS.md). The OpenAI function schemas in `src/tools.py`
@@ -12,10 +13,11 @@ canonical database schema.
 
 - **Natural Language Processing**: Add tasks, events, and query your schedule using conversational text
 - **Task Management**: Create, complete, delete, and modify tasks with deadlines and priorities
+- **One-time Reminders**: Store quick nudges separately and send them through Telegram at the requested time without occupying Google Calendar
 - **Safe Event Management**: Conflicting fixed events are warned about first and require an explicit later confirmation before they are created or changed
 - **Goal Sessions**: Scheduling-enabled weekly/monthly goals materialize paced, task-backed work sessions and reschedule missed automatic sessions
 - **Google Calendar Integration**: Reads visible calendars for availability and briefs; writes only owned `Kalendra` events with consistent category/kind colors
-- **Daily Briefings**: Get summaries of local commitments, external Google events, due tasks, scheduled work, and goal pace
+- **Daily Briefings**: Get summaries of local commitments, external Google events, due tasks, scheduled work, goal pace, and pending reminders through the next two local days
 - **Learning From Outcomes**: Reuse observed durations only for matching completed task families; explicit estimates always take precedence
 
 ## Quick Start
@@ -99,6 +101,22 @@ meeting with advisor friday 2pm at office
 dinner saturday 7pm at Olive Garden
 ```
 
+### Setting Reminders
+
+```text
+remind me tomorrow at 9 to call the dentist
+in two months remind me to email Sam
+cancel the email Sam reminder
+```
+
+Reminders are SQLite-only one-time Telegram nudges. They never create Google
+Calendar entries or consume free/busy time. A persistent dispatcher checks for
+due reminders every 30 seconds and catches up after a restart. Explicitly timed
+reminders are delivered even during quiet hours or an active conversation.
+Delivery is at least once: a crash in the narrow interval after Telegram accepts
+a message but before the database acknowledgement can rarely duplicate it rather
+than lose it.
+
 ### Queries
 ```
 what do I have today?
@@ -141,6 +159,10 @@ only `DATA_DIR` on a persistent disk. `GOOGLE_CALENDAR_CREDENTIALS_PATH`,
 `APSCHEDULER_DATABASE_PATH` are optional explicit overrides for unusual layouts.
 
 Dharvis creates and updates only events it owns on its secondary `Kalendra` calendar. Owned metadata uses the canonical kinds `fixed-event`, `task-block`, and `goal-session`; it does not edit events on your primary or other visible calendars.
+
+Exam and interview events are treated as fixed commitments. They do not
+automatically create study or preparation work; ask the bot to add or schedule
+prep tasks when you want them.
 
 ## Running Tests
 

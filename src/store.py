@@ -21,6 +21,7 @@ from .migrate import run_migrations
 
 Record = dict[str, Any]
 TaskStatus = Literal["pending", "scheduled", "completed", "dropped"]
+ReminderStatus = Literal["pending", "delivered", "cancelled"]
 
 _TASK_FIELDS = {
     "title", "description", "deadline", "estimated_minutes", "category", "energy",
@@ -42,6 +43,7 @@ _EVENT_FIELDS = {
     "source", "gcal_event_id",
 }
 _EVENT_CLEARABLE = {"description", "location", "category"}
+_REMINDER_FIELDS = {"message", "remind_at"}
 _FACT_FIELDS = {
     "content", "category", "confidence", "source", "evidence_count",
     "last_confirmed_at", "active",
@@ -52,6 +54,8 @@ _DATETIME_FIELDS = {
     "start_time", "end_time", "decided_at", "start", "end", "previous_start",
     "previous_end", "last_confirmed_at", "logged_at", "brief_sent_at", "debrief_sent_at",
     "period_start", "period_end", "cancelled_at", "expires_at", "claimed_at", "consumed_at",
+    "remind_at", "updated_at", "delivered_at", "last_attempt_at", "next_attempt_at",
+    "lease_expires_at",
 }
 _JSON_FIELDS = {"facts_used", "tool_calls", "planned", "completed", "payload", "conflicts"}
 _BOOL_FIELDS = {"active", "surfaced_to_user", "scheduling_enabled"}
@@ -399,6 +403,49 @@ class Store:
             rows = await self._fetch_ids(db, "events", ids)
         return rows
 
+    async def add_reminders(self, reminders: list[Record]) -> list[Record]:
+        """Persist quick, non-calendar nudges for later Telegram delivery.
+
+        Reminder timestamps are normalized to UTC.  Creating a reminder does
+        not create an event or reserve any calendar time.
+        """
+        if not isinstance(reminders, list) or not reminders:
+            raise ValueError("reminders must be a non-empty list")
+        prepared: list[tuple[str, str]] = []
+        for reminder in reminders:
+            if not isinstance(reminder, dict):
+                raise TypeError("each reminder must be a dictionary")
+            unknown = set(reminder) - _REMINDER_FIELDS
+            if unknown:
+                raise ValueError(f"Unsupported reminder fields: {sorted(unknown)}")
+            if "remind_at" not in reminder:
+                raise ValueError("reminders require a remind_at datetime")
+            prepared.append(
+                (
+                    _require_nonempty_text(reminder.get("message"), "message"),
+                    _utc_text(reminder["remind_at"], "remind_at"),
+                )
+            )
+
+        now_text = _utc_text(timeutil.now_utc(), "created_at")
+        ids: list[int] = []
+        async with self.connection() as db:
+            try:
+                for message, remind_at in prepared:
+                    cursor = await db.execute(
+                        """INSERT INTO reminders
+                           (message, remind_at, created_at, updated_at, next_attempt_at)
+                           VALUES (?, ?, ?, ?, ?)""",
+                        (message, remind_at, now_text, now_text, remind_at),
+                    )
+                    ids.append(int(cursor.lastrowid))
+                await db.commit()
+            except Exception:
+                await db.rollback()
+                raise
+            rows = await self._fetch_ids(db, "reminders", ids)
+        return rows
+
     async def _fetch_ids(
         self, db: aiosqlite.Connection, table: str, ids: list[int]
     ) -> list[Record]:
@@ -424,6 +471,285 @@ class Store:
 
     async def get_event(self, event_id: int) -> Record | None:
         return await self._get("events", event_id)
+
+    async def get_reminder(self, reminder_id: int) -> Record | None:
+        """Return one reminder without consulting Google Calendar."""
+        return await self._get("reminders", reminder_id)
+
+    async def update_reminder(self, reminder_id: int, changes: Record) -> Record:
+        """Edit a pending reminder when it is not actively claimed for delivery.
+
+        Delivered and cancelled reminders are immutable audit records.  An
+        expired delivery lease is reclaimed by the edit, while a live lease
+        prevents a race with the dispatcher.
+        """
+        if not isinstance(changes, dict) or not changes:
+            raise ValueError("changes must include message or remind_at")
+        unknown = set(changes) - _REMINDER_FIELDS
+        if unknown:
+            raise ValueError(f"Unsupported reminder fields: {sorted(unknown)}")
+        if any(value is None for value in changes.values()):
+            raise ValueError("reminder fields cannot be cleared")
+        assignments: Record = {}
+        if "message" in changes:
+            assignments["message"] = _require_nonempty_text(changes["message"], "message")
+        if "remind_at" in changes:
+            assignments["remind_at"] = _utc_text(changes["remind_at"], "remind_at")
+            assignments["next_attempt_at"] = assignments["remind_at"]
+        now = timeutil.now_utc()
+        now_text = _utc_text(now, "updated_at")
+
+        async with self.connection() as db:
+            try:
+                await db.execute("BEGIN IMMEDIATE")
+                current = await self._get("reminders", reminder_id, db)
+                if current is None:
+                    raise KeyError(f"Reminder {reminder_id} does not exist")
+                if current["status"] != "pending":
+                    raise ValueError(f"{current['status']} reminders cannot be edited")
+                lease_expires = current["lease_expires_at"]
+                if lease_expires is not None and lease_expires > now.astimezone(UTC):
+                    raise ValueError("reminder is currently being delivered")
+                assignments.update(
+                    {
+                        "updated_at": now_text,
+                        "lease_token": None,
+                        "lease_expires_at": None,
+                    }
+                )
+                sql = ", ".join(f"{field} = ?" for field in assignments)
+                await db.execute(
+                    f"UPDATE reminders SET {sql} WHERE id = ? AND status = 'pending'",
+                    [*assignments.values(), reminder_id],
+                )
+                await db.commit()
+                updated = await self._get("reminders", reminder_id, db)
+            except Exception:
+                await db.rollback()
+                raise
+        assert updated is not None
+        return updated
+
+    async def cancel_reminder(
+        self, reminder_id: int, cancelled_at: datetime | None = None
+    ) -> Record:
+        """Soft-cancel a pending, unleased reminder."""
+        now = timeutil.now_utc()
+        cancelled = cancelled_at or now
+        cancelled_text = _utc_text(cancelled, "cancelled_at")
+        now_utc = now.astimezone(UTC)
+        async with self.connection() as db:
+            try:
+                await db.execute("BEGIN IMMEDIATE")
+                current = await self._get("reminders", reminder_id, db)
+                if current is None:
+                    raise KeyError(f"Reminder {reminder_id} does not exist")
+                if current["status"] != "pending":
+                    raise ValueError(f"{current['status']} reminders cannot be cancelled")
+                lease_expires = current["lease_expires_at"]
+                if lease_expires is not None and lease_expires > now_utc:
+                    raise ValueError("reminder is currently being delivered")
+                await db.execute(
+                    """UPDATE reminders
+                       SET status = 'cancelled', cancelled_at = ?, updated_at = ?,
+                           next_attempt_at = NULL, lease_token = NULL,
+                           lease_expires_at = NULL
+                       WHERE id = ? AND status = 'pending'""",
+                    (cancelled_text, cancelled_text, reminder_id),
+                )
+                await db.commit()
+                result = await self._get("reminders", reminder_id, db)
+            except Exception:
+                await db.rollback()
+                raise
+        assert result is not None
+        return result
+
+    async def query_reminders(
+        self,
+        status: ReminderStatus | None = None,
+        remind_before: datetime | None = None,
+        remind_after: datetime | None = None,
+    ) -> list[Record]:
+        """Query reminders by lifecycle state and original reminder time."""
+        if status is not None and status not in {"pending", "delivered", "cancelled"}:
+            raise ValueError("status must be pending, delivered, cancelled, or None")
+        clauses: list[str] = []
+        params: list[Any] = []
+        if status is not None:
+            clauses.append("status = ?")
+            params.append(status)
+        if remind_before is not None:
+            clauses.append("utc_epoch_us(remind_at) < utc_epoch_us(?)")
+            params.append(_utc_text(remind_before, "remind_before"))
+        if remind_after is not None:
+            clauses.append("utc_epoch_us(remind_at) >= utc_epoch_us(?)")
+            params.append(_utc_text(remind_after, "remind_after"))
+        where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+        async with self.connection() as db:
+            cursor = await db.execute(
+                f"""SELECT * FROM reminders{where}
+                    ORDER BY utc_epoch_us(remind_at), id""",
+                params,
+            )
+            return _records(await cursor.fetchall())
+
+    async def claim_due_reminders(
+        self,
+        now: datetime,
+        lease_for: timedelta = timedelta(minutes=2),
+        limit: int = 20,
+    ) -> list[Record]:
+        """Atomically lease due reminders for at-least-once delivery.
+
+        Expired leases are eligible for reclamation.  Each returned reminder
+        carries its own opaque ``lease_token`` for acknowledgement or release.
+        """
+        now_text = _utc_text(now, "now")
+        if not isinstance(lease_for, timedelta) or lease_for <= timedelta(0):
+            raise ValueError("lease_for must be a positive timedelta")
+        if type(limit) is not int or limit <= 0:
+            raise ValueError("limit must be a positive integer")
+        lease_expires_text = _utc_text(now.astimezone(UTC) + lease_for, "lease_expires_at")
+
+        for attempt in range(5):
+            try:
+                async with self.connection() as db:
+                    try:
+                        await db.execute("BEGIN IMMEDIATE")
+                        cursor = await db.execute(
+                            """SELECT id FROM reminders
+                               WHERE status = 'pending'
+                                 AND utc_epoch_us(next_attempt_at) <= utc_epoch_us(?)
+                                 AND (
+                                     lease_expires_at IS NULL
+                                     OR utc_epoch_us(lease_expires_at) <= utc_epoch_us(?)
+                                 )
+                               ORDER BY utc_epoch_us(next_attempt_at),
+                                        utc_epoch_us(remind_at), id
+                               LIMIT ?""",
+                            (now_text, now_text, limit),
+                        )
+                        ids = [int(row["id"]) for row in await cursor.fetchall()]
+                        tokens: dict[int, str] = {}
+                        for reminder_id in ids:
+                            token = uuid.uuid4().hex
+                            update = await db.execute(
+                                """UPDATE reminders
+                                   SET lease_token = ?, lease_expires_at = ?,
+                                       delivery_attempts = delivery_attempts + 1,
+                                       last_attempt_at = ?, updated_at = ?
+                                   WHERE id = ? AND status = 'pending'
+                                     AND utc_epoch_us(next_attempt_at) <= utc_epoch_us(?)
+                                     AND (
+                                         lease_expires_at IS NULL
+                                         OR utc_epoch_us(lease_expires_at) <= utc_epoch_us(?)
+                                     )""",
+                                (
+                                    token, lease_expires_text, now_text, now_text,
+                                    reminder_id, now_text, now_text,
+                                ),
+                            )
+                            if update.rowcount != 1:
+                                raise RuntimeError(
+                                    f"Reminder {reminder_id} became unavailable during claim"
+                                )
+                            tokens[reminder_id] = token
+                        await db.commit()
+                        claimed = await self._fetch_ids(db, "reminders", ids)
+                    except Exception:
+                        await db.rollback()
+                        raise
+            except aiosqlite.OperationalError as exc:
+                if attempt == 4 or not any(
+                    token in str(exc).casefold() for token in ("locked", "busy")
+                ):
+                    raise
+                await asyncio.sleep(0.005 * (2 ** attempt))
+                continue
+            # Reading by id after the update preserves the due-order selection.
+            # The map assertion also guards accidental reuse of one token for a batch.
+            assert all(item["lease_token"] == tokens[item["id"]] for item in claimed)
+            return claimed
+        raise RuntimeError("unreachable reminder claim retry exhaustion")
+
+    async def ack_reminder_delivery(
+        self,
+        reminder_id: int,
+        claim_token: str,
+        delivered_at: datetime | None = None,
+    ) -> Record:
+        """Mark a claimed reminder delivered after Telegram accepts the message."""
+        token = _require_nonempty_text(claim_token, "claim_token")
+        delivered = delivered_at or timeutil.now_utc()
+        delivered_text = _utc_text(delivered, "delivered_at")
+        async with self.connection() as db:
+            try:
+                await db.execute("BEGIN IMMEDIATE")
+                current = await self._get("reminders", reminder_id, db)
+                if current is None:
+                    raise KeyError(f"Reminder {reminder_id} does not exist")
+                if current["status"] != "pending":
+                    raise ValueError(f"reminder has already been {current['status']}")
+                if current["lease_token"] != token:
+                    raise ValueError("reminder claim token is invalid")
+                update = await db.execute(
+                    """UPDATE reminders
+                       SET status = 'delivered', delivered_at = ?, updated_at = ?,
+                           next_attempt_at = NULL, lease_token = NULL,
+                           lease_expires_at = NULL
+                       WHERE id = ? AND status = 'pending' AND lease_token = ?""",
+                    (delivered_text, delivered_text, reminder_id, token),
+                )
+                if update.rowcount != 1:
+                    raise ValueError("reminder claim is no longer available")
+                await db.commit()
+                result = await self._get("reminders", reminder_id, db)
+            except Exception:
+                await db.rollback()
+                raise
+        assert result is not None
+        return result
+
+    async def release_reminder_delivery(
+        self,
+        reminder_id: int,
+        claim_token: str,
+        failed_at: datetime,
+        retry_at: datetime,
+    ) -> Record:
+        """Release a failed delivery claim and schedule its next retry."""
+        token = _require_nonempty_text(claim_token, "claim_token")
+        failed_text = _utc_text(failed_at, "failed_at")
+        retry_text = _utc_text(retry_at, "retry_at")
+        if retry_at.astimezone(UTC) < failed_at.astimezone(UTC):
+            raise ValueError("retry_at must not be earlier than failed_at")
+        async with self.connection() as db:
+            try:
+                await db.execute("BEGIN IMMEDIATE")
+                current = await self._get("reminders", reminder_id, db)
+                if current is None:
+                    raise KeyError(f"Reminder {reminder_id} does not exist")
+                if current["status"] != "pending":
+                    raise ValueError(f"reminder has already been {current['status']}")
+                if current["lease_token"] != token:
+                    raise ValueError("reminder claim token is invalid")
+                update = await db.execute(
+                    """UPDATE reminders
+                       SET last_attempt_at = ?, next_attempt_at = ?, updated_at = ?,
+                           lease_token = NULL, lease_expires_at = NULL
+                       WHERE id = ? AND status = 'pending' AND lease_token = ?""",
+                    (failed_text, retry_text, failed_text, reminder_id, token),
+                )
+                if update.rowcount != 1:
+                    raise ValueError("reminder claim is no longer available")
+                await db.commit()
+                result = await self._get("reminders", reminder_id, db)
+            except Exception:
+                await db.rollback()
+                raise
+        assert result is not None
+        return result
 
     async def _update(
         self,
