@@ -336,6 +336,200 @@ async def test_list_events_force_refresh_bypasses_cached_google_result(tmp_path:
 
 
 @pytest.mark.asyncio
+async def test_zero_duration_event_is_skipped_without_poisoning_complete_cached_read(
+    tmp_path: Path,
+):
+    google = MagicMock()
+    calendar_list(google, {None: {"items": [{"id": "primary"}]}})
+    events = event_resource(google)
+    events.list.return_value = Request(
+        {
+            "items": [
+                google_event("valid", "Valid"),
+                google_event(
+                    "empty",
+                    "Empty",
+                    "2026-08-26T17:00:00Z",
+                    "2026-08-26T17:00:00Z",
+                ),
+            ]
+        }
+    )
+    service = connected_service(tmp_path, google)
+
+    first = await service.list_events(RANGE_START, RANGE_END)
+    second = await service.list_events(RANGE_START, RANGE_END)
+
+    assert [item["id"] for item in first] == ["valid"]
+    assert [item["id"] for item in second] == ["valid"]
+    assert service._last_query_complete is True
+    assert events.list.call_count == 1
+
+
+@pytest.mark.asyncio
+async def test_only_zero_duration_events_leave_range_complete_and_available(
+    tmp_path: Path,
+):
+    google = MagicMock()
+    calendar_list(google, {None: {"items": [{"id": "primary"}]}})
+    events = event_resource(google)
+    events.list.return_value = Request(
+        {
+            "items": [
+                google_event(
+                    "empty",
+                    "Empty",
+                    "2026-08-26T17:00:00Z",
+                    "2026-08-26T17:00:00Z",
+                )
+            ]
+        }
+    )
+    service = connected_service(tmp_path, google)
+
+    assert await service.list_events(RANGE_START, RANGE_END) == []
+    assert service._last_query_complete is True
+    assert await service.check_availability(RANGE_START, RANGE_END) is True
+    assert events.list.call_count == 1
+
+
+@pytest.mark.asyncio
+async def test_equal_instants_with_different_offsets_are_zero_duration(tmp_path: Path):
+    google = MagicMock()
+    calendar_list(google, {None: {"items": [{"id": "primary"}]}})
+    events = event_resource(google)
+    events.list.return_value = Request(
+        {
+            "items": [
+                google_event(
+                    "offset-empty",
+                    "Offset empty",
+                    "2026-08-26T10:00:00-05:00",
+                    "2026-08-26T11:00:00-04:00",
+                )
+            ]
+        }
+    )
+    service = connected_service(tmp_path, google)
+
+    assert await service.list_events(RANGE_START, RANGE_END) == []
+    assert service._last_query_complete is True
+
+
+@pytest.mark.asyncio
+async def test_equal_all_day_dates_are_zero_duration(tmp_path: Path):
+    google = MagicMock()
+    calendar_list(google, {None: {"items": [{"id": "primary"}]}})
+    events = event_resource(google)
+    events.list.return_value = Request(
+        {
+            "items": [
+                {
+                    "id": "all-day-empty",
+                    "summary": "All-day empty",
+                    "start": {"date": "2026-08-26"},
+                    "end": {"date": "2026-08-26"},
+                }
+            ]
+        }
+    )
+    service = connected_service(tmp_path, google)
+
+    assert await service.list_events(RANGE_START, RANGE_END) == []
+    assert service._last_query_complete is True
+
+
+@pytest.mark.asyncio
+async def test_reversed_event_range_remains_incomplete_and_uncached(tmp_path: Path):
+    google = MagicMock()
+    calendar_list(google, {None: {"items": [{"id": "primary"}]}})
+    events = event_resource(google)
+    events.list.side_effect = [
+        Request(
+            {
+                "items": [
+                    google_event(
+                        "reversed",
+                        "Reversed",
+                        "2026-08-26T17:00:00Z",
+                        "2026-08-26T16:00:00Z",
+                    )
+                ]
+            }
+        ),
+        Request({"items": []}),
+    ]
+    service = connected_service(tmp_path, google)
+
+    assert await service.list_events(RANGE_START, RANGE_END) == []
+    assert service._last_query_complete is False
+    assert await service.list_events(RANGE_START, RANGE_END) == []
+    assert service._last_query_complete is True
+    assert events.list.call_count == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "invalid_event",
+    [
+        {
+            "id": "missing-end",
+            "summary": "Missing end",
+            "start": {"dateTime": "2026-08-26T15:00:00Z"},
+        },
+        {
+            "id": "null-end",
+            "summary": "Null end",
+            "start": {"dateTime": "2026-08-26T15:00:00Z"},
+            "end": None,
+        },
+        {
+            "id": "non-mapping-end",
+            "summary": "Non-mapping end",
+            "start": {"dateTime": "2026-08-26T15:00:00Z"},
+            "end": "2026-08-26T16:00:00Z",
+        },
+        {
+            "id": "null-start",
+            "summary": "Null start",
+            "start": None,
+            "end": {"dateTime": "2026-08-26T16:00:00Z"},
+        },
+        {
+            "id": "non-mapping-start",
+            "summary": "Non-mapping start",
+            "start": "2026-08-26T15:00:00Z",
+            "end": {"dateTime": "2026-08-26T16:00:00Z"},
+        },
+    ],
+    ids=[
+        "omitted-end",
+        "null-end",
+        "non-mapping-end",
+        "null-start",
+        "non-mapping-start",
+    ],
+)
+async def test_invalid_event_endpoint_is_incomplete_and_uncached(
+    tmp_path: Path, invalid_event: dict,
+):
+    google = MagicMock()
+    calendar_list(google, {None: {"items": [{"id": "primary"}]}})
+    events = event_resource(google)
+    events.list.side_effect = [
+        Request({"items": [invalid_event]}),
+        Request({"items": []}),
+    ]
+    service = connected_service(tmp_path, google)
+
+    assert await service.list_events(RANGE_START, RANGE_END) == []
+    assert service._last_query_complete is False
+    assert await service.list_events(RANGE_START, RANGE_END) == []
+    assert service._last_query_complete is True
+    assert events.list.call_count == 2
+
+
+@pytest.mark.asyncio
 async def test_partial_reads_are_not_cached(tmp_path: Path):
     google = MagicMock()
     calendar_list(google, {None: {"items": [{"id": "primary"}]}})

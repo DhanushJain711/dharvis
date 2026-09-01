@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from copy import deepcopy
 from datetime import date, datetime, timedelta
 import logging
@@ -67,6 +68,10 @@ class CalendarReconnectRequiredError(CalendarError):
 CalendarReconnectRequired = CalendarReconnectRequiredError
 
 
+class _ZeroDurationGoogleEvent(ValueError):
+    """Signal an explicitly empty Google event that cannot occupy calendar time."""
+
+
 def _write_securely(path: Path, content: str) -> None:
     """Write private application state without a permissive-umask window."""
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -86,8 +91,10 @@ def _write_token_securely(path: Path, content: str) -> None:
     _write_securely(path, content)
 
 
-def _google_time_to_utc(value: dict[str, Any]) -> str | None:
+def _google_time_to_utc(value: Any) -> str | None:
     """Normalize one Google ``date`` or ``dateTime`` object to UTC text."""
+    if not isinstance(value, dict):
+        raise TypeError("Google event time must be an object")
     date_time = value.get("dateTime")
     if date_time:
         parsed = datetime.fromisoformat(str(date_time).replace("Z", "+00:00"))
@@ -326,6 +333,14 @@ class CalendarService:
                         )
                     )
                     for event in response.get("items", []):
+                        if not isinstance(event, Mapping):
+                            complete = False
+                            logger.warning(
+                                "Skipping malformed non-object Google Calendar event (%s)",
+                                type(event).__name__,
+                            )
+                            continue
+                        event_id = event.get("id", "<unknown>")
                         try:
                             formatted = self._format_event(event)
                             formatted["calendar_id"] = calendar_id
@@ -346,11 +361,16 @@ class CalendarService:
                                 "foregroundColor"
                             )
                             normalized.append(formatted)
+                        except _ZeroDurationGoogleEvent:
+                            logger.info(
+                                "Skipping zero-duration Google Calendar event %r",
+                                event_id,
+                            )
                         except (TypeError, ValueError):
                             complete = False
                             logger.warning(
                                 "Skipping malformed Google Calendar event %r",
-                                event.get("id", "<unknown>"),
+                                event_id,
                                 exc_info=True,
                             )
                     page_token = response.get("nextPageToken")
@@ -916,8 +936,14 @@ class CalendarService:
         if start_time is None:
             raise ValueError("Google event is missing a start date or dateTime")
         if end_time is None:
-            end_time = (datetime.fromisoformat(start_time) + timedelta(hours=1)).isoformat()
-        if datetime.fromisoformat(end_time) <= datetime.fromisoformat(start_time):
+            raise ValueError("Google event is missing an end date or dateTime")
+        start_instant = datetime.fromisoformat(start_time)
+        end_instant = datetime.fromisoformat(end_time)
+        if end_instant == start_instant:
+            raise _ZeroDurationGoogleEvent(
+                "Google event has identical normalized start and end instants"
+            )
+        if end_instant < start_instant:
             raise ValueError("Google event end must be later than its start")
         return {
             "id": event.get("id", ""),
