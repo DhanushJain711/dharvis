@@ -1,35 +1,30 @@
-# Docs for the Azure Web Apps Deploy action: https://github.com/Azure/webapps-deploy
-# More GitHub Actions for Azure: https://github.com/Azure/actions
-
-name: 'Build and deploy Python app to Azure Web App: kalendra-bot'
+name: Build and deploy Python app to Azure Web App - kalendra-bot
 
 on:
   push:
-    branches:
-    - main
+    branches: [main]
   workflow_dispatch:
 
 jobs:
-  build-and-deploy:
+  deploy:
     runs-on: ubuntu-latest
-    
     steps:
-    - uses: actions/checkout@v2
+      - uses: actions/checkout@v4
 
-    - name: Set up Python version
-      uses: actions/setup-python@v1
-      with:
-        python-version: '3.12'
-    
-    - name: Build using AppService-Build
-      uses: azure/appservice-build@v2
-      with:
-        platform: python
-        platform-version: '3.12'
-    
-    - name: 'Deploy to Azure Web App'
-      uses: azure/webapps-deploy@v2
-      with: 
-        app-name: 'kalendra-bot'
-        slot-name: 'production'
-        publish-profile: ${{ secrets.AzureAppService_PublishProfile_80c7a755812445d69ea5752741270a51 }}
+      - name: Zip artifact for deployment
+        run: |
+          zip -r release.zip . \
+            -x "*.git*" \
+            -x "*.venv/*" \
+            -x "**/__pycache__/*" \
+            -x "*.pyc" \
+            -x ".env" \
+            -x "data/*"
+
+      - name: Deploy to Azure Web App
+        uses: azure/webapps-deploy@v3
+        with:
+          app-name: 'kalendra-bot'
+          slot-name: 'production'
+          publish-profile: ${{ secrets.AzureAppService_PublishProfile_80c7a755812445d69ea5752741270a51 }}
+          package: release.zip
