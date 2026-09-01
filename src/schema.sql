@@ -82,6 +82,9 @@ CREATE TABLE IF NOT EXISTS events (
     gcal_event_id TEXT,
     created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
         CHECK (substr(created_at, -1) = 'Z' OR substr(created_at, -6) = '+00:00'),
+    color_id TEXT CHECK (
+        color_id IS NULL OR color_id IN ('1', '2', '3', '4', '5', '6', '7', '8', '9', '10', '11')
+    ),
     CHECK (end_time > start_time),
     CHECK (julianday(start_time) IS NOT NULL AND instr(start_time, 'T') = 11),
     CHECK (julianday(end_time) IS NOT NULL AND instr(end_time, 'T') = 11),
@@ -447,4 +450,4 @@ BEGIN
     SELECT RAISE(ABORT, 'fact is referenced by a schedule decision');
 END;
 
-PRAGMA user_version = 4;
+PRAGMA user_version = 5;

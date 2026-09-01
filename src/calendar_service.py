@@ -54,6 +54,7 @@ KIND_COLOR_IDS: dict[str, str] = {
     TASK_BLOCK_KIND: "9",
     GOAL_SESSION_KIND: "10",
 }
+EVENT_COLOR_IDS = frozenset(str(item) for item in range(1, 12))
 logger = logging.getLogger(__name__)
 
 
@@ -70,6 +71,15 @@ CalendarReconnectRequired = CalendarReconnectRequiredError
 
 class _ZeroDurationGoogleEvent(ValueError):
     """Signal an explicitly empty Google event that cannot occupy calendar time."""
+
+
+def normalize_event_color_id(value: Any) -> str:
+    """Validate a Google *event* palette id without accepting calendar colors."""
+    if not isinstance(value, str) or value not in EVENT_COLOR_IDS:
+        raise ValueError(
+            "color_id must be a Google Calendar event color id string from '1' to '11'"
+        )
+    return value
 
 
 def _write_securely(path: Path, content: str) -> None:
@@ -409,6 +419,44 @@ class CalendarService:
         events = await self.list_events(start, end)
         return self._last_query_complete and not events
 
+    async def get_owned_event(self, gcal_event_id: str) -> CalendarRecord:
+        """Read one application-owned event directly from the Kalendra calendar.
+
+        This exact-id lookup intentionally does not scan visible calendars or
+        depend on an event time range.  It is suitable for capturing a remote
+        preimage immediately before a guarded update.
+        """
+        event_id = str(gcal_event_id or "").strip()
+        if not event_id:
+            raise ValueError("gcal_event_id must be non-empty")
+        service = self._get_service()
+        if service is None:
+            raise CalendarReconnectRequiredError(
+                "Google Calendar is not connected; reconnect your calendar"
+            )
+        calendar_id = self._ensure_kalendra_calendar()
+        try:
+            event = self._execute(
+                service.events().get(calendarId=calendar_id, eventId=event_id)
+            )
+        except HttpError as exc:
+            if _is_not_found(exc):
+                raise CalendarError("The Kalendra calendar event was not found") from exc
+            self._raise_if_reconnect_required(exc)
+            raise CalendarError("Could not retrieve the Kalendra calendar event") from exc
+        except (OSError, TypeError, ValueError) as exc:
+            raise CalendarError("Could not retrieve the Kalendra calendar event") from exc
+        if not isinstance(event, Mapping):
+            raise CalendarError("Google returned an invalid Kalendra calendar event")
+        if not self._is_owned_event(event):
+            raise CalendarError("The calendar event is not owned by Kalendra")
+        try:
+            formatted = self._format_event(event)
+        except (TypeError, ValueError) as exc:
+            raise CalendarError("Google returned an invalid Kalendra calendar event") from exc
+        formatted["calendar_id"] = calendar_id
+        return formatted
+
     def _ensure_kalendra_calendar(self) -> str:
         """Find or create the dedicated secondary calendar, then persist its id."""
         if self._kalendra_calendar_id and self._kalendra_id_validated:
@@ -528,13 +576,6 @@ class CalendarService:
             )
         return normalized
 
-    @staticmethod
-    def _normalize_color_id(value: Any) -> str:
-        color_id = str(value).strip()
-        if color_id not in {str(item) for item in range(1, 12)}:
-            raise ValueError("color_id must be a Google Calendar event color id from 1 to 11")
-        return color_id
-
     @classmethod
     def _default_color_id(cls, category: Any, kind: Any) -> str:
         normalized_category = str(category or "").strip().lower()
@@ -601,7 +642,7 @@ class CalendarService:
         body["extendedProperties"] = extended
         explicit_color = event.get("color_id", event.get("colorId"))
         body["colorId"] = (
-            self._normalize_color_id(explicit_color)
+            normalize_event_color_id(explicit_color)
             if explicit_color is not None
             else self._default_color_id(normalized_category, normalized_kind)
         )
@@ -616,6 +657,9 @@ class CalendarService:
         kind: str = FIXED_EVENT_KIND,
     ) -> CalendarRecord:
         """Create a reasoned, application-owned event on Kalendra."""
+        # Build and validate before discovering/creating the owned calendar so
+        # invalid input cannot cause even that preliminary Google mutation.
+        body = self._event_body(event, reasoning, category=category, kind=kind)
         service = self._get_service()
         if service is None:
             raise CalendarReconnectRequiredError(
@@ -626,9 +670,7 @@ class CalendarService:
             created = self._execute(
                 service.events().insert(
                     calendarId=calendar_id,
-                    body=self._event_body(
-                        event, reasoning, category=category, kind=kind
-                    ),
+                    body=body,
                 )
             )
         except HttpError as exc:
@@ -650,6 +692,16 @@ class CalendarService:
         """Patch an event in Kalendra; primary and other calendars are untouched."""
         if not gcal_event_id:
             raise ValueError("gcal_event_id must be non-empty")
+        color_key = (
+            "color_id"
+            if "color_id" in changes
+            else "colorId"
+            if "colorId" in changes
+            else None
+        )
+        requested_color = changes[color_key] if color_key is not None else None
+        if color_key is not None and requested_color is not None:
+            requested_color = normalize_event_color_id(requested_color)
         service = self._get_service()
         if service is None:
             raise CalendarReconnectRequiredError(
@@ -712,9 +764,10 @@ class CalendarService:
                         else:
                             private[identifier] = str(identifier_value)
                 body["extendedProperties"] = extended
-            explicit_color = changes.get("color_id", changes.get("colorId"))
-            if explicit_color is not None:
-                body["colorId"] = self._normalize_color_id(explicit_color)
+            if color_key is not None:
+                # A present null is intentional: Google interprets it as
+                # clearing the event override so the calendar color inherits.
+                body["colorId"] = requested_color
             elif marker_change_requested:
                 old_default = self._default_color_id(
                     current_private.get("category", ""), current_kind

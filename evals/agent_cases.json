@@ -48,5 +48,11 @@
   {"id":"query_fitness","category":"cross_domain_queries","message":"how are my fitness tasks and goals looking?","expected":["query_tasks","query_goals"],"unordered":true},
   {"id":"query_availability","category":"cross_domain_queries","message":"am I free Friday afternoon and what tasks could fit?","expected":["resolve_date","query_schedule","query_tasks"],"unordered_tail":true},
   {"id":"query_why_goal","category":"cross_domain_queries","message":"why is the pset scheduled there and am I behind on any goals?","expected":["query_tasks","query_goals","explain_schedule"],"unordered":true},
-  {"id":"query_everything","category":"cross_domain_queries","message":"give me today's events, scheduled work, pending tasks, and active goals","expected":["query_schedule","query_tasks","query_goals"],"unordered":true}
+  {"id":"query_everything","category":"cross_domain_queries","message":"give me today's events, scheduled work, pending tasks, and active goals","expected":["query_schedule","query_tasks","query_goals"],"unordered":true},
+
+  {"id":"color_named_update","category":"event_colors","message":"make event 21 orange","prior":[["assistant","event 21 is your dentist appointment"]],"expected":["update_event"]},
+  {"id":"color_match_reference","category":"event_colors","message":"add office hours Friday at 11 for an hour, same color as my CS311 lecture","expected":["resolve_date","query_schedule","add_event"],"unordered":true},
+  {"id":"color_inherited_reference","category":"event_colors","message":"make event 21 the same color as my CS311 lecture","prior":[["assistant","event 21 is your dentist appointment"]],"expected":["query_schedule"]},
+  {"id":"color_conflicting_references","category":"event_colors","message":"make event 21 the same color as my CS311 events","prior":[["assistant","event 21 is your dentist appointment"]],"expected":["query_schedule"]},
+  {"id":"color_external_refusal","category":"event_colors","message":"make my Canvas lecture purple","expected":["query_schedule"]}
 ]

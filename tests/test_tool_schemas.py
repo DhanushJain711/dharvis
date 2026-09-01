@@ -30,6 +30,35 @@ def test_batch_create_and_required_schedule_reasoning() -> None:
     assert "one-sentence" in schedule["properties"]["reasoning"]["description"]
 
 
+def test_event_color_contract_uses_only_google_event_palette_ids() -> None:
+    add_item = TOOLS_BY_NAME["add_event"]["function"]["parameters"]["properties"]["events"]["items"]
+    add_color = add_item["properties"]["color_id"]
+    assert "color_id" in add_item["required"]
+    assert add_color["type"] == ["string", "null"]
+    assert add_color["enum"] == [str(value) for value in range(1, 12)] + [None]
+    assert "calendar_color_id" in add_color["description"]
+    assert "never copy" in add_color["description"]
+
+    update = TOOLS_BY_NAME["update_event"]["function"]["parameters"]
+    update_color = update["properties"]["color_id"]
+    assert update_color["enum"] == add_color["enum"]
+    assert "null to leave" in update_color["description"]
+    assert "color_id" in update["properties"]["clear_fields"]["items"]["enum"]
+    assert "inherit" in update["properties"]["clear_fields"]["description"]
+
+    palette = add_color["description"]
+    for label in (
+        "1 lavender", "2 sage", "3 grape", "4 flamingo", "5 banana",
+        "6 tangerine", "7 peacock", "8 graphite", "9 blueberry",
+        "10 basil", "11 tomato",
+    ):
+        assert label in palette
+    query_description = TOOLS_BY_NAME["query_schedule"]["function"]["description"]
+    assert "metadata.color_id" in query_description
+    assert "metadata.calendar_color_id" in query_description
+    assert "must never be passed" in query_description
+
+
 def test_reminder_tools_are_separate_from_calendar_scheduling() -> None:
     add = TOOLS_BY_NAME["add_reminder"]["function"]
     assert add["parameters"]["properties"]["reminders"]["type"] == "array"

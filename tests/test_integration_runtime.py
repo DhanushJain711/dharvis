@@ -25,9 +25,14 @@ class FakeCalendar:
 
     def __init__(self) -> None:
         self.events: list[dict] = []
+        self.owned_events: dict[str, dict] = {}
+        self.owned_reads: list[str] = []
         self.deleted: list[str] = []
+        self.list_calls = 0
+        self.updates: list[tuple[str, dict]] = []
 
     async def list_events(self, start, end, *, force_refresh=False):
+        self.list_calls += 1
         return list(self.events)
 
     async def create_event(self, event, reasoning=None, *, category=None, kind="fixed-event"):
@@ -36,9 +41,17 @@ class FakeCalendar:
         created["end_time"] = created.pop("end", created.get("end_time", None))
         created["gcal_event_id"] = f"g-{len(self.events) + 1}"
         self.events.append(created)
+        self.owned_events[created["gcal_event_id"]] = created
         return created
 
+    async def get_owned_event(self, event_id):
+        self.owned_reads.append(event_id)
+        if event_id not in self.owned_events:
+            raise CalendarError("owned event not found")
+        return dict(self.owned_events[event_id])
+
     async def update_event(self, event_id, changes, *, category=None, kind=None):
+        self.updates.append((event_id, dict(changes)))
         return {"gcal_event_id": event_id, **changes}
 
     async def delete_event(self, event_id):
@@ -174,6 +187,312 @@ async def test_full_event_loop_writes_calendar_and_store(tmp_path):
         datetime(2026, 8, 28, 21, tzinfo=UTC),
     )
     assert [(block.source, block.title) for block in merged] == [("event", "dentist")]
+
+
+@pytest.mark.asyncio
+async def test_event_batch_validates_every_color_before_calendar_access(tmp_path):
+    store = Store(tmp_path / "invalid-color-batch.sqlite")
+    await store.initialize()
+    calendar = FakeCalendar()
+    handlers = await build_tool_handlers(
+        store, calendar, SpyScheduler(), FactsEngine(store)
+    )
+    start = datetime(2026, 8, 28, 19, tzinfo=UTC)
+    base = {
+        "description": None, "start": start.isoformat(),
+        "end": (start + timedelta(hours=1)).isoformat(), "location": None,
+        "category": "school",
+    }
+    with pytest.raises(ValueError, match="color_id"):
+        await handlers["add_event"](events=[
+            {"title": "valid first", "color_id": "6", **base},
+            {"title": "invalid second", "color_id": "12", **base},
+        ])
+    assert calendar.events == []
+    assert calendar.list_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_event_create_persists_google_returned_color(tmp_path):
+    class CanonicalizingCalendar(FakeCalendar):
+        async def create_event(self, event, reasoning=None, *, category=None, kind="fixed-event"):
+            created = await super().create_event(
+                event, reasoning, category=category, kind=kind
+            )
+            created["color_id"] = "9"
+            return created
+
+    store = Store(tmp_path / "created-color.sqlite")
+    await store.initialize()
+    calendar = CanonicalizingCalendar()
+    handlers = await build_tool_handlers(
+        store, calendar, SpyScheduler(), FactsEngine(store)
+    )
+    start = datetime(2026, 8, 28, 19, tzinfo=UTC)
+    result = await handlers["add_event"](events=[{
+        "title": "office hours", "description": None,
+        "start": start.isoformat(), "end": (start + timedelta(hours=1)).isoformat(),
+        "location": None, "category": "school", "color_id": "6",
+    }])
+    assert result["events"][0]["color_id"] == "9"
+    assert (await store.get_event(result["events"][0]["id"]))["color_id"] == "9"
+
+
+@pytest.mark.asyncio
+async def test_color_only_event_update_skips_conflict_reads_and_reconciliation(tmp_path):
+    class CanonicalizingCalendar(FakeCalendar):
+        async def update_event(self, event_id, changes, *, category=None, kind=None):
+            await super().update_event(
+                event_id, changes, category=category, kind=kind
+            )
+            return {"gcal_event_id": event_id, **changes, "color_id": "10"}
+
+    store = Store(tmp_path / "color-only.sqlite")
+    await store.initialize()
+    start = datetime(2026, 8, 28, 19, tzinfo=UTC)
+    [event] = await store.add_events([{
+        "title": "dentist", "start": start, "end": start + timedelta(hours=1),
+        "source": "bot", "gcal_event_id": "g-1", "color_id": "6",
+    }])
+    calendar = CanonicalizingCalendar()
+    calendar.owned_events["g-1"] = {
+        "gcal_event_id": "g-1", "title": "dentist",
+        "start_time": start + timedelta(days=3),
+        # A direct owned-event lookup still works if Google was moved outside
+        # SQLite's stale interval.
+        "end_time": start + timedelta(days=3, hours=1), "color_id": "6",
+    }
+    scheduler = SpyScheduler()
+    handlers = await build_tool_handlers(
+        store, calendar, scheduler, FactsEngine(store)
+    )
+    result = await handlers["update_event"](
+        event_id=event["id"], title=None, description=None, start=None, end=None,
+        location=None, category=None, color_id="9", clear_fields=[],
+    )
+    assert result["color_id"] == "10"
+    assert calendar.list_calls == 0
+    assert calendar.owned_reads == ["g-1"]
+    assert calendar.updates == [("g-1", {"color_id": "9"})]
+    assert scheduler.conflicts == []
+    assert result["schedule_changes"] == []
+
+
+@pytest.mark.asyncio
+async def test_clearing_event_color_inherits_calendar_default_without_preflight(tmp_path):
+    store = Store(tmp_path / "clear-color.sqlite")
+    await store.initialize()
+    start = datetime(2026, 8, 28, 19, tzinfo=UTC)
+    [event] = await store.add_events([{
+        "title": "dentist", "start": start, "end": start + timedelta(hours=1),
+        "source": "bot", "gcal_event_id": "g-1", "color_id": "6",
+    }])
+    calendar = FakeCalendar()
+    calendar.owned_events["g-1"] = {
+        "gcal_event_id": "g-1", "title": "dentist", "start_time": start,
+        "end_time": start + timedelta(hours=1), "color_id": "6",
+    }
+    scheduler = SpyScheduler()
+    handlers = await build_tool_handlers(
+        store, calendar, scheduler, FactsEngine(store)
+    )
+    result = await handlers["update_event"](
+        event_id=event["id"], title=None, description=None, start=None, end=None,
+        location=None, category=None, color_id=None, clear_fields=["color_id"],
+    )
+    assert result["color_id"] is None
+    assert calendar.updates == [("g-1", {"color_id": None})]
+    assert calendar.list_calls == 0
+    assert calendar.owned_reads == ["g-1"]
+    assert scheduler.conflicts == []
+
+
+@pytest.mark.asyncio
+async def test_event_color_clear_and_assignment_are_rejected_before_remote_write(tmp_path):
+    store = Store(tmp_path / "contradictory-color.sqlite")
+    await store.initialize()
+    start = datetime(2026, 8, 28, 19, tzinfo=UTC)
+    [event] = await store.add_events([{
+        "title": "dentist", "start": start, "end": start + timedelta(hours=1),
+        "source": "bot", "gcal_event_id": "g-1", "color_id": "6",
+    }])
+    calendar = FakeCalendar()
+    handlers = await build_tool_handlers(
+        store, calendar, SpyScheduler(), FactsEngine(store)
+    )
+    with pytest.raises(ValueError, match="both cleared and assigned"):
+        await handlers["update_event"](
+            event_id=event["id"], title=None, description=None, start=None, end=None,
+            location=None, category=None, color_id="9", clear_fields=["color_id"],
+        )
+    assert calendar.list_calls == 0
+    assert calendar.updates == []
+
+
+@pytest.mark.asyncio
+async def test_event_color_survives_conflict_proposal_confirmation(tmp_path):
+    store = Store(tmp_path / "color-proposal.sqlite")
+    await store.initialize()
+    calendar = FakeCalendar()
+    handlers = await build_tool_handlers(
+        store, calendar, SpyScheduler(), FactsEngine(store)
+    )
+    start = datetime(2026, 8, 28, 19, tzinfo=UTC)
+    await handlers["add_event"](events=[{
+        "title": "first", "description": None, "start": start.isoformat(),
+        "end": (start + timedelta(hours=1)).isoformat(), "location": None,
+        "category": "work", "color_id": None,
+    }])
+    proposal = await handlers["add_event"](events=[{
+        "title": "CS311", "description": None,
+        "start": (start + timedelta(minutes=30)).isoformat(),
+        "end": (start + timedelta(hours=2)).isoformat(), "location": None,
+        "category": "school", "color_id": "6",
+    }])
+    saved = await store.get_event_change_proposal(proposal["proposal_id"])
+    assert saved["payload"]["events"][0]["color_id"] == "6"
+    confirmed = await handlers["confirm_event_change"](
+        proposal_id=proposal["proposal_id"]
+    )
+    assert confirmed["events"][0]["color_id"] == "6"
+
+
+@pytest.mark.asyncio
+async def test_event_color_survives_update_proposal_confirmation(tmp_path):
+    store = Store(tmp_path / "update-color-proposal.sqlite")
+    await store.initialize()
+    calendar = FakeCalendar()
+    handlers = await build_tool_handlers(
+        store, calendar, SpyScheduler(), FactsEngine(store)
+    )
+    start = datetime(2026, 8, 28, 19, tzinfo=UTC)
+    blocker = await handlers["add_event"](events=[{
+        "title": "meeting", "description": None, "start": start.isoformat(),
+        "end": (start + timedelta(hours=1)).isoformat(), "location": None,
+        "category": "work", "color_id": None,
+    }])
+    movable = await handlers["add_event"](events=[{
+        "title": "dentist", "description": None,
+        "start": (start + timedelta(hours=2)).isoformat(),
+        "end": (start + timedelta(hours=3)).isoformat(), "location": None,
+        "category": "personal", "color_id": "9",
+    }])
+    assert blocker["events"] and movable["events"]
+    event_id = movable["events"][0]["id"]
+    proposal = await handlers["update_event"](
+        event_id=event_id, title=None, description=None,
+        start=(start + timedelta(minutes=30)).isoformat(),
+        end=(start + timedelta(minutes=90)).isoformat(),
+        location=None, category=None, color_id="3", clear_fields=[],
+    )
+    assert proposal["confirmation_required"] is True
+    saved = await store.get_event_change_proposal(proposal["proposal_id"])
+    assert saved["payload"]["changes"]["color_id"] == "3"
+    confirmed = await handlers["confirm_event_change"](
+        proposal_id=proposal["proposal_id"]
+    )
+    assert confirmed["color_id"] == "3"
+    assert (await store.get_event(event_id))["color_id"] == "3"
+
+
+@pytest.mark.asyncio
+async def test_failed_local_color_update_restores_live_google_color_not_stale_local(tmp_path):
+    store = Store(tmp_path / "color-rollback.sqlite")
+    await store.initialize()
+    start = datetime(2026, 8, 28, 19, tzinfo=UTC)
+    [event] = await store.add_events([{
+        "title": "dentist", "start": start, "end": start + timedelta(hours=1),
+        "source": "bot", "gcal_event_id": "g-1", "color_id": "6",
+    }])
+    original_update = store.update_event
+
+    async def fail_update(event_id, changes):
+        raise RuntimeError("locked")
+
+    store.update_event = fail_update  # type: ignore[method-assign]
+    calendar = FakeCalendar()
+    calendar.owned_events["g-1"] = {
+        "gcal_event_id": "g-1", "title": "dentist", "start_time": start,
+        "end_time": start + timedelta(hours=1),
+        # The user manually changed Google after SQLite last observed color 6.
+        "color_id": "3",
+    }
+    # A visible event on another calendar may reuse the same opaque Google ID;
+    # only the direct Kalendra-owned lookup is a valid rollback preimage.
+    calendar.events.append({
+        "gcal_event_id": "g-1", "title": "external collision",
+        "start_time": start, "end_time": start + timedelta(hours=1),
+        "color_id": "11",
+    })
+    handlers = await build_tool_handlers(
+        store, calendar, SpyScheduler(), FactsEngine(store)
+    )
+    with pytest.raises(Exception, match="event update failed"):
+        await handlers["update_event"](
+            event_id=event["id"], title=None, description=None, start=None, end=None,
+            location=None, category=None, color_id="9", clear_fields=[],
+        )
+    assert calendar.updates[0] == ("g-1", {"color_id": "9"})
+    assert calendar.updates[1][1]["color_id"] == "3"
+    assert calendar.owned_reads == ["g-1"]
+    store.update_event = original_update  # type: ignore[method-assign]
+
+
+@pytest.mark.asyncio
+async def test_google_null_color_response_clears_local_without_second_remote_patch(tmp_path):
+    class ClearingCalendar(FakeCalendar):
+        async def update_event(self, event_id, changes, *, category=None, kind=None):
+            await super().update_event(
+                event_id, changes, category=category, kind=kind
+            )
+            return {"gcal_event_id": event_id, **changes, "color_id": None}
+
+    store = Store(tmp_path / "authoritative-null-color.sqlite")
+    await store.initialize()
+    start = datetime(2026, 8, 28, 19, tzinfo=UTC)
+    [event] = await store.add_events([{
+        "title": "dentist", "start": start, "end": start + timedelta(hours=1),
+        "source": "bot", "gcal_event_id": "g-1", "color_id": "6",
+    }])
+    calendar = ClearingCalendar()
+    calendar.owned_events["g-1"] = {
+        "gcal_event_id": "g-1", "title": "dentist", "start_time": start,
+        "end_time": start + timedelta(hours=1), "color_id": "6",
+    }
+    handlers = await build_tool_handlers(
+        store, calendar, SpyScheduler(), FactsEngine(store)
+    )
+    result = await handlers["update_event"](
+        event_id=event["id"], title=None, description=None, start=None, end=None,
+        location=None, category=None, color_id="9", clear_fields=[],
+    )
+    assert result["color_id"] is None
+    assert (await store.get_event(event["id"]))["color_id"] is None
+    assert calendar.updates == [("g-1", {"color_id": "9"})]
+    assert calendar.owned_reads == ["g-1"]
+
+
+@pytest.mark.asyncio
+async def test_update_event_refuses_external_google_records(tmp_path):
+    store = Store(tmp_path / "external-event.sqlite")
+    await store.initialize()
+    start = datetime(2026, 8, 28, 19, tzinfo=UTC)
+    [event] = await store.add_events([{
+        "title": "Canvas lecture", "start": start,
+        "end": start + timedelta(hours=1), "source": "gcal",
+        "gcal_event_id": "external", "color_id": "6",
+    }])
+    calendar = FakeCalendar()
+    handlers = await build_tool_handlers(
+        store, calendar, SpyScheduler(), FactsEngine(store)
+    )
+    with pytest.raises(ValueError, match="read-only"):
+        await handlers["update_event"](
+            event_id=event["id"], title=None, description=None, start=None, end=None,
+            location=None, category=None, color_id="3", clear_fields=[],
+        )
+    assert calendar.list_calls == 0
+    assert calendar.updates == []
 
 
 @pytest.mark.asyncio

@@ -426,13 +426,41 @@ async def query_schedule(
         for record in event_records
         if str(record.get("gcal_event_id") or "").strip()
     }
+    google_by_id = {
+        str(record.get("gcal_event_id", record.get("id", ""))).strip(): record
+        for record in google_records
+        if str(record.get("gcal_event_id", record.get("id", ""))).strip()
+    }
+    live_google_metadata = (
+        "color_id",
+        "calendar_id",
+        "calendar_summary",
+        "calendar_primary",
+        "calendar_access_role",
+        "calendar_color_id",
+        "calendar_background_color",
+        "calendar_foreground_color",
+    )
+    enriched_event_records: list[dict[str, Any]] = []
+    for record in event_records:
+        enriched = dict(record)
+        google_id = str(record.get("gcal_event_id") or "").strip()
+        live_record = google_by_id.get(google_id)
+        if live_record is not None:
+            # Google is authoritative for display colors.  In particular, a
+            # manual recolor made outside the bot must beat stale local data
+            # before the duplicate Google block is discarded.
+            for field in live_google_metadata:
+                if field in live_record:
+                    enriched[field] = live_record[field]
+        enriched_event_records.append(enriched)
     blocks: list[ScheduleBlock] = [
         _schedule_block(record, "gcal")
         for record in google_records
         if str(record.get("gcal_event_id", record.get("id", ""))).strip()
         not in task_gcal_ids | local_event_gcal_ids
     ]
-    blocks.extend(_schedule_block(record, "event") for record in event_records)
+    blocks.extend(_schedule_block(record, "event") for record in enriched_event_records)
     blocks.extend(task_blocks)
     return sorted(blocks, key=lambda block: (block.start, block.end, block.title))
 

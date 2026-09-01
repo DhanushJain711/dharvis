@@ -10,7 +10,11 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from . import timeutil
-from .calendar_service import FIXED_EVENT_KIND, CalendarService
+from .calendar_service import (
+    FIXED_EVENT_KIND,
+    CalendarService,
+    normalize_event_color_id,
+)
 from .config import config
 from .facts_engine import FactsEngine
 from .freebusy import ScheduleBlock, find_free_blocks, overlapping_blocks, query_schedule
@@ -104,6 +108,8 @@ async def build_tool_handlers(
 
     def _validate_event(event: dict[str, Any]) -> dict[str, Any]:
         item = dict(event)
+        if item.get("color_id") is not None:
+            item["color_id"] = normalize_event_color_id(item["color_id"])
         item["start"] = _aware(item.get("start"), "start")
         item["end"] = _aware(item.get("end"), "end")
         if item["start"] is None or item["end"] is None or item["end"] <= item["start"]:
@@ -160,6 +166,11 @@ async def build_tool_handlers(
                 local = dict(item)
                 local["source"] = "bot"
                 local["gcal_event_id"] = created["gcal_event_id"]
+                # Google is authoritative for the effective event-level color.
+                # In particular, its response tells us which deterministic
+                # default was applied when the caller supplied null.
+                if "color_id" in created:
+                    local["color_id"] = created["color_id"]
                 local_events.append(local)
             records = await store.add_events(local_events)
         except Exception as exc:
@@ -274,7 +285,25 @@ async def build_tool_handlers(
         current = await store.get_event(event_id)
         if current is None:
             raise KeyError(f"Event {event_id} does not exist")
+        if current.get("source") != "bot":
+            raise ValueError("external Google Calendar events are read-only")
+        allowed_clear_fields = {"description", "location", "category", "color_id"}
+        invalid_clear_fields = set(clear_fields) - allowed_clear_fields
+        if invalid_clear_fields:
+            raise ValueError(
+                f"event fields cannot be cleared: {sorted(invalid_clear_fields)}"
+            )
+        contradictory_fields = {
+            field for field in clear_fields if changes.get(field) is not None
+        }
+        if contradictory_fields:
+            raise ValueError(
+                "event fields cannot be both cleared and assigned: "
+                f"{sorted(contradictory_fields)}"
+            )
         payload = {key: value for key, value in changes.items() if value is not None}
+        if "color_id" in payload:
+            payload["color_id"] = normalize_event_color_id(payload["color_id"])
         for key in ("start", "end"):
             if key in payload:
                 payload[key] = _aware(payload[key], key)
@@ -283,21 +312,25 @@ async def build_tool_handlers(
         proposed["start"] = payload.get("start", proposed.get("start_time"))
         proposed["end"] = payload.get("end", proposed.get("end_time"))
         proposed = _validate_event(proposed)
-        conflicts = await _conflicts_for([proposed], ignore_event_id=event_id)
         proposal_payload = {
             "event_id": event_id,
             "clear_fields": clear_fields,
             "changes": payload,
         }
-        if conflicts:
-            return jsonable(await _proposal("update", proposal_payload, conflicts))
-        # Freshly read the merged schedule immediately before the external
-        # mutation; a concurrent calendar edit becomes a new proposal.
-        conflicts = await _conflicts_for([proposed], ignore_event_id=event_id)
-        if conflicts:
-            return jsonable(await _proposal("update", proposal_payload, conflicts))
+        changed_fields = set(payload) | set(clear_fields)
+        color_only = bool(changed_fields) and changed_fields <= {"color_id"}
+        if not color_only:
+            conflicts = await _conflicts_for([proposed], ignore_event_id=event_id)
+            if conflicts:
+                return jsonable(await _proposal("update", proposal_payload, conflicts))
+            # Freshly read the merged schedule immediately before the external
+            # mutation; a concurrent calendar edit becomes a new proposal.
+            conflicts = await _conflicts_for([proposed], ignore_event_id=event_id)
+            if conflicts:
+                return jsonable(await _proposal("update", proposal_payload, conflicts))
         return jsonable(await _apply_event_update(
-            event_id, current, payload, clear_fields, recheck=False
+            event_id, current, payload, clear_fields, recheck=False,
+            skip_reconciliation=color_only,
         ))
 
     async def _apply_event_update(
@@ -307,6 +340,7 @@ async def build_tool_handlers(
         clear_fields: list[str],
         *,
         recheck: bool,
+        skip_reconciliation: bool = False,
     ) -> dict[str, Any]:
         proposed = dict(current)
         proposed.update(payload)
@@ -318,23 +352,47 @@ async def build_tool_handlers(
             if conflicts:
                 raise ValueError("the calendar changed and this event still conflicts")
         gcal_id = str(current.get("gcal_event_id") or "")
+        remote_updated: dict[str, Any] | None = None
+        remote_preimage_color: str | None = None
+        remote_mutated = False
         if gcal_id:
             calendar_payload = dict(payload)
             for field in clear_fields:
                 calendar_payload[field] = None
             if set(calendar_payload) & {
                 "title", "description", "start", "end", "start_time",
-                "end_time", "location", "category",
+                "end_time", "location", "category", "color_id",
             }:
-                await calendar.update_event(
-                    gcal_id, calendar_payload,
-                    category=proposed.get("category"), kind=FIXED_EVENT_KIND,
+                # Compensation must restore Google's live preimage, not a
+                # potentially stale SQLite value (the user may have recolored
+                # the event directly in Google Calendar).
+                live_event = await calendar.get_owned_event(gcal_id)
+                if live_event.get("color_id") is not None:
+                    remote_preimage_color = normalize_event_color_id(
+                        live_event["color_id"]
+                    )
+                remote_updated = await calendar.update_event(gcal_id, calendar_payload)
+                remote_mutated = True
+        store_payload = dict(payload)
+        # Persist Google's returned effective color after a set. Clearing stays
+        # represented by clear_fields so SQLite stores null/inherited state.
+        local_clear_fields = list(clear_fields)
+        if "color_id" not in clear_fields and remote_updated is not None and "color_id" in remote_updated:
+            if remote_updated["color_id"] is None:
+                # This is a local persistence instruction only. The Google
+                # patch already happened above, so do not route it back through
+                # the calendar boundary a second time.
+                store_payload.pop("color_id", None)
+                local_clear_fields.append("color_id")
+            else:
+                store_payload["color_id"] = normalize_event_color_id(
+                    remote_updated["color_id"]
                 )
-        payload["clear_fields"] = clear_fields
+        store_payload["clear_fields"] = local_clear_fields
         try:
-            updated = await store.update_event(event_id, payload)
+            updated = await store.update_event(event_id, store_payload)
         except Exception as exc:
-            if gcal_id:
+            if remote_mutated:
                 try:
                     await calendar.update_event(gcal_id, {
                         "title": current.get("title"),
@@ -343,7 +401,8 @@ async def build_tool_handlers(
                         "end_time": current.get("end_time"),
                         "location": current.get("location"),
                         "category": current.get("category"),
-                    }, category=current.get("category"), kind=FIXED_EVENT_KIND)
+                        "color_id": remote_preimage_color,
+                    })
                 except Exception as rollback_error:
                     raise _EventApplyError(
                         "event update failed and calendar rollback could not be verified",
@@ -356,7 +415,11 @@ async def build_tool_handlers(
         try:
             schedule_changes = (
                 await scheduler.detect_conflicts(start, end)
-                if isinstance(start, datetime) and isinstance(end, datetime)
+                if (
+                    not skip_reconciliation
+                    and isinstance(start, datetime)
+                    and isinstance(end, datetime)
+                )
                 else []
             )
         except Exception:
@@ -419,7 +482,8 @@ async def build_tool_handlers(
         token, _ = claim
         try:
             result = await _apply_event_update(
-                event_id, current, changes, list(payload["clear_fields"]), recheck=False
+                event_id, current, changes, list(payload["clear_fields"]),
+                recheck=False,
             )
         except _EventApplyError as exc:
             if exc.compensated:

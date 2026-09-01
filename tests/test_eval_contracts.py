@@ -12,15 +12,16 @@ from src.scheduler_engine import SchedulerEngine, SchedulingPlanError
 from src.tools import TOOLS_BY_NAME
 
 
-def test_agent_eval_has_45_valid_messages_and_all_categories():
+def test_agent_eval_has_50_valid_messages_and_all_categories():
     cases = json.loads(
         (Path(__file__).parents[1] / "evals" / "agent_cases.json").read_text()
     )
-    assert len(cases) == 45
+    assert len(cases) == 50
     counts = Counter(case["category"] for case in cases)
     assert set(counts) == {
         "multi_item", "relative_dates", "ambiguous_references",
         "corrections", "multi_turn_context", "cross_domain_queries",
+        "event_colors",
     }
     assert all(case["message"].strip() for case in cases)
     assert all(set(case["expected"]) <= set(TOOLS_BY_NAME) for case in cases)
@@ -78,3 +79,12 @@ def test_few_shot_assistant_lines_have_no_corporate_phrases_or_reasoning_label()
     schedule_examples = [line for line in assistant_lines if line.startswith(("put ", "moved "))]
     assert len(schedule_examples) >= 3
     assert all("—" in line for line in schedule_examples)
+
+
+def test_system_prompt_distinguishes_event_and_calendar_colors() -> None:
+    prompt = (Path(__file__).parents[1] / "src" / "prompts" / "system.md").read_text()
+    assert "metadata.color_id" in prompt
+    assert "never copy `metadata.calendar_color_id`" in prompt
+    assert "external events themselves are read-only" in prompt
+    assert "6 tangerine/orange" in prompt
+    assert "clear `color_id`" in prompt

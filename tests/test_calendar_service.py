@@ -283,6 +283,221 @@ async def test_list_events_preserves_event_and_source_calendar_metadata(tmp_path
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("color_id", [None, "6"])
+async def test_get_owned_event_uses_exact_kalendra_lookup_and_preserves_color(
+    tmp_path: Path, color_id: str | None
+):
+    google = MagicMock()
+    events = event_resource(google)
+    event = google_event("shared-id", "CS311 discussion")
+    event["extendedProperties"] = {
+        "private": {
+            OWNERSHIP_MARKER_KEY: OWNERSHIP_MARKER_VALUE,
+            KIND_MARKER_KEY: FIXED_EVENT_KIND,
+        }
+    }
+    if color_id is not None:
+        event["colorId"] = color_id
+    events.get.return_value = Request(event)
+    service = connected_service(tmp_path, google)
+    service._kalendra_calendar_id = "kalendra-id"
+    service._kalendra_id_validated = True
+
+    result = await service.get_owned_event("shared-id")
+
+    assert events.get.call_args.kwargs == {
+        "calendarId": "kalendra-id",
+        "eventId": "shared-id",
+    }
+    events.list.assert_not_called()
+    google.calendarList.return_value.list.assert_not_called()
+    assert result["calendar_id"] == "kalendra-id"
+    assert result["gcal_event_id"] == "shared-id"
+    assert result["kalendra_owned"] is True
+    assert result["color_id"] == color_id
+
+
+@pytest.mark.asyncio
+async def test_get_owned_event_requires_event_id(
+    tmp_path: Path,
+):
+    google = MagicMock()
+    events = event_resource(google)
+    service = connected_service(tmp_path, google)
+
+    with pytest.raises(ValueError, match="gcal_event_id"):
+        await service.get_owned_event("  ")
+
+    events.get.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_get_owned_event_discovers_marker_owned_calendar_without_cached_id(
+    tmp_path: Path,
+):
+    google = MagicMock()
+    calendar_list(
+        google,
+        {
+            None: {
+                "items": [
+                    {"id": "primary", "primary": True},
+                    owned_calendar("found-kalendra"),
+                ]
+            }
+        },
+    )
+    events = event_resource(google)
+    event = google_event("event-id", "Dinner")
+    event["extendedProperties"] = {
+        "private": {
+            OWNERSHIP_MARKER_KEY: OWNERSHIP_MARKER_VALUE,
+            KIND_MARKER_KEY: FIXED_EVENT_KIND,
+        }
+    }
+    events.get.return_value = Request(event)
+    service = connected_service(tmp_path, google)
+
+    result = await service.get_owned_event("event-id")
+
+    assert result["calendar_id"] == "found-kalendra"
+    assert events.get.call_args.kwargs["calendarId"] == "found-kalendra"
+    google.calendars.return_value.insert.assert_not_called()
+    events.list.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_get_owned_event_recovers_stale_persisted_calendar_id(tmp_path: Path):
+    google = MagicMock()
+    calendar_list(
+        google,
+        {
+            None: {
+                "items": [
+                    {"id": "stale", "summary": "Kalendra", "primary": False},
+                    owned_calendar("recovered-kalendra"),
+                ]
+            }
+        },
+    )
+    events = event_resource(google)
+    event = google_event("event-id", "Dinner")
+    event["extendedProperties"] = {
+        "private": {
+            OWNERSHIP_MARKER_KEY: OWNERSHIP_MARKER_VALUE,
+            KIND_MARKER_KEY: FIXED_EVENT_KIND,
+        }
+    }
+    events.get.return_value = Request(event)
+    service = connected_service(tmp_path, google)
+    service._kalendra_calendar_id = "stale"
+
+    result = await service.get_owned_event("event-id")
+
+    assert result["calendar_id"] == "recovered-kalendra"
+    assert events.get.call_args.kwargs["calendarId"] == "recovered-kalendra"
+    assert service.kalendra_id_path.read_text(encoding="utf-8").strip() == (
+        "recovered-kalendra"
+    )
+    events.list.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_get_owned_event_never_uses_primary_or_name_only_calendar(tmp_path: Path):
+    google = MagicMock()
+    calendar_list(
+        google,
+        {
+            None: {
+                "items": [
+                    {
+                        "id": "primary",
+                        "summary": "Kalendra",
+                        "primary": True,
+                        "description": CALENDAR_OWNERSHIP_MARKER,
+                    },
+                    {"id": "name-only", "summary": "Kalendra", "primary": False},
+                ]
+            }
+        },
+    )
+    calendars = MagicMock()
+    calendars.insert.return_value = Request(
+        {"id": "new-owned-kalendra", "primary": False}
+    )
+    google.calendars.return_value = calendars
+    events = event_resource(google)
+    event = google_event("event-id", "Dinner")
+    event["extendedProperties"] = {
+        "private": {
+            OWNERSHIP_MARKER_KEY: OWNERSHIP_MARKER_VALUE,
+            KIND_MARKER_KEY: FIXED_EVENT_KIND,
+        }
+    }
+    events.get.return_value = Request(event)
+    service = connected_service(tmp_path, google)
+
+    result = await service.get_owned_event("event-id")
+
+    assert result["calendar_id"] == "new-owned-kalendra"
+    assert events.get.call_args.kwargs["calendarId"] == "new-owned-kalendra"
+    events.list.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_get_owned_event_surfaces_not_found_plainly(tmp_path: Path):
+    google = MagicMock()
+    events = event_resource(google)
+    events.get.return_value = Request(
+        error=HttpError(
+            resp=SimpleNamespace(status=404, reason="not found"), content=b"missing"
+        )
+    )
+    service = connected_service(tmp_path, google)
+    service._kalendra_calendar_id = "kalendra-id"
+    service._kalendra_id_validated = True
+
+    with pytest.raises(CalendarError, match="event was not found"):
+        await service.get_owned_event("missing")
+
+
+@pytest.mark.asyncio
+async def test_get_owned_event_fails_closed_on_google_error(tmp_path: Path):
+    google = MagicMock()
+    events = event_resource(google)
+    events.get.return_value = Request(
+        error=HttpError(
+            resp=SimpleNamespace(status=500, reason="server error"), content=b"failed"
+        )
+    )
+    service = connected_service(tmp_path, google)
+    service._kalendra_calendar_id = "kalendra-id"
+    service._kalendra_id_validated = True
+
+    with pytest.raises(CalendarError, match="Could not retrieve"):
+        await service.get_owned_event("event-id")
+
+
+@pytest.mark.asyncio
+async def test_get_owned_event_rejects_same_id_without_owned_marker(tmp_path: Path):
+    google = MagicMock()
+    events = event_resource(google)
+    # Event ids are interpreted only inside the exact Kalendra calendar.  A
+    # same-named event from another calendar is never discovered or accepted.
+    events.get.return_value = Request(google_event("collision", "External copy"))
+    service = connected_service(tmp_path, google)
+    service._kalendra_calendar_id = "kalendra-id"
+    service._kalendra_id_validated = True
+
+    with pytest.raises(CalendarError, match="not owned by Kalendra"):
+        await service.get_owned_event("collision")
+
+    assert events.get.call_args.kwargs["calendarId"] == "kalendra-id"
+    events.list.assert_not_called()
+    google.calendarList.return_value.list.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_list_events_cache_is_60_seconds_and_returns_defensive_copies(
     tmp_path: Path,
 ):
@@ -670,6 +885,83 @@ async def test_first_create_makes_secondary_calendar_persists_id_and_never_write
 
 
 @pytest.mark.asyncio
+async def test_create_event_writes_explicit_google_event_color(tmp_path: Path):
+    google = MagicMock()
+    calendar_list(google, {None: {"items": [owned_calendar()]}})
+    events = event_resource(google)
+    events.insert.side_effect = lambda **kwargs: Request(
+        {"id": "colored-event", **kwargs["body"]}
+    )
+    service = connected_service(tmp_path, google)
+
+    created = await service.create_event(
+        {
+            "title": "CS311 discussion",
+            "start_time": RANGE_START,
+            "end_time": RANGE_END,
+            "color_id": "6",
+        },
+        "the user requested this fixed-time event",
+    )
+
+    assert events.insert.call_args.kwargs["body"]["colorId"] == "6"
+    assert created["color_id"] == "6"
+
+
+@pytest.mark.asyncio
+async def test_create_event_null_color_uses_deterministic_category_default(
+    tmp_path: Path,
+):
+    google = MagicMock()
+    calendar_list(google, {None: {"items": [owned_calendar()]}})
+    events = event_resource(google)
+    events.insert.side_effect = lambda **kwargs: Request(
+        {"id": "default-colored-event", **kwargs["body"]}
+    )
+    service = connected_service(tmp_path, google)
+
+    created = await service.create_event(
+        {
+            "title": "CS311 discussion",
+            "start_time": RANGE_START,
+            "end_time": RANGE_END,
+            "category": "school",
+            "color_id": None,
+        },
+        "the user requested this fixed-time event",
+    )
+
+    expected = CATEGORY_COLOR_IDS["school"]
+    assert events.insert.call_args.kwargs["body"]["colorId"] == expected
+    assert created["color_id"] == expected
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("invalid_color", ["0", "12", " 5 ", 5])
+async def test_create_rejects_invalid_event_color_before_google_mutation(
+    tmp_path: Path, invalid_color: object
+):
+    google = MagicMock()
+    events = event_resource(google)
+    service = connected_service(tmp_path, google)
+
+    with pytest.raises(ValueError, match="event color id string"):
+        await service.create_event(
+            {
+                "title": "Invalid color",
+                "start_time": RANGE_START,
+                "end_time": RANGE_END,
+                "color_id": invalid_color,
+            },
+            "the user requested this fixed-time event",
+        )
+
+    google.calendarList.return_value.list.assert_not_called()
+    google.calendars.return_value.insert.assert_not_called()
+    events.insert.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_persisted_owned_calendar_is_reused_without_creating_another(tmp_path: Path):
     token = tmp_path / "token.json"
     id_path = token.with_name(f"{token.name}.kalendra-calendar-id")
@@ -724,6 +1016,99 @@ async def test_update_and_delete_target_only_marked_kalendra_events(tmp_path: Pa
     assert "Scheduling rationale: moved after the lecture" in patch_call.kwargs["body"]["description"]
     delete_call = events.delete.call_args
     assert delete_call.kwargs == {"calendarId": "kalendra-id", "eventId": "block"}
+
+
+@pytest.mark.asyncio
+async def test_update_event_patches_explicit_color_and_returns_it(tmp_path: Path):
+    google = MagicMock()
+    calendar_list(google, {None: {"items": [owned_calendar()]}})
+    events = event_resource(google)
+    current = google_event("fixed", "Dinner", marked=True)
+    current["colorId"] = "2"
+    current["extendedProperties"] = {
+        "private": {
+            OWNERSHIP_MARKER_KEY: OWNERSHIP_MARKER_VALUE,
+            KIND_MARKER_KEY: FIXED_EVENT_KIND,
+        }
+    }
+    events.get.return_value = Request(current)
+    events.patch.side_effect = lambda **kwargs: Request(
+        {**current, **kwargs["body"], "id": kwargs["eventId"]}
+    )
+    service = connected_service(tmp_path, google)
+
+    updated = await service.update_event("fixed", {"color_id": "4"})
+
+    assert events.patch.call_args.kwargs["body"] == {"colorId": "4"}
+    assert updated["color_id"] == "4"
+
+
+@pytest.mark.asyncio
+async def test_update_event_null_color_clears_override_to_inherit_calendar_color(
+    tmp_path: Path,
+):
+    google = MagicMock()
+    calendar_list(google, {None: {"items": [owned_calendar()]}})
+    events = event_resource(google)
+    current = google_event("fixed", "Dinner", marked=True)
+    current["colorId"] = "2"
+    current["extendedProperties"] = {
+        "private": {
+            OWNERSHIP_MARKER_KEY: OWNERSHIP_MARKER_VALUE,
+            KIND_MARKER_KEY: FIXED_EVENT_KIND,
+        }
+    }
+    events.get.return_value = Request(current)
+    events.patch.side_effect = lambda **kwargs: Request(
+        {**current, **kwargs["body"], "id": kwargs["eventId"]}
+    )
+    service = connected_service(tmp_path, google)
+
+    updated = await service.update_event("fixed", {"color_id": None})
+
+    assert events.patch.call_args.kwargs["body"] == {"colorId": None}
+    assert updated["color_id"] is None
+
+
+@pytest.mark.asyncio
+async def test_title_only_update_preserves_existing_explicit_color(tmp_path: Path):
+    google = MagicMock()
+    calendar_list(google, {None: {"items": [owned_calendar()]}})
+    events = event_resource(google)
+    current = google_event("fixed", "Dinner", marked=True)
+    current["colorId"] = "3"
+    current["extendedProperties"] = {
+        "private": {
+            OWNERSHIP_MARKER_KEY: OWNERSHIP_MARKER_VALUE,
+            KIND_MARKER_KEY: FIXED_EVENT_KIND,
+        }
+    }
+    events.get.return_value = Request(current)
+    events.patch.side_effect = lambda **kwargs: Request(
+        {**current, **kwargs["body"], "id": kwargs["eventId"]}
+    )
+    service = connected_service(tmp_path, google)
+
+    updated = await service.update_event("fixed", {"title": "Late dinner"})
+
+    assert events.patch.call_args.kwargs["body"] == {"summary": "Late dinner"}
+    assert updated["color_id"] == "3"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("invalid_color", ["0", "12", " 5 ", 5])
+async def test_update_rejects_invalid_event_color_before_google_request(
+    tmp_path: Path, invalid_color: object
+):
+    google = MagicMock()
+    events = event_resource(google)
+    service = connected_service(tmp_path, google)
+
+    with pytest.raises(ValueError, match="event color id string"):
+        await service.update_event("fixed", {"color_id": invalid_color})
+
+    events.get.assert_not_called()
+    events.patch.assert_not_called()
 
 
 @pytest.mark.asyncio

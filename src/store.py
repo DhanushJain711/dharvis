@@ -40,9 +40,9 @@ _TASK_CLEARABLE = {
 }
 _EVENT_FIELDS = {
     "title", "description", "start_time", "end_time", "location", "category",
-    "source", "gcal_event_id",
+    "source", "gcal_event_id", "color_id",
 }
-_EVENT_CLEARABLE = {"description", "location", "category"}
+_EVENT_CLEARABLE = {"description", "location", "category", "color_id"}
 _REMINDER_FIELDS = {"message", "remind_at"}
 _FACT_FIELDS = {
     "content", "category", "confidence", "source", "evidence_count",
@@ -83,6 +83,7 @@ _SERIES_STOP_WORDS = {
 }
 _ORDINAL_RE = re.compile(r"^\d+(?:st|nd|rd|th)?$")
 _NUMBERED_TOKEN_RE = re.compile(r"^([a-z]+)[-_#]?\d+$")
+_GOOGLE_EVENT_COLOR_IDS = {str(value) for value in range(1, 12)}
 
 
 def _utc_text(value: datetime, name: str = "datetime") -> str:
@@ -246,6 +247,9 @@ def _db_value(field: str, value: Any) -> Any:
         return json.dumps(value, separators=(",", ":"), ensure_ascii=False)
     if field in _BOOL_FIELDS:
         return int(bool(value))
+    if field == "color_id":
+        if not isinstance(value, str) or value not in _GOOGLE_EVENT_COLOR_IDS:
+            raise ValueError("color_id must be a string from '1' through '11'")
     return value
 
 
@@ -389,6 +393,8 @@ class Store:
                     if end <= start:
                         raise ValueError("event end must be later than start")
                     payload["start_time"], payload["end_time"] = start, end
+                    if payload.get("color_id") is not None:
+                        payload["color_id"] = _db_value("color_id", payload["color_id"])
                     values = {key: value for key, value in payload.items() if value is not None}
                     fields = list(values)
                     cursor = await db.execute(

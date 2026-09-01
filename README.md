@@ -16,7 +16,7 @@ canonical database schema.
 - **One-time Reminders**: Store quick nudges separately and send them through Telegram at the requested time without occupying Google Calendar
 - **Safe Event Management**: Conflicting fixed events are warned about first and require an explicit later confirmation before they are created or changed
 - **Goal Sessions**: Scheduling-enabled weekly/monthly goals materialize paced, task-backed work sessions and reschedule missed automatic sessions
-- **Google Calendar Integration**: Reads visible calendars for availability and briefs; writes only owned `Kalendra` events with consistent category/kind colors
+- **Google Calendar Integration**: Reads visible calendars for availability and briefs; writes only owned `Kalendra` events with consistent category/kind colors and optional event-specific colors
 - **Daily Briefings**: Get summaries of local commitments, external Google events, due tasks, scheduled work, goal pace, and pending reminders through the next two local days
 - **Learning From Outcomes**: Reuse observed durations only for matching completed task families; explicit estimates always take precedence
 
@@ -99,7 +99,17 @@ need to email professor by end of week
 coffee with Jake tomorrow 3pm
 meeting with advisor friday 2pm at office
 dinner saturday 7pm at Olive Garden
+make the dentist event orange
+add office hours Friday at 11, same color as my CS311 lecture
 ```
+
+Bot-owned events can use Google's event palette: lavender, sage, grape,
+flamingo, banana, tangerine, peacock, graphite, blueberry, basil, or tomato
+(event color IDs `1`–`11`). Clearing an event color makes it inherit the
+Kalendra calendar color. Events read from primary or external calendars remain
+read-only. A reference event with no event-level override merely inherits its
+source calendar's color; calendar and event color IDs use different palettes,
+so that inherited color cannot always be reproduced exactly on Kalendra.
 
 ### Setting Reminders
 

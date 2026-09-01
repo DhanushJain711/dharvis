@@ -46,7 +46,53 @@ async def test_migrates_legacy_tasks_and_events_without_data_loss(tmp_path: Path
         "2026-08-27T16:00:00+00:00",
         "bot",
     )
+    assert db.execute("SELECT color_id FROM events WHERE id = 9").fetchone() == (None,)
+    assert db.execute("PRAGMA user_version").fetchone() == (5,)
     assert not db.execute("PRAGMA foreign_key_check").fetchall()
+
+
+@pytest.mark.asyncio
+async def test_adds_event_color_to_v4_database_without_data_loss(tmp_path: Path) -> None:
+    path = tmp_path / "v4.db"
+    db = sqlite3.connect(path)
+    db.executescript(
+        """
+        CREATE TABLE events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            title TEXT NOT NULL,
+            description TEXT,
+            start_time TEXT NOT NULL,
+            end_time TEXT NOT NULL,
+            location TEXT,
+            category TEXT,
+            source TEXT NOT NULL DEFAULT 'bot',
+            gcal_event_id TEXT,
+            created_at TEXT NOT NULL
+        );
+        INSERT INTO events (
+            id, title, start_time, end_time, category, source, gcal_event_id, created_at
+        ) VALUES (
+            12, 'Existing event', '2026-09-02T14:00:00Z', '2026-09-02T15:00:00Z',
+            'school', 'bot', 'google-12', '2026-09-01T12:00:00Z'
+        );
+        PRAGMA user_version = 4;
+        """
+    )
+    db.close()
+
+    await run_migrations(path)
+
+    db = sqlite3.connect(path)
+    assert db.execute("PRAGMA user_version").fetchone() == (5,)
+    assert db.execute(
+        """SELECT id, title, category, gcal_event_id, color_id
+           FROM events WHERE id = 12"""
+    ).fetchone() == (12, "Existing event", "school", "google-12", None)
+    db.execute("UPDATE events SET color_id = '6' WHERE id = 12")
+    assert db.execute("SELECT color_id FROM events WHERE id = 12").fetchone() == ("6",)
+    for invalid in ("0", "12", "blue", ""):
+        with pytest.raises(sqlite3.IntegrityError):
+            db.execute("UPDATE events SET color_id = ? WHERE id = 12", (invalid,))
 
 
 @pytest.mark.asyncio

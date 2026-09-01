@@ -28,7 +28,8 @@ SAFE_EXTRA_TOOLS = {
 
 
 class RecordingTools:
-    def __init__(self) -> None:
+    def __init__(self, case_id: str = "") -> None:
+        self.case_id = case_id
         self.calls: list[str] = []
         self.call_details: list[dict[str, Any]] = []
         self.next_id = 100
@@ -56,6 +57,37 @@ class RecordingTools:
         if name == "query_tasks":
             return [{"id": 12, "title": "pset report", "status": "pending", "estimated_minutes": 90}]
         if name == "query_schedule":
+            if self.case_id == "color_match_reference":
+                return [{
+                    "source": "gcal", "source_id": "cs311", "title": "CS311 lecture",
+                    "start": "2026-09-03T20:30:00Z", "end": "2026-09-03T22:00:00Z",
+                    "metadata": {"color_id": "6", "calendar_color_id": "9"},
+                }]
+            if self.case_id == "color_inherited_reference":
+                return [{
+                    "source": "gcal", "source_id": "canvas", "title": "CS311 lecture",
+                    "start": "2026-09-03T20:30:00Z", "end": "2026-09-03T22:00:00Z",
+                    "metadata": {"color_id": None, "calendar_color_id": "9"},
+                }]
+            if self.case_id == "color_conflicting_references":
+                return [
+                    {
+                        "source": "gcal", "source_id": "cs311-a", "title": "CS311 lecture",
+                        "start": "2026-09-03T20:30:00Z", "end": "2026-09-03T22:00:00Z",
+                        "metadata": {"color_id": "6", "calendar_color_id": "9"},
+                    },
+                    {
+                        "source": "gcal", "source_id": "cs311-b", "title": "CS311 review",
+                        "start": "2026-09-04T20:30:00Z", "end": "2026-09-04T22:00:00Z",
+                        "metadata": {"color_id": "3", "calendar_color_id": "9"},
+                    },
+                ]
+            if self.case_id == "color_external_refusal":
+                return [{
+                    "source": "gcal", "source_id": "canvas", "title": "Canvas lecture",
+                    "start": "2026-09-03T20:30:00Z", "end": "2026-09-03T22:00:00Z",
+                    "metadata": {"color_id": "6", "calendar_access_role": "reader"},
+                }]
             return [{"source": "event", "source_id": "21", "title": "dentist", "start": "2026-08-28T19:00:00Z", "end": "2026-08-28T20:00:00Z"}]
         if name == "find_free_blocks":
             return [{
@@ -98,7 +130,7 @@ async def run_case(case: dict[str, Any], root: Path) -> dict[str, Any]:
     store = Store(root / f"{case['id']}.sqlite")
     await store.initialize()
     history = History(store)
-    recorder = RecordingTools()
+    recorder = RecordingTools(case["id"])
     agent = Agent(history, tool_handlers=recorder.handlers())
     conversation = f"eval-{case['id']}"
     session, _ = await history.resolve_session(conversation)

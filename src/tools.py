@@ -9,6 +9,17 @@ ToolSchema = dict[str, Any]
 
 CATEGORIES = ["school", "work", "personal", "fitness", "career", "errand"]
 TASK_STATUSES = ["pending", "scheduled", "completed", "dropped"]
+EVENT_COLOR_IDS = [str(value) for value in range(1, 12)]
+EVENT_COLOR_DESCRIPTION = (
+    "Google Calendar event-level color override: 1 lavender, 2 sage, "
+    "3 grape/purple, 4 flamingo/pink, 5 banana/yellow, "
+    "6 tangerine/orange, 7 peacock/teal, 8 graphite/gray, "
+    "9 blueberry/blue, 10 basil/green, or 11 tomato/red. "
+    "Use null for Dharvis's deterministic category/kind default. When matching "
+    "a reference returned by query_schedule, copy only metadata.color_id; never "
+    "copy metadata.calendar_color_id because calendar and event color IDs are "
+    "different namespaces."
+)
 
 
 def _object(properties: dict[str, JsonSchema]) -> JsonSchema:
@@ -62,6 +73,11 @@ _event_input = _object(
         "end": {"type": "string", "description": "Event end as an aware UTC ISO-8601 datetime later than start."},
         "location": _nullable("string", "Physical or virtual location, or null when unspecified."),
         "category": _nullable("string", "Optional life-area category.", enum=CATEGORIES + [None]),
+        "color_id": _nullable(
+            "string",
+            EVENT_COLOR_DESCRIPTION,
+            enum=EVENT_COLOR_IDS + [None],
+        ),
     }
 )
 
@@ -88,7 +104,7 @@ TOOLS: list[ToolSchema] = [
     ),
     _tool(
         "add_event",
-        "Propose or create one or more fixed-time calendar events. Use this for appointments or commitments with known start and end times, not flexible work. Send all events from one user message in one call. The handler checks the merged calendar first: if anything overlaps, it creates nothing and returns confirmation_required with a proposal_id. Warn the user and wait for a later user message; never call confirm_event_change in the same turn.",
+        "Propose or create one or more fixed-time calendar events. Use this for appointments or commitments with known start and end times, not flexible work. Send all events from one user message in one call. An optional color_id sets the Google event's own color, independently of the Kalendra calendar color. The handler checks the merged calendar first: if anything overlaps, it creates nothing and returns confirmation_required with a proposal_id. Warn the user and wait for a later user message; never call confirm_event_change in the same turn.",
         {"events": {"type": "array", "description": "Every event to create.", "items": _event_input, "minItems": 1}},
     ),
     _tool(
@@ -115,7 +131,7 @@ TOOLS: list[ToolSchema] = [
     ),
     _tool(
         "update_event",
-        "Propose or change a bot-created event identified by its integer local event id. Query the schedule first when the id is ambiguous. External Google events are read-only. The handler checks the merged calendar first: an overlap changes nothing and returns confirmation_required with a proposal_id. Warn the user and wait for a later user message; never call confirm_event_change in the same turn. Null field values mean unchanged; nullable fields are cleared only by naming them in clear_fields.",
+        "Propose or change a bot-created event identified by its integer local event id. Query the schedule first when the id is ambiguous. External Google events are read-only, though their event-level metadata.color_id may be copied onto a bot-created event. The handler checks time changes against the merged calendar first: an overlap changes nothing and returns confirmation_required with a proposal_id. Warn the user and wait for a later user message; never call confirm_event_change in the same turn. Null field values mean unchanged; nullable fields are cleared only by naming them in clear_fields. A color-only update does not change availability.",
         {
             "event_id": {"type": "integer", "minimum": 1, "description": "Exact local event id."},
             "title": _nullable("string", "Replacement title, or null to leave unchanged."),
@@ -124,10 +140,18 @@ TOOLS: list[ToolSchema] = [
             "end": _nullable("string", "Replacement aware UTC end, or null to leave unchanged."),
             "location": _nullable("string", "Replacement location, or null to leave unchanged."),
             "category": _nullable("string", "Replacement category, or null to leave unchanged."),
+            "color_id": _nullable(
+                "string",
+                EVENT_COLOR_DESCRIPTION.replace(
+                    "Use null for Dharvis's deterministic category/kind default.",
+                    "Use null to leave the current color unchanged; put color_id in clear_fields to remove the event-level override and inherit the Kalendra calendar default.",
+                ),
+                enum=EVENT_COLOR_IDS + [None],
+            ),
             "clear_fields": {
                 "type": "array",
-                "items": {"type": "string", "enum": ["description", "location", "category"]},
-                "description": "Nullable fields to set to null. Use an empty array when clearing nothing, and leave each named field's value null.",
+                "items": {"type": "string", "enum": ["description", "location", "category", "color_id"]},
+                "description": "Nullable fields to set to null. Clearing color_id removes the event-level override so the event inherits the Kalendra calendar default. Use an empty array when clearing nothing, and leave each named field's value null.",
             },
         },
     ),
@@ -154,7 +178,7 @@ TOOLS: list[ToolSchema] = [
     _tool("delete_event", "Delete a bot-created event only when the user explicitly cancels it. Query first if the integer local id is uncertain; external Google events are read-only.", {"event_id": {"type": "integer", "minimum": 1, "description": "Exact local event id to delete."}}),
     _tool(
         "query_schedule",
-        "Read the merged schedule of Google Calendar events, local events, and scheduled task work blocks over a UTC range. Use before answering availability or calendar questions.",
+        "Read the merged schedule of Google Calendar events, local events, and scheduled task work blocks over a UTC range. Use before answering availability or calendar questions and before matching another event's color. metadata.color_id is the event-level override that may be copied when non-null and consistent; metadata.calendar_color_id is only the source calendar's appearance and must never be passed to an event mutation.",
         {
             "start": {"type": "string", "description": "Inclusive aware UTC ISO-8601 range start."},
             "end": {"type": "string", "description": "Exclusive aware UTC ISO-8601 range end."},

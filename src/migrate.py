@@ -24,6 +24,12 @@ _EVENT_COLUMNS = {
 }
 
 _ADDITIVE_COLUMNS: dict[str, dict[str, str]] = {
+    "events": {
+        "color_id": (
+            "TEXT CHECK (color_id IS NULL OR "
+            "color_id IN ('1', '2', '3', '4', '5', '6', '7', '8', '9', '10', '11'))"
+        ),
+    },
     "tasks": {
         "series_key": "TEXT",
         "estimate_source": (
@@ -197,9 +203,12 @@ async def run_migrations(db_path: str | Path | None = None) -> None:
             for table, definitions in _ADDITIVE_COLUMNS.items():
                 if not await _table_exists(db, table):
                     continue
-                # A legacy tasks table is rebuilt below; adding its new columns
-                # before the rename would only do disposable work.
-                if table == "tasks" and tasks_legacy:
+                # Legacy core tables are rebuilt below; adding their new columns
+                # after the queued rename would target a table that no longer
+                # exists under its canonical name.
+                if (table == "tasks" and tasks_legacy) or (
+                    table == "events" and events_legacy
+                ):
                     continue
                 existing = await _table_columns(db, table)
                 for column, definition in definitions.items():
@@ -217,7 +226,7 @@ async def run_migrations(db_path: str | Path | None = None) -> None:
             if conversations_legacy:
                 await _copy_legacy_conversations(db)
                 await db.execute("DROP TABLE conversation_context")
-            await db.execute("PRAGMA user_version = 4")
+            await db.execute("PRAGMA user_version = 5")
             violations = await (await db.execute("PRAGMA foreign_key_check")).fetchall()
             if violations:
                 raise RuntimeError(f"foreign key violations after migration: {violations!r}")

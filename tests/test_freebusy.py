@@ -368,6 +368,54 @@ async def test_query_schedule_deduplicates_task_backed_google_work_block():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("live_color_id", ["6", None])
+async def test_query_schedule_prefers_live_google_color_metadata_for_local_event(
+    live_color_id,
+):
+    calendar = AsyncMock()
+    calendar._last_query_complete = True
+    calendar.list_events.return_value = [
+        {
+            "id": "gcal-event",
+            "gcal_event_id": "gcal-event",
+            "title": "CS311 discussion",
+            "start_time": utc(14).isoformat(),
+            "end_time": utc(15).isoformat(),
+            "color_id": live_color_id,
+            "calendar_id": "kalendra-id",
+            "calendar_summary": "Kalendra",
+            "calendar_primary": False,
+            "calendar_access_role": "owner",
+            "calendar_color_id": "9",
+            "calendar_background_color": "#9fe1e7",
+            "calendar_foreground_color": "#000000",
+        }
+    ]
+    store = AsyncMock()
+    store.query_events.return_value = [
+        {
+            "id": 22,
+            "gcal_event_id": "gcal-event",
+            "title": "CS311 discussion",
+            "start_time": utc(14),
+            "end_time": utc(15),
+            "color_id": "11",
+        }
+    ]
+    store.query_tasks.return_value = []
+
+    blocks = await query_schedule(store, calendar, utc(9), utc(18))
+
+    assert len(blocks) == 1
+    assert blocks[0].source == "event"
+    assert blocks[0].source_id == "22"
+    assert blocks[0].metadata["color_id"] == live_color_id
+    assert blocks[0].metadata["calendar_id"] == "kalendra-id"
+    assert blocks[0].metadata["calendar_color_id"] == "9"
+    assert blocks[0].metadata["calendar_background_color"] == "#9fe1e7"
+
+
+@pytest.mark.asyncio
 async def test_query_schedule_forwards_force_refresh_to_calendar():
     calendar = AsyncMock()
     calendar._last_query_complete = True

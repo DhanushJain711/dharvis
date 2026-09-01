@@ -4,7 +4,7 @@ Dharvis is a stateful Telegram personal assistant for one authorized user. It tu
 
 ## Mental model
 
-- An **event** is a fixed-time commitment such as a meeting or appointment.
+- An **event** is a fixed-time commitment such as a meeting or appointment. Bot-owned events may carry a Google event-level color override.
 - A **reminder** is a quick, one-time Telegram nudge at a requested instant. It is SQLite-only and never reserves calendar time.
 - A **task** is flexible work with a deadline, estimated duration, category, energy mode, and priority.
 - A **work block** is a task's scheduled interval on the dedicated Google Calendar named `Kalendra`.
@@ -12,7 +12,7 @@ Dharvis is a stateful Telegram personal assistant for one authorized user. It tu
 - A **fact** is a durable preference or observed behavior, such as “deep work usually happens before lunch.”
 - A **goal** is a weekly or monthly target measured in hours or sessions. Tasks can be linked to goals.
 
-The bot reads all visible Google calendars for availability and briefs, but it writes only marked events on its application-owned `Kalendra` secondary calendar. It never edits arbitrary events on the primary calendar.
+The bot reads all visible Google calendars for availability and briefs, but it writes only marked events on its application-owned `Kalendra` secondary calendar. It never edits arbitrary events on the primary or other external calendars. Owned events accept Google event color IDs `1` through `11` (lavender, sage, grape, flamingo, banana, tangerine, peacock, graphite, blueberry, basil, and tomato); clearing an override makes the event inherit Kalendra's calendar color.
 
 ## Runtime flow
 
@@ -101,7 +101,7 @@ override is intentionally configured. Azure App Service uses `DATA_DIR=/home/dat
 - Event-to-event conflicts are not automatically resolved. Fixed events remain fixed; only overlapping task work blocks are replanned.
 - Reminders remain separate from tasks, events, Google Calendar, free/busy, and the scheduler. Their only side effect is the requested Telegram delivery.
 - Scheduling-enabled goals materialize idempotent task-backed sessions for their outstanding weekly or monthly quota. Sessions are paced across remaining days, missed automatic sessions are rescheduled, and manual goal-session placements are preserved.
-- Calendar ownership is explicit (`kalendra_owned=v1`) and event kind is canonical hyphenated metadata: `fixed-event`, `task-block`, or `goal-session`. Deterministic category/kind Google colors distinguish these entries while preserving a user-selected nondefault color.
+- Calendar ownership is explicit (`kalendra_owned=v1`) and event kind is canonical hyphenated metadata: `fixed-event`, `task-block`, or `goal-session`. Deterministic category/kind Google event colors distinguish these entries while preserving a user-selected nondefault color. Event-level `color_id` and source-calendar `calendar_color_id` belong to different Google palettes: only a non-null event-level override can be copied exactly. A null reference color means the event inherits an external calendar color that Kalendra may not reproduce exactly, so the assistant asks for a named event color instead of copying the calendar ID.
 - The scheduler sees durable facts and goal progress, not raw chat history. Interactive agent behavior sees recent conversation history separately.
 
 ## Sources of truth

@@ -12,6 +12,7 @@ Fact = dict[str, Any]
 ToolSchema = dict[str, Any]
 TaskStatus = Literal["pending", "scheduled", "completed", "dropped"]
 ReminderStatus = Literal["pending", "delivered", "cancelled"]
+EventColorId = Literal["1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11"]
 DecisionAction = Literal["scheduled", "moved", "unscheduled", "shortened", "extended"]
 Trigger = Literal["daily_plan", "conflict", "user_request", "deadline_shift", "goal_quota"]
 ProgressSource = Literal["task", "manual", "inferred"]
@@ -99,7 +100,7 @@ add_goal             log_goal_progress      query_goals
 resolve_date
 ```
 
-`schedule_task.reasoning` is required and is a one-sentence explanation recorded at decision time. Its handler must call `Store.apply_schedule_decision` so placement and rationale commit atomically. `add_task`, `add_event`, and `add_reminder` accept arrays. Reminders are one-time Telegram nudges stored only in SQLite: their tools never call Google Calendar, free/busy, or the scheduler. Tasks include a nullable `series_key`, which groups recurring work for deterministic duration inference; an explicit `estimated_minutes` wins over inferred evidence and the configured default. Conflicting fixed-event changes return a one-time proposal and require `confirm_event_change` in a later user turn. Strict update schemas require every field: `null` means unchanged, while nullable values are cleared only through the required `clear_fields` array (`[]` means clear nothing).
+`schedule_task.reasoning` is required and is a one-sentence explanation recorded at decision time. Its handler must call `Store.apply_schedule_decision` so placement and rationale commit atomically. `add_task`, `add_event`, and `add_reminder` accept arrays. Reminders are one-time Telegram nudges stored only in SQLite: their tools never call Google Calendar, free/busy, or the scheduler. Tasks include a nullable `series_key`, which groups recurring work for deterministic duration inference; an explicit `estimated_minutes` wins over inferred evidence and the configured default. Conflicting fixed-event changes return a one-time proposal and require `confirm_event_change` in a later user turn. Strict update schemas require every field: `null` means unchanged, while nullable values are cleared only through the required `clear_fields` array (`[]` means clear nothing). `add_event.color_id` and `update_event.color_id` accept only Google event color ID strings `1` through `11`: lavender, sage, grape, flamingo, banana, tangerine, peacock, graphite, blueberry, basil, and tomato. A null add color uses Dharvis's deterministic category/kind default; a null update color is unchanged unless `color_id` is listed in `clear_fields`, which removes the override so the event inherits Kalendra's calendar color. External events are read-only.
 
 ## Schema migration (`src.migrate`)
 
@@ -109,7 +110,7 @@ main() -> None
 ```
 
 `src/schema.sql` is the only canonical schema file. Later agents must not add migration files.
-The current canonical schema version is 4; it adds the durable `reminders` lifecycle and delivery-lease fields.
+The current canonical schema version is 5; it adds nullable `events.color_id`, constrained to Google event color ID strings `1` through `11`. A null stored value means there is no event-level override and the event inherits its calendar's color.
 The migration runner alone accepts naive timestamps from the retired database and interprets them in `USER_TIMEZONE` before converting to UTC. Runtime APIs reject naive datetimes; this recovery policy must not be copied into new writes.
 
 ## Store (`src.store`)
@@ -189,6 +190,7 @@ CalendarService.get_events_between(start: datetime, end: datetime, *, force_refr
 CalendarService.get_today_events() -> list[CalendarRecord]  # async
 CalendarService.get_upcoming_events(days: int = 7) -> list[CalendarRecord]  # async
 CalendarService.check_availability(start: datetime, end: datetime) -> bool  # async
+CalendarService.get_owned_event(gcal_event_id: str) -> CalendarRecord  # async
 CalendarService.create_event(event: CalendarRecord, reasoning: str | None = None, *, category: str | None = None, kind: str = "fixed-event") -> CalendarRecord  # async
 CalendarService.update_event(gcal_event_id: str, changes: CalendarRecord, *, category: str | None = None, kind: str | None = None) -> CalendarRecord  # async
 CalendarService.delete_event(gcal_event_id: str) -> None  # async
@@ -198,9 +200,10 @@ CalendarService.update_work_block(gcal_event_id: str, title: str, start: datetim
 CalendarService.delete_work_block(gcal_event_id: str) -> None  # async
 run_oauth_flow(credentials_path: Path | None = None, token_path: Path | None = None) -> bool
 create_calendar_service() -> CalendarService  # async
+normalize_event_color_id(value: Any) -> str
 ```
 
-OAuth uses the read/write Calendar scope. Reads cover every visible calendar and cache complete results in memory for 60 seconds; `force_refresh=True` bypasses that cache for write-adjacent safety checks. Returned Google records retain visible-calendar metadata (summary, primary/access role, and colors). Writes are restricted to marked, application-owned events on a dedicated secondary calendar named `Kalendra`; its ID is persisted beside the OAuth token, and primary-calendar events are never mutated. New owned events carry `kalendra_owned=v1` and canonical `kalendra_kind` values `fixed-event`, `task-block`, or `goal-session` (the legacy work-block marker remains readable). Category and kind select deterministic Google color IDs unless the user supplied a valid color; a manual nondefault color survives later metadata updates. Creating a block requires a nonblank rationale, supplied as `reasoning` or `event["reasoning"]`, which is rendered in the Google event description. `clear_kalendra_range` and `delete_work_block` delete only owned movable task/goal blocks, never fixed events; remote 404 deletion is retry-safe. Credential refresh is transparent; absent, invalid, rejected, or unrefreshable credentials raise `CalendarReconnectRequiredError` so callers can request reconnection.
+OAuth uses the read/write Calendar scope. Reads cover every visible calendar and cache complete results in memory for 60 seconds; `force_refresh=True` bypasses that cache for write-adjacent safety checks. Returned Google records retain visible-calendar metadata (summary, primary/access role, and colors). Writes are restricted to marked, application-owned events on a dedicated secondary calendar named `Kalendra`; its ID is persisted beside the OAuth token, and primary-calendar and other external events are read-only. `get_owned_event` performs an exact-ID read from that owned calendar, verifies the ownership marker, and returns the normalized record; it never searches external calendars or depends on a time range. New owned events carry `kalendra_owned=v1` and canonical `kalendra_kind` values `fixed-event`, `task-block`, or `goal-session` (the legacy work-block marker remains readable). Category and kind select a deterministic event-level color unless the user supplies an event color ID from `1` through `11`; setting one updates the Google event override, while explicitly clearing it sends null and restores inheritance from Kalendra's calendar color. A manual nondefault event color survives later metadata updates. Google event colors (`color_id`) and calendar colors (`calendar_color_id`) are different palette namespaces: only a non-null event-level ID can be copied exactly from a reference. A reference with null `color_id` inherits its source calendar's color, which may not have an exact event-palette equivalent, so callers must ask for a named event color rather than copying the calendar ID. Creating a block requires a nonblank rationale, supplied as `reasoning` or `event["reasoning"]`, which is rendered in the Google event description. `clear_kalendra_range` and `delete_work_block` delete only owned movable task/goal blocks, never fixed events; remote 404 deletion is retry-safe. Credential refresh is transparent; absent, invalid, rejected, or unrefreshable credentials raise `CalendarReconnectRequiredError` so callers can request reconnection.
 
 Every returned `start_time` and `end_time` is UTC-aware ISO-8601 text. Google `dateTime` offsets are converted to UTC; all-day `date` values become the UTC instants for local midnight boundaries. Returned occupied events always have positive duration. Explicit Google entries whose normalized start and end instants are equal are omitted as non-occupying without making the read incomplete; reversed or missing endpoints, structurally invalid or non-object entries, and HTTP or inaccessible-calendar failures still make the read incomplete and preserve fail-closed behavior.
 
