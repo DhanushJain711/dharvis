@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import copy
-from contextlib import suppress
+from contextlib import asynccontextmanager, suppress
 from datetime import datetime, timedelta, timezone
 import hashlib
 import io
@@ -18,11 +18,12 @@ import re
 import secrets
 import tempfile
 import time
-from typing import Any
+from typing import Any, AsyncIterator
 
 from openai import AsyncOpenAI
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, InputFile, Update
 from telegram.constants import ChatAction, ChatType
+from telegram.error import BadRequest
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -104,6 +105,7 @@ class TelegramHandler:
         self._openai: AsyncOpenAI | None = None
         self._checklist_lock = asyncio.Lock()
         self._credits = _TokenBucket()
+        self._update_locks: dict[int, tuple[asyncio.Lock, int]] = {}
         self._checklist_path = Path(
             f"{config.DATABASE_PATH}.telegram-checklists.json"
         )
@@ -162,8 +164,57 @@ class TelegramHandler:
         if message is not None:
             await message.reply_text(
                 "text me naturally — I can manage tasks, events, goals, and scheduling. "
-                "Use /cost for today and month-to-date model usage."
+                "Use /times to change when I send the morning and evening check-ins, "
+                "or /cost for today and month-to-date model usage."
             )
+
+    async def times_command(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """Show or persist daily notification clocks in the user's timezone."""
+        if not self._authorize_update(update, "command"):
+            return
+        message = getattr(update, "message", None)
+        if message is None:
+            return
+        args = list(context.args or [])
+        usage = "use /times morning 08:30 or /times evening 21:00 — local 24-hour time"
+        if args and (
+            len(args) != 2
+            or args[0].lower() not in {"morning", "evening"}
+            or re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", args[1]) is None
+        ):
+            await message.reply_text(usage)
+            return
+        if self.store is None:
+            await message.reply_text("I can’t reach your saved settings right now. Try again shortly.")
+            return
+        try:
+            if args:
+                from .jobs import update_notification_times
+
+                settings = await update_notification_times(
+                    self.store, **{args[0].lower(): args[1]}
+                )
+            else:
+                settings = await self.store.get_notification_times()
+        except ValueError as exc:
+            await message.reply_text(f"{str(exc).rstrip('.')}. {usage}")
+            return
+        except Exception as exc:
+            self._log_failure("notification settings", exc)
+            await message.reply_text("I couldn’t save or read those times right now. Try again shortly.")
+            return
+
+        def clock(value: str) -> str:
+            hour, minute = (int(part) for part in value.split(":"))
+            return f"{hour % 12 or 12}:{minute:02d}{'am' if hour < 12 else 'pm'}"
+
+        text = (
+            f"morning at {clock(settings['morning'])}, evening at {clock(settings['evening'])} "
+            f"({config.USER_TIMEZONE})"
+        )
+        await message.reply_text(f"saved — {text}" if args else f"{text}\n{usage}")
 
     async def cost_command(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
@@ -212,35 +263,75 @@ class TelegramHandler:
             LOGGER.warning("Ignored authorized non-new-message Telegram update")
             return
         try:
-            if getattr(message, "voice", None) is not None:
-                await self._handle_voice(update, message)
-                return
-            if getattr(message, "photo", None):
-                await self._handle_photo(update, message)
-                return
-            document = getattr(message, "document", None)
-            if document is not None and document.mime_type == "application/pdf":
-                await self._handle_pdf(update, message)
-                return
-            text = getattr(message, "text", None)
-            if text and not text.startswith("/"):
-                if len(text) > _MAX_INPUT_TEXT:
-                    await message.reply_text("That message is too long for me to process.")
-                    return
-                await self._run_agent_for_update(update, message, text)
+            update_id = getattr(update, "update_id", None)
+            can_record = (
+                type(update_id) is int and update_id >= 0
+                and callable(getattr(self.store, "has_processed_update", None))
+                and callable(getattr(self.store, "mark_update_processed", None))
+            )
+            if can_record:
+                async with self._update_receipt_lock(update_id):
+                    if await self.store.has_processed_update(update_id):
+                        LOGGER.info("Skipped previously handled Telegram update_id=%s", update_id)
+                        return
+                    if await self._dispatch_message(update, message):
+                        try:
+                            await self.store.mark_update_processed(update_id)
+                        except Exception as exc:
+                            # The reply already arrived; a receipt outage must
+                            # not contradict a successful action with an error.
+                            self._log_failure("update receipt", exc)
+            else:
+                await self._dispatch_message(update, message)
         except Exception as exc:
             self._log_failure("message", exc)
             await self._reply_generic(message)
 
-    async def _handle_voice(self, update: Update, message: Any) -> None:
+    @asynccontextmanager
+    async def _update_receipt_lock(self, update_id: int) -> AsyncIterator[None]:
+        """Serialize same-process replays; retain locks only while in use.
+
+        Durable receipts suppress already answered updates across restarts. This
+        does not claim exactly-once tool effects if a process dies mid-turn.
+        """
+        lock, users = self._update_locks.get(update_id, (asyncio.Lock(), 0))
+        self._update_locks[update_id] = (lock, users + 1)
+        try:
+            async with lock:
+                yield
+        finally:
+            _, users = self._update_locks[update_id]
+            if users == 1:
+                self._update_locks.pop(update_id)
+            else:
+                self._update_locks[update_id] = (lock, users - 1)
+
+    async def _dispatch_message(self, update: Update, message: Any) -> bool:
+        """Return true only after a supported update has a delivered response."""
+        if getattr(message, "voice", None) is not None:
+            return await self._handle_voice(update, message)
+        if getattr(message, "photo", None):
+            return await self._handle_photo(update, message)
+        document = getattr(message, "document", None)
+        if document is not None and document.mime_type == "application/pdf":
+            return await self._handle_pdf(update, message)
+        text = getattr(message, "text", None)
+        if text and not text.startswith("/"):
+            if len(text) > _MAX_INPUT_TEXT:
+                await message.reply_text("That message is too long for me to process.")
+                return True
+            return await self._run_agent_for_update(update, message, text)
+        return False
+
+    async def _handle_voice(self, update: Update, message: Any) -> bool:
         voice = message.voice
         if self._file_too_large(voice, _MAX_VOICE_BYTES):
             await message.reply_text("That voice note is too large for me to process.")
-            return
+            return True
         # Reserve transcription and agent calls before downloading any bytes.
         if not await self._credits.consume(2):
             await message.reply_text(_RATE_LIMIT_MESSAGE)
-            return
+            return False
 
         stop_typing, typing_task = self._start_typing(update.effective_chat)
         try:
@@ -248,7 +339,7 @@ class TelegramHandler:
             audio = bytes(await telegram_file.download_as_bytearray())
             if len(audio) > _MAX_VOICE_BYTES:
                 await message.reply_text("That voice note is too large for me to process.")
-                return
+                return True
             transcript = await self._openai_client().audio.transcriptions.create(
                 model=_TRANSCRIPTION_MODEL,
                 file=("voice.ogg", audio, voice.mime_type or "audio/ogg"),
@@ -256,20 +347,21 @@ class TelegramHandler:
             text = transcript.text.strip()
             if not text:
                 await message.reply_text("I couldn’t hear any speech in that voice note.")
-                return
+                return True
             reply = await self._invoke_agent(text[:_MAX_INPUT_TEXT], self._session_id(update))
             await self._send_reply(message, reply)
+            return self._receipt_eligible(reply)
         finally:
             await self._stop_typing(stop_typing, typing_task)
 
-    async def _handle_photo(self, update: Update, message: Any) -> None:
+    async def _handle_photo(self, update: Update, message: Any) -> bool:
         photo = message.photo[-1]
         if self._file_too_large(photo, _MAX_PHOTO_BYTES):
             await message.reply_text("That image is too large for me to process.")
-            return
+            return True
         if not await self._credits.consume():
             await message.reply_text(_RATE_LIMIT_MESSAGE)
-            return
+            return False
 
         stop_typing, typing_task = self._start_typing(update.effective_chat)
         try:
@@ -277,7 +369,7 @@ class TelegramHandler:
             image = bytes(await telegram_file.download_as_bytearray())
             if len(image) > _MAX_PHOTO_BYTES:
                 await message.reply_text("That image is too large for me to process.")
-                return
+                return True
             transient_content = [
                 {
                     "type": "input_text",
@@ -297,19 +389,20 @@ class TelegramHandler:
                 transient_content, self._session_id(update)
             )
             await self._send_reply(message, reply)
+            return self._receipt_eligible(reply)
         finally:
             # The base64 payload remains local to this call and is never stored by
             # the Telegram layer or added to Telegram persistence.
             await self._stop_typing(stop_typing, typing_task)
 
-    async def _handle_pdf(self, update: Update, message: Any) -> None:
+    async def _handle_pdf(self, update: Update, message: Any) -> bool:
         document = message.document
         if self._file_too_large(document, _MAX_PDF_BYTES):
             await message.reply_text("That PDF is too large for me to process.")
-            return
+            return True
         if not await self._credits.consume():
             await message.reply_text(_RATE_LIMIT_MESSAGE)
-            return
+            return False
 
         stop_typing, typing_task = self._start_typing(update.effective_chat)
         try:
@@ -317,7 +410,7 @@ class TelegramHandler:
             pdf = bytes(await telegram_file.download_as_bytearray())
             if len(pdf) > _MAX_PDF_BYTES:
                 await message.reply_text("That PDF is too large for me to process.")
-                return
+                return True
             filename = (document.file_name or "document.pdf")[:128]
             transient_content = [
                 {
@@ -338,6 +431,7 @@ class TelegramHandler:
                 transient_content, self._session_id(update)
             )
             await self._send_reply(message, reply)
+            return self._receipt_eligible(reply)
         finally:
             await self._stop_typing(stop_typing, typing_task)
 
@@ -346,14 +440,15 @@ class TelegramHandler:
         update: Update,
         message: Any,
         agent_input: str,
-    ) -> None:
+    ) -> bool:
         if not await self._credits.consume():
             await message.reply_text(_RATE_LIMIT_MESSAGE)
-            return
+            return False
         stop_typing, typing_task = self._start_typing(update.effective_chat)
         try:
             reply = await self._invoke_agent(agent_input, self._session_id(update))
             await self._send_reply(message, reply)
+            return self._receipt_eligible(reply)
         finally:
             await self._stop_typing(stop_typing, typing_task)
 
@@ -393,7 +488,18 @@ class TelegramHandler:
         raise TypeError("Agent does not expose a transient multimodal boundary")
 
     @staticmethod
+    def _receipt_eligible(reply: str) -> bool:
+        """Retry safe pre-mutation failures, but suppress uncertain effect replays.
+
+        AgentTurnResult carries per-turn metadata while retaining the public str
+        interface. Transport failures never reach this receipt decision.
+        """
+        return bool(reply.strip()) and not bool(getattr(reply, "retry_safe", False))
+
+    @staticmethod
     def _agent_result_text(result: Any) -> str:
+        if result is None:
+            return ""
         if isinstance(result, str):
             return result
         return json.dumps(result, ensure_ascii=False, default=str)
@@ -604,7 +710,20 @@ class TelegramHandler:
                 return
             if action == "d":
                 await query.answer()
-                await self._complete_checklist(query, key, state)
+                try:
+                    await self._complete_checklist(query, key, state)
+                except Exception as exc:
+                    if self._checklists.get(key, {}).get("completion_delivered"):
+                        self._log_failure("completed checklist display", exc)
+                        if query.message is not None:
+                            await query.message.reply_text(
+                                "saved your check-in — I couldn’t refresh the checklist"
+                            )
+                    else:
+                        raise
+                return
+            if state["completion_delivered"]:
+                await query.answer("This check-in is already saved.")
                 return
             try:
                 item_text, target_text = action.split(".", 1)
@@ -622,7 +741,7 @@ class TelegramHandler:
             proposed_state = copy.deepcopy(state)
             proposed_state["items"][item_index]["checked"] = target
             if bool(item["checked"]) == target:
-                await query.edit_message_text(
+                await self._edit_checklist_message(query,
                     text=self._checklist_text(proposed_state),
                     reply_markup=self._checklist_markup(key, proposed_state),
                 )
@@ -631,7 +750,7 @@ class TelegramHandler:
             proposed[key] = proposed_state
             await self._save_checklists(proposed)
             try:
-                await query.edit_message_text(
+                await self._edit_checklist_message(query,
                     text=self._checklist_text(proposed_state),
                     reply_markup=self._checklist_markup(key, proposed_state),
                 )
@@ -643,19 +762,25 @@ class TelegramHandler:
                 raise
             self._checklists = proposed
 
+    @staticmethod
+    async def _edit_checklist_message(query: Any, **kwargs: Any) -> None:
+        """A repeated edit to the already desired Telegram state is a success."""
+        try:
+            await query.edit_message_text(**kwargs)
+        except BadRequest as exc:
+            if "message is not modified" not in str(exc).lower():
+                raise
+
     async def _complete_checklist(
         self, query: Any, key: str, state: dict[str, Any]
     ) -> None:
         delivered_state = copy.deepcopy(state)
         if not delivered_state["completion_delivered"]:
-            if not await self._credits.consume():
-                if query.message is not None:
-                    await query.message.reply_text(_RATE_LIMIT_MESSAGE)
-                return
             event = {
                 "type": "telegram_checklist_completed",
                 "callback_prefix": state["callback_prefix"],
                 "checklist_id": state["checklist_id"],
+                "created_at": state["created_at"],
                 "items": [
                     {
                         "id": item["id"],
@@ -674,10 +799,12 @@ class TelegramHandler:
             delivered_state["completion_delivered"] = True
             delivered = copy.deepcopy(self._checklists)
             delivered[key] = delivered_state
-            await self._save_checklists(delivered)
+            # Completion is already durably owned by the callback. Retain that
+            # success in memory even if the separate UI-state write fails.
             self._checklists = delivered
+            await self._save_checklists(delivered)
 
-        await query.edit_message_text(
+        await self._edit_checklist_message(query,
             text=self._checklist_text(delivered_state, completed=True),
             reply_markup=None,
         )
@@ -1156,6 +1283,11 @@ class TelegramHandler:
                 "cost", self.cost_command, filters=filters.UpdateType.MESSAGE
             )
         )
+        app.add_handler(
+            CommandHandler(
+                "times", self.times_command, filters=filters.UpdateType.MESSAGE
+            )
+        )
         app.add_handler(CallbackQueryHandler(self.callback_query_handler))
         app.add_handler(
             MessageHandler(
@@ -1227,6 +1359,9 @@ async def initialize_application_runtime(application: Application) -> None:
         store = runtime["store"]
         await store.initialize()
         from .integration import build_tool_handlers
+        from .jobs import load_notification_times
+
+        await load_notification_times(store)
 
         agent = runtime["telegram_handler"].agent
         agent.tool_handlers = await build_tool_handlers(

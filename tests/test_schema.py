@@ -47,7 +47,7 @@ async def test_migrates_legacy_tasks_and_events_without_data_loss(tmp_path: Path
         "bot",
     )
     assert db.execute("SELECT color_id FROM events WHERE id = 9").fetchone() == (None,)
-    assert db.execute("PRAGMA user_version").fetchone() == (5,)
+    assert db.execute("PRAGMA user_version").fetchone() == (6,)
     assert not db.execute("PRAGMA foreign_key_check").fetchall()
 
 
@@ -83,7 +83,7 @@ async def test_adds_event_color_to_v4_database_without_data_loss(tmp_path: Path)
     await run_migrations(path)
 
     db = sqlite3.connect(path)
-    assert db.execute("PRAGMA user_version").fetchone() == (5,)
+    assert db.execute("PRAGMA user_version").fetchone() == (6,)
     assert db.execute(
         """SELECT id, title, category, gcal_event_id, color_id
            FROM events WHERE id = 12"""
@@ -148,6 +148,7 @@ async def test_migrates_additive_goal_and_task_fields_on_existing_canonical_db(
         row[1] for row in db.execute("PRAGMA table_info(event_change_proposals)")
     }
     assert {"series_key", "estimate_source", "actual_minutes_source"} <= task_columns
+    assert {"progress_minutes", "progress_notes", "progress_updated_at", "reopened_at"} <= task_columns
     assert {"session_minutes", "scheduling_enabled"} <= goal_columns
     assert "task_id" in progress_columns
     assert {"claimed_at", "claim_token"} <= proposal_columns
@@ -155,12 +156,19 @@ async def test_migrates_additive_goal_and_task_fields_on_existing_canonical_db(
         "SELECT session_minutes, scheduling_enabled FROM goals WHERE id = 1"
     ).fetchone() == (60, 1)
     assert db.execute("SELECT title FROM tasks WHERE id = 2").fetchone() == ("Legacy task",)
+    assert db.execute(
+        "SELECT progress_minutes, progress_notes, progress_updated_at FROM tasks WHERE id = 2"
+    ).fetchone() == (0, None, None)
+    assert db.execute("SELECT reopened_at FROM tasks WHERE id = 2").fetchone() == (None,)
+    with pytest.raises(sqlite3.IntegrityError):
+        db.execute("UPDATE tasks SET reopened_at = '2026-09-20T12:00:00' WHERE id = 2")
     assert db.execute("SELECT amount FROM goal_progress WHERE id = 3").fetchone() == (1.0,)
     assert db.execute(
         "SELECT claimed_at, claim_token FROM event_change_proposals WHERE id = 'legacy-proposal'"
     ).fetchone() == (None, None)
     tables = {row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
     assert {"goal_schedule_items", "event_change_proposals"} <= tables
+    assert {"app_settings", "processed_updates", "calendar_cleanup"} <= tables
     assert not db.execute("PRAGMA foreign_key_check").fetchall()
 
 

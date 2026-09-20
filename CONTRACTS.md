@@ -65,6 +65,8 @@ Config.validate() -> list[str]
 
 Production startup requires both `TELEGRAM_BOT_TOKEN` and `ALLOWED_USER_ID` and fails closed when either is absent. `RUN_MODE` defaults to `polling`; webhook mode additionally requires a pathless HTTPS `PUBLIC_BASE_URL` and URL-safe webhook path and secret. Clock settings are local 24-hour `HH:MM` strings. `DATA_DIR` defaults to `./data` and derives the database, scheduler database, OAuth credentials, and OAuth token paths unless their corresponding explicit path variable is set. OAuth token material created or refreshed by the app is mode `0600`.
 
+Saved `app_settings` morning/evening clocks override `DAILY_BRIEF_TIME` and `DAILY_DEBRIEF_TIME`; environment values remain the defaults for an unset preference. `Config` disables its dataclass representation, so `repr(config)` exposes no field values, including secrets.
+
 ## Time (`src.timeutil`)
 
 ```python
@@ -90,7 +92,7 @@ get_tool_schemas() -> list[ToolSchema]
 ```text
 add_task             add_event              update_task
 update_event         confirm_event_change   complete_task
-delete_task
+log_task_progress    delete_task
 delete_event         query_schedule         query_tasks
 add_reminder         update_reminder        cancel_reminder
 query_reminders      find_free_blocks       schedule_task
@@ -102,6 +104,8 @@ resolve_date
 
 `schedule_task.reasoning` is required and is a one-sentence explanation recorded at decision time. Its handler must call `Store.apply_schedule_decision` so placement and rationale commit atomically. `add_task`, `add_event`, and `add_reminder` accept arrays. Reminders are one-time Telegram nudges stored only in SQLite: their tools never call Google Calendar, free/busy, or the scheduler. Tasks include a nullable `series_key`, which groups recurring work for deterministic duration inference; an explicit `estimated_minutes` wins over inferred evidence and the configured default. Conflicting fixed-event changes return a one-time proposal and require `confirm_event_change` in a later user turn. Strict update schemas require every field: `null` means unchanged, while nullable values are cleared only through the required `clear_fields` array (`[]` means clear nothing). `add_event.color_id` and `update_event.color_id` accept only Google event color ID strings `1` through `11`: lavender, sage, grape, flamingo, banana, tangerine, peacock, graphite, blueberry, basil, and tomato. A null add color uses Dharvis's deterministic category/kind default; a null update color is unchanged unless `color_id` is listed in `clear_fields`, which removes the override so the event inherits Kalendra's calendar color. External events are read-only.
 
+`log_task_progress` requires `task_id`, `total_minutes`, `remaining_minutes`, and `notes`; the last three are nullable. `total_minutes` is cumulative observed work, not an increment, and retries repeat the same total. Only an explicit user remaining-time estimate changes `estimated_minutes`; elapsed work is never subtracted to guess it. Progress preserves task identity, unfinished status, and the existing scheduled interval. It neither credits a goal nor automatically replans or resizes a work block. `complete_task` is reserved for finished work; `calendar_sync_pending` in its result means local completion succeeded and owned calendar cleanup remains queued.
+
 ## Schema migration (`src.migrate`)
 
 ```python
@@ -110,7 +114,7 @@ main() -> None
 ```
 
 `src/schema.sql` is the only canonical schema file. Later agents must not add migration files.
-The current canonical schema version is 5; it adds nullable `events.color_id`, constrained to Google event color ID strings `1` through `11`. A null stored value means there is no event-level override and the event inherits its calendar's color.
+The current canonical schema version is 6. It adds task fields `progress_minutes` (nonnegative, default 0), `progress_notes`, `progress_updated_at`, and `reopened_at`, plus `app_settings` (morning/evening local clocks), `processed_updates` (Telegram update receipts), `calendar_cleanup` (pending owned work-block deletions), and `debrief_learning_attempts` (immutable evidence snapshots with a separate processing acknowledgement). Version 5's nullable `events.color_id` remains constrained to Google event color ID strings `1` through `11`; null means inheritance from the calendar. Existing task duplicates are preserved, not merged or deleted during migration.
 The migration runner alone accepts naive timestamps from the retired database and interprets them in `USER_TIMEZONE` before converting to UTC. Runtime APIs reject naive datetimes; this recovery policy must not be copied into new writes.
 
 ## Store (`src.store`)
@@ -120,6 +124,12 @@ Store(db_path: str | Path | None = None)
 Store.initialize() -> None  # async
 Store.connection() -> AsyncIterator[aiosqlite.Connection]  # @asynccontextmanager
 Store.add_tasks(tasks: list[Record]) -> list[Record]  # async
+Store.get_notification_times() -> dict[str, str]  # async
+Store.set_notification_times(*, morning: str | None = None, evening: str | None = None) -> dict[str, str]  # async
+Store.has_processed_update(update_id: int) -> bool  # async
+Store.mark_update_processed(update_id: int) -> None  # async
+Store.list_pending_calendar_cleanup(limit: int = 50, *, task_id: int | None = None) -> list[Record]  # async
+Store.ack_calendar_cleanup(gcal_event_id: str) -> None  # async
 Store.add_events(events: list[Record]) -> list[Record]  # async
 Store.add_reminders(reminders: list[Record]) -> list[Record]  # async
 Store.get_task(task_id: int) -> Record | None  # async
@@ -140,7 +150,8 @@ Store.claim_event_change_proposal(proposal_id: str, claimed_at: datetime | None 
 Store.finalize_event_change_proposal(proposal_id: str, claim_token: str, consumed_at: datetime | None = None) -> Record  # async
 Store.release_event_change_proposal(proposal_id: str, claim_token: str) -> Record  # async
 Store.infer_task_duration(title: str, category: str, energy: str, series_key: str | None = None, limit: int = 5) -> Record  # async
-Store.complete_task(task_id: int, actual_minutes: int | None = None, actual_minutes_source: ActualMinutesSource | None = None) -> Record  # async
+Store.complete_task(task_id: int, actual_minutes: int | None = None, actual_minutes_source: ActualMinutesSource | None = None, *, observed_at: datetime | None = None) -> Record  # async
+Store.log_task_progress(task_id: int, total_minutes: int | None = None, remaining_minutes: int | None = None, notes: str | None = None) -> Record  # async
 Store.drop_task(task_id: int) -> Record  # async
 Store.delete_task(task_id: int) -> Record  # async; drops without erasing history
 Store.delete_event(event_id: int) -> bool  # async
@@ -168,12 +179,21 @@ Store.get_messages(session_id: str, limit: int = 100) -> list[Record]  # async
 Store.get_messages_between(start: datetime, end: datetime) -> list[Record]  # async
 Store.get_daily_log(local_date: date) -> Record | None  # async
 Store.upsert_daily_log(local_date: date, changes: Record) -> Record  # async
+Store.save_debrief_learning(local_date: date, changes: Record, snapshot: Record) -> Record  # async
+Store.get_pending_debrief_learning(local_date: date | None = None, limit: int = 50) -> list[Record]  # async
+Store.ack_debrief_learning(attempt_id: int) -> None  # async
 Store.record_usage(component: Literal["agent_loop", "session_summary", "scheduler", "facts"], model: str, usage: Record, estimated_cost_usd: float | None, session_id: str | None = None) -> None  # async
 Store.usage_summary(start: datetime, end: datetime) -> list[Record]  # async
 create_store(db_path: str | Path | None = None) -> Store  # async
 ```
 
 Every Store connection enables `PRAGMA foreign_keys = ON`. `apply_schedule_decision` is the only placement mutation contract: it updates the task placement and inserts the nonblank `schedule_decisions` row in one transaction. `facts_used` accepts only existing integer fact IDs. Event-change proposals are one-time, expiring records: callers claim a proposal before the external write, finalize it only after the write succeeds, and release the claim only after compensated failure. Goal-session cancellation is likewise two phase: retain its local calendar ID until the owned remote block is deleted, then finalize the local cleanup. `infer_task_duration` uses only recent completed tasks with the same normalized `series_key`, category, and energy; it takes a robust median of recorded `actual_minutes`, returns evidence task IDs, and uses neither a model nor a vector index.
+
+`add_tasks` serializes creation and reuses an active task only when its complete title (case/whitespace normalized), deadline instant, category, and goal match. It returns that task unchanged; task-family similarity does not merge occurrences. Existing duplicate rows are not repaired destructively.
+
+`complete_task` atomically sets completion, clears local placement, queues the old calendar ID for cleanup, and credits the linked goal once. Replays preserve the original completion timestamp and observed duration. Session goals receive one session; hour goals use supplied actual minutes, otherwise nonzero partial progress, otherwise the estimate. Partial minutes never become final `actual_minutes` for duration inference. Reopening through `update_task(status="pending")` atomically clears completion metadata, records `reopened_at`, removes automatic task goal credit and old daily-log completion entries, and preserves partial progress, manual goal logs, and queued cleanup. An `observed_at` at or before `reopened_at` cannot re-complete the task from a stale checklist.
+
+`save_debrief_learning` commits daily-log changes and a snapshot of that persisted row together with the caller's same-day conversation, decisions, and metadata in one transaction. Retries read the saved snapshot unchanged; acknowledgement sets only `processed_at`. Concurrently reopened tasks are excluded from saved completion entries. Notification clock updates validate all supplied values before atomically saving them; quiet-hour policy belongs to `jobs.update_notification_times`. Telegram receipts retain 30 days of update IDs and do not use message text as identity.
 
 Reminder delivery uses an explicit `pending -> delivered` or `pending -> cancelled` lifecycle. The dispatcher atomically claims due records with opaque, expiring per-reminder leases, acknowledges only after Telegram accepts the send, and releases failed claims with a retry time. This provides at-least-once delivery: a crash after Telegram accepts a message but before acknowledgement can cause a rare duplicate, while expired leases and startup catch-up prevent silent loss. Delivered and cancelled reminders are immutable audit records, and a reminder under a live delivery lease cannot be edited or cancelled.
 
@@ -182,6 +202,7 @@ Reminder delivery uses an explicit `pending -> delivered` or `pending -> cancell
 ```python
 CalendarError(RuntimeError)
 CalendarReconnectRequiredError(CalendarError)
+CalendarWriteUncertainError(CalendarError)
 CalendarReconnectRequired = CalendarReconnectRequiredError
 CalendarService(credentials_path: Path | None = None, token_path: Path | None = None, calendar_id: str | None = None)
 CalendarService.is_available() -> bool
@@ -203,7 +224,9 @@ create_calendar_service() -> CalendarService  # async
 normalize_event_color_id(value: Any) -> str
 ```
 
-OAuth uses the read/write Calendar scope. Reads cover every visible calendar and cache complete results in memory for 60 seconds; `force_refresh=True` bypasses that cache for write-adjacent safety checks. Returned Google records retain visible-calendar metadata (summary, primary/access role, and colors). Writes are restricted to marked, application-owned events on a dedicated secondary calendar named `Kalendra`; its ID is persisted beside the OAuth token, and primary-calendar and other external events are read-only. `get_owned_event` performs an exact-ID read from that owned calendar, verifies the ownership marker, and returns the normalized record; it never searches external calendars or depends on a time range. New owned events carry `kalendra_owned=v1` and canonical `kalendra_kind` values `fixed-event`, `task-block`, or `goal-session` (the legacy work-block marker remains readable). Category and kind select a deterministic event-level color unless the user supplies an event color ID from `1` through `11`; setting one updates the Google event override, while explicitly clearing it sends null and restores inheritance from Kalendra's calendar color. A manual nondefault event color survives later metadata updates. Google event colors (`color_id`) and calendar colors (`calendar_color_id`) are different palette namespaces: only a non-null event-level ID can be copied exactly from a reference. A reference with null `color_id` inherits its source calendar's color, which may not have an exact event-palette equivalent, so callers must ask for a named event color rather than copying the calendar ID. Creating a block requires a nonblank rationale, supplied as `reasoning` or `event["reasoning"]`, which is rendered in the Google event description. `clear_kalendra_range` and `delete_work_block` delete only owned movable task/goal blocks, never fixed events; remote 404 deletion is retry-safe. Credential refresh is transparent; absent, invalid, rejected, or unrefreshable credentials raise `CalendarReconnectRequiredError` so callers can request reconnection.
+OAuth uses the read/write Calendar scope. Reads cover every visible calendar and cache complete results in memory for 60 seconds; `force_refresh=True` bypasses that cache for write-adjacent safety checks. Returned Google records retain visible-calendar metadata (summary, primary/access role, and colors). Writes are restricted to marked, application-owned events on a dedicated secondary calendar named `Kalendra`; its ID is persisted beside the OAuth token, and primary-calendar and other external events are read-only. `get_owned_event` performs an exact-ID read from that owned calendar, verifies the ownership marker, and returns the normalized record; it never searches external calendars or depends on a time range. New owned events carry `kalendra_owned=v1` and canonical `kalendra_kind` values `fixed-event`, `task-block`, or `goal-session` (the legacy work-block marker remains readable). Category and kind select a deterministic event-level color unless the user supplies an event color ID from `1` through `11`; setting one updates the Google event override, while explicitly clearing it sends null and restores inheritance from Kalendra's calendar color. A manual nondefault event color survives later metadata updates. Google event colors (`color_id`) and calendar colors (`calendar_color_id`) are different palette namespaces: only a non-null event-level ID can be copied exactly from a reference. A reference with null `color_id` inherits its source calendar's color, which may not have an exact event-palette equivalent, so callers must ask for a named event color rather than copying the calendar ID. Creating a block requires a nonblank rationale, supplied as `reasoning` or `event["reasoning"]`, which is rendered in the Google event description. `clear_kalendra_range` and `delete_work_block` delete only owned movable task/goal blocks, never fixed events; remote 404 deletion is retry-safe.
+
+Credential refresh is transparent and refreshed tokens are replaced atomically with mode `0600`. Missing or malformed authorization, `invalid_grant`/`invalid_scope`, a required reauthentication, HTTP 401, and a scope-specific HTTP 403 raise `CalendarReconnectRequiredError`. Transport failures, rate limits, transient refresh errors, token-storage failures, and other permission errors do not falsely request reconnection. Safe reads/deletes use bounded retries for transient failures; ambiguous inserts/updates are not automatically retried. `CalendarWriteUncertainError` means a write may have reached Google: callers must not assert rollback or release a confirmation claim as compensated. A token-save failure after confirmed remote success retains the valid credentials for a later storage retry without reporting that write as failed.
 
 Every returned `start_time` and `end_time` is UTC-aware ISO-8601 text. Google `dateTime` offsets are converted to UTC; all-day `date` values become the UTC instants for local midnight boundaries. Returned occupied events always have positive duration. Explicit Google entries whose normalized start and end instants are equal are omitted as non-occupying without making the read incomplete; reversed or missing endpoints, structurally invalid or non-object entries, and HTTP or inaccessible-calendar failures still make the read incomplete and preserve fail-closed behavior.
 
@@ -232,6 +255,10 @@ has_conflict(blocks: list[ScheduleBlock], start: datetime, end: datetime) -> boo
 ## Agent and history (`src.agent`, `src.history`)
 
 ```python
+AgentTurnResult(text: str, *, failed: bool = False, mutation_attempted: bool = False)  # subclass of str
+AgentTurnResult.failed: bool
+AgentTurnResult.mutation_attempted: bool
+AgentTurnResult.retry_safe: bool
 Agent(history: History | None = None)
 Agent.build_system_prompt() -> str
 Agent.respond(message: str, session_id: str) -> str  # async
@@ -247,6 +274,8 @@ History.to_openai_input(messages: list[Message]) -> list[dict[str, Any]]
 create_history(store: Store) -> History  # async
 ```
 
+Agent replies retain the `str` interface and carry `AgentTurnResult` metadata per turn. `retry_safe` is true only for a failed turn with no attempted mutation. Empty, incomplete, and failed model responses are explicit failures; after a possible mutation the reply warns that some changes may already be saved. Transport code must use the typed metadata, not wording or shared agent state, to decide whether a delivered reply may receive a receipt.
+
 ## Telegram (`src.telegram_handler`)
 
 ```python
@@ -255,6 +284,7 @@ TelegramHandler.is_authorized(user_id: int) -> bool
 TelegramHandler.start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None  # async
 TelegramHandler.help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None  # async
 TelegramHandler.cost_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None  # async
+TelegramHandler.times_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None  # async
 TelegramHandler.message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None  # async
 TelegramHandler.error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None  # async
 TelegramHandler.create_application(token: str | None = None) -> Application
@@ -262,6 +292,8 @@ create_telegram_handler(agent: Agent, store: Any | None = None) -> TelegramHandl
 build_application() -> Application
 initialize_application_runtime(application: Application) -> None  # async
 ```
+
+`/times` displays saved morning/evening clocks. `/times morning HH:MM` and `/times evening HH:MM` accept strict local 24-hour times and reject quiet-hour choices. Settings take effect in the running scheduler and are loaded before job registration after restart. Authorized new-message processing serializes identical update IDs in process and records durable receipts only after a qualifying reply is delivered. Safely retryable pre-mutation failures and transport failures remain unreceipted; delivered replies after a possible mutation suppress automatic replay. This is not an exactly-once guarantee across a process crash between tool effects, delivery, and receipt persistence.
 
 ## Scheduler (`src.scheduler_engine`)
 
@@ -291,6 +323,10 @@ create_scheduler_engine(store: Store, calendar: CalendarService) -> SchedulerEng
 ```python
 send_daily_brief(store: Store, telegram: Any, local_date: date) -> None  # async
 send_daily_debrief(store: Store, telegram: Any, local_date: date) -> None  # async
+send_weekly_review(store: Store, telegram: Any, local_date: date) -> None  # async
+handle_debrief_submission(store: Store, facts_engine: Any, telegram: Any, event: Record, session_id: str | None = None) -> None  # async
+load_notification_times(store: Store) -> None  # async
+update_notification_times(store: Store, *, morning: str | None = None, evening: str | None = None) -> dict[str, str]  # async
 deliver_due_reminders(store: Store, telegram: Any, *, now: datetime | None = None) -> int  # async
 run_daily_planning(engine: SchedulerEngine, local_date: date) -> None  # async
 reconcile_calendar(engine: SchedulerEngine) -> None  # async
@@ -305,13 +341,17 @@ run_startup_catchup() -> None  # async
 
 The stable reminder dispatcher job runs every 30 seconds and is also the first startup catch-up action. Explicit reminder delivery bypasses quiet-hour and active-conversation deferral so the requested instant is honored. It processes a bounded leased batch, retries individual failures with capped exponential backoff, and continues past a failed send. The morning brief only reads reminder state: it includes pending reminders overdue through the end of the second following local day, but does not claim, acknowledge, or suppress their normal due-time delivery.
 
+Morning/evening clock changes replace the stable planning, morning, and debrief jobs and remove stale deferred occurrences. Planning remains 15 minutes before the morning clock; daily delivery markers prevent resending an already delivered check-in after an edit or restart. Briefs render local human-readable times and concise recorded reasons. Weekly reviews report saved completion counts, concrete goal totals, and still-open planned tasks without inventing behavioral insights.
+
+Debrief submission persists outcomes and immutable day-scoped learning evidence without awaiting facts-model extraction. A separate five-minute job and startup catch-up retry pending snapshots with a 30-second extraction timeout, including older days. A successful extraction is acknowledged separately; failures retain the original evidence for retry. A reopened task invalidates an older queued completion observation instead of rewriting its snapshot. Follow-up reflections create new attempts without replaying task completion or goal credit. Calendar cleanup is retried at startup and during reconciliation independently of successful local completion.
+
 ## Facts (`src.facts_engine`)
 
 ```python
 FactsEngine(store: Store)
 FactsEngine.extract_facts(user_message: str, assistant_message: str) -> list[Fact]  # async
 FactsEngine.extract_from_day(daily_log: Mapping[str, Any] | Sequence[Any] | str | None, conversation: Sequence[Any] | Mapping[str, Any] | str | None, decisions: Sequence[Any] | Mapping[str, Any] | str | None) -> list[Fact]  # async
-FactsEngine.consolidate(candidates: list[Fact]) -> list[Fact]  # async
+FactsEngine.consolidate(candidates: list[Fact], *, contradictions: Sequence[Mapping[str, Any]] | None = None, override_fact_ids: set[int] | None = None, observation_key: str | None = None, evidence_key: str | None = None) -> list[Fact]  # async
 FactsEngine.relevant_facts(context: str, category: str | None = None, limit: int = 20) -> list[Fact]  # async
 FactsEngine.seed_facts(facts: list[Fact]) -> list[Fact]  # async
 FactsEngine.confirm_fact(fact_id: int, confidence: float = 1.0) -> Fact  # async
@@ -319,15 +359,20 @@ FactsEngine.deactivate_fact(fact_id: int) -> Fact  # async
 create_facts_engine(store: Store) -> FactsEngine  # async
 ```
 
+Exact extraction inputs have a cached observation identity; daily evidence has a separate date identity. Replaying an attempt or adding a reflection on the same day cannot turn one day into multiple supporting observations for a fact. New same-day evidence text is retained without increasing its evidence count or confidence as another independent habit sample.
+
 ## Runtime integration (`src.integration`)
 
 ```python
 jsonable(value: Any) -> Any
+complete_task_with_calendar(store: Store, calendar: CalendarService | None, task_id: int, actual_minutes: int | None = None, *, actual_minutes_source: ActualMinutesSource | None = None, observed_at: datetime | None = None) -> Record  # async
+drain_calendar_cleanup(store: Store, calendar: CalendarService | None, *, limit: int = 50) -> int  # async
 build_tool_handlers(store: Store, calendar: CalendarService, scheduler: SchedulerEngine, facts_engine: FactsEngine) -> dict[str, ToolHandler]  # async
 ```
 
 The returned registry contains exactly every name in `TOOLS_BY_NAME`. Tool
 results contain only JSON-compatible values and never naive datetimes.
+`complete_task_with_calendar` commits local completion first, attempts queued owned-block deletion, and returns `calendar_sync_pending` plus a plain-language warning when cleanup remains. `drain_calendar_cleanup` acknowledges only successful deletions and returns the repaired count; failed entries remain durable.
 
 ## Entrypoint (`src.main`)
 

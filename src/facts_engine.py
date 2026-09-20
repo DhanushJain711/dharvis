@@ -7,7 +7,7 @@ import json
 import logging
 import re
 import unicodedata
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from typing import Any, Mapping, Sequence
 from zoneinfo import ZoneInfo
 
@@ -307,6 +307,21 @@ def _observation_key(daily_log: Any, conversation: Any, decisions: Any) -> str:
     return "nightly:" + hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
+def _day_observation_key(daily_log: Any) -> str | None:
+    """A later reflection from the same day is not an independent habit sample."""
+    if not isinstance(daily_log, Mapping):
+        return None
+    value = daily_log.get("date")
+    if isinstance(value, date) and not isinstance(value, datetime):
+        return f"day:{value.isoformat()}"
+    if isinstance(value, str):
+        try:
+            return f"day:{date.fromisoformat(value).isoformat()}"
+        except ValueError:
+            pass
+    return None
+
+
 def _candidate_evidence(candidate: Mapping[str, Any]) -> str:
     evidence = candidate.get("evidence")
     if isinstance(evidence, str) and evidence.strip():
@@ -449,6 +464,7 @@ class FactsEngine:
             ],
             override_fact_ids=override_ids,
             observation_key=observation_key,
+            evidence_key=_day_observation_key(daily_log),
         )
 
     async def consolidate(
@@ -458,6 +474,7 @@ class FactsEngine:
         contradictions: Sequence[Mapping[str, Any]] | None = None,
         override_fact_ids: set[int] | None = None,
         observation_key: str | None = None,
+        evidence_key: str | None = None,
     ) -> list[Fact]:
         """Merge one observation per semantic fact and centrally apply contradictions."""
         if not isinstance(candidates, list):
@@ -467,6 +484,9 @@ class FactsEngine:
             if cached is not None:
                 return cached
         unique_candidates = _merge_batch_candidates(candidates)
+        # Batch identity caches an exact immutable input. Evidence identity
+        # prevents revised input from counting the same day more than once.
+        producing_observation = evidence_key or observation_key
 
         decay: dict[int, tuple[float, list[str]]] = {}
         for contradiction in contradictions or ():
@@ -491,7 +511,7 @@ class FactsEngine:
                 fact_id,
                 amount,
                 "; ".join(dict.fromkeys(evidence)),
-                observation_key=observation_key,
+                observation_key=producing_observation,
             )
 
         consolidated: list[Fact] = []
@@ -510,7 +530,7 @@ class FactsEngine:
                     _fact_ids(candidate.get("contradicts_fact_ids")) | set(decay)
                 ),
                 evidence=_candidate_evidence(candidate),
-                observation_key=observation_key,
+                observation_key=producing_observation,
             )
             consolidated.append(fact)
 
@@ -730,14 +750,26 @@ class FactsEngine:
                     and observation_key is not None
                 ):
                     prior_evidence = await db.execute(
-                        """SELECT 1 FROM facts_engine_evidence
+                        """SELECT evidence FROM facts_engine_evidence
                            WHERE fact_id = ? AND kind = 'observation'
                              AND observation_key = ? LIMIT 1""",
                         (int(best["id"]), observation_key),
                     )
-                    already_observed = await prior_evidence.fetchone() is not None
+                    prior_row = await prior_evidence.fetchone()
+                    already_observed = prior_row is not None
                 if already_observed:
                     fact_id = int(best["id"])
+                    # Keep new producing evidence from a follow-up without
+                    # upgrading one day's observation into a repeated habit.
+                    clean_evidence = _clean_text(evidence, "evidence")
+                    previous = str(prior_row["evidence"])
+                    if clean_evidence not in previous.splitlines():
+                        await db.execute(
+                            """UPDATE facts_engine_evidence SET evidence = ?
+                               WHERE fact_id = ? AND kind = 'observation'
+                                 AND observation_key = ?""",
+                            (f"{previous}\n{clean_evidence}", fact_id, observation_key),
+                        )
                 elif best is None or best_score < _MATCH_THRESHOLD:
                     confidence = min(0.45, proposed_confidence)
                     inserted = await db.execute(

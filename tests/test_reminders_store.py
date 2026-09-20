@@ -197,7 +197,7 @@ async def test_existing_database_migration_installs_reminders_and_bumps_version(
             )
         ).fetchone()
 
-    assert version == 5
+    assert version == 6
     assert {
         "id",
         "message",

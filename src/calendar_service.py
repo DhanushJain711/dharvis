@@ -5,18 +5,21 @@ from __future__ import annotations
 from collections.abc import Mapping
 from copy import deepcopy
 from datetime import date, datetime, timedelta
+import json
 import logging
 import os
 from pathlib import Path
-from time import monotonic
+import tempfile
+from time import monotonic, sleep
 from typing import Any
 
-from google.auth.exceptions import RefreshError
+from google.auth.exceptions import ReauthFailError, RefreshError, TransportError
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
+from httplib2 import HttpLib2Error
 
 from .config import config
 from .timeutil import day_bounds, now_local, now_utc, to_utc
@@ -24,6 +27,8 @@ from .timeutil import day_bounds, now_local, now_utc, to_utc
 CalendarRecord = dict[str, Any]
 SCOPES = ["https://www.googleapis.com/auth/calendar"]
 CACHE_TTL_SECONDS = 60.0
+SAFE_REQUEST_ATTEMPTS = 3
+RETRY_DELAY_SECONDS = 0.25
 CALENDAR_OWNERSHIP_MARKER = "kalendra-managed-calendar:v1"
 # New events use an explicit ownership marker and kind.  The old
 # ``kalendra=work-block`` marker remains readable so deployed calendars can be
@@ -66,6 +71,10 @@ class CalendarReconnectRequiredError(CalendarError):
     """OAuth authorization is no longer usable and must be re-established."""
 
 
+class CalendarWriteUncertainError(CalendarError):
+    """Google may have accepted a write; callers must not claim rollback or retry it."""
+
+
 CalendarReconnectRequired = CalendarReconnectRequiredError
 
 
@@ -83,17 +92,22 @@ def normalize_event_color_id(value: Any) -> str:
 
 
 def _write_securely(path: Path, content: str) -> None:
-    """Write private application state without a permissive-umask window."""
+    """Atomically replace private state without truncation or a public temp file."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    descriptor, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    temporary_path = Path(temporary_name)
     try:
         os.fchmod(descriptor, 0o600)
         with os.fdopen(descriptor, "w", encoding="utf-8") as output_file:
             descriptor = -1
             output_file.write(content)
+            output_file.flush()
+            os.fsync(output_file.fileno())
+        os.replace(temporary_path, path)
     finally:
         if descriptor >= 0:
             os.close(descriptor)
+        temporary_path.unlink(missing_ok=True)
 
 
 def _write_token_securely(path: Path, content: str) -> None:
@@ -145,6 +159,40 @@ def _is_not_found(exc: HttpError) -> bool:
     return _http_status(exc) == 404
 
 
+def _http_reasons(exc: HttpError) -> set[str]:
+    """Read Google's machine-readable reasons without exposing response contents."""
+    try:
+        error = json.loads(exc.content).get("error", {})
+        if not isinstance(error, dict):
+            return set()
+        return {
+            str(item["reason"])
+            for field in ("errors", "details")
+            for item in error.get(field, [])
+            if isinstance(item, dict) and item.get("reason")
+        }
+    except (TypeError, ValueError, AttributeError):
+        return set()
+
+
+def _refresh_error_code(exc: RefreshError) -> str:
+    """OAuth errors carry a structured second argument; never log its contents."""
+    for argument in exc.args:
+        if isinstance(argument, Mapping) and isinstance(argument.get("error"), str):
+            return argument["error"]
+    # Some transports retain only the canonical OAuth code and description.
+    return str(exc.args[0]).split(":", 1)[0].strip() if exc.args else ""
+
+
+def _transient_http_error(exc: HttpError) -> bool:
+    status = _http_status(exc)
+    return bool(
+        status in {408, 429, 500, 502, 503, 504}
+        or status == 403
+        and _http_reasons(exc) & {"rateLimitExceeded", "userRateLimitExceeded"}
+    )
+
+
 class CalendarService:
     """Merged calendar reads and writes isolated to a Kalendra calendar."""
 
@@ -161,6 +209,7 @@ class CalendarService:
             f"{self.token_path.name}.kalendra-calendar-id"
         )
         self._credentials: Credentials | None = None
+        self._credentials_dirty = False
         self._service: Any | None = None
         self._kalendra_calendar_id: str | None = (
             config.KALENDRA_CALENDAR_ID or self._read_persisted_kalendra_id()
@@ -198,37 +247,84 @@ class CalendarService:
                 credentials = Credentials.from_authorized_user_file(
                     str(self.token_path), SCOPES
                 )
-            except (OSError, ValueError) as exc:
+            except OSError as exc:
+                raise CalendarError(
+                    "Google Calendar authorization could not be read from storage; try again shortly"
+                ) from exc
+            except ValueError as exc:
                 raise CalendarReconnectRequiredError(
                     "Google Calendar authorization is unreadable; reconnect your calendar"
                 ) from exc
 
-        if credentials.expired:
+        if credentials.expired or not credentials.valid:
             if not credentials.refresh_token:
                 raise CalendarReconnectRequiredError(
                     "Google Calendar authorization expired; reconnect your calendar"
                 )
-            try:
-                credentials.refresh(Request())
-                _write_token_securely(self.token_path, credentials.to_json())
-            except Exception as exc:
-                self._credentials = None
-                self._service = None
-                raise CalendarReconnectRequiredError(
-                    "Google Calendar authorization could not be refreshed; reconnect your calendar"
-                ) from exc
+            self._refresh_credentials(credentials)
         if not credentials.valid:
             raise CalendarReconnectRequiredError(
                 "Google Calendar authorization is invalid; reconnect your calendar"
             )
         self._credentials = credentials
+        self._persist_credentials()
         return credentials
+
+    def _persist_credentials(self) -> None:
+        """Retry a previously failed save without throwing away a valid token."""
+        if not self._credentials_dirty or self._credentials is None:
+            return
+        try:
+            _write_token_securely(self.token_path, self._credentials.to_json())
+        except OSError as exc:
+            raise CalendarError(
+                "Google Calendar is connected, but its refreshed authorization could not be saved; "
+                "try again shortly"
+            ) from exc
+        self._credentials_dirty = False
+
+    def _raise_refresh_failure(self, exc: RefreshError) -> None:
+        if isinstance(exc, ReauthFailError) or _refresh_error_code(exc) in {
+            "invalid_grant", "invalid_scope",
+        }:
+            self._credentials = None
+            self._credentials_dirty = False
+            self._service = None
+            self._invalidate_cache()
+            raise CalendarReconnectRequiredError(
+                "Google Calendar authorization expired or was revoked; reconnect your calendar"
+            ) from exc
+        raise CalendarError(
+            "Google Calendar authorization could not be refreshed right now; try again shortly"
+        ) from exc
+
+    def _refresh_credentials(self, credentials: Credentials) -> None:
+        """Refresh with bounded transport retries, preserving existing authorization."""
+        for attempt in range(SAFE_REQUEST_ATTEMPTS):
+            try:
+                credentials.refresh(Request())
+            except RefreshError as exc:
+                retryable = bool(getattr(exc, "retryable", False)) or _refresh_error_code(exc) in {
+                    "server_error", "temporarily_unavailable",
+                }
+                if not retryable or attempt == SAFE_REQUEST_ATTEMPTS - 1:
+                    self._raise_refresh_failure(exc)
+            except (TransportError, OSError, HttpLib2Error) as exc:
+                if attempt == SAFE_REQUEST_ATTEMPTS - 1:
+                    raise CalendarError(
+                        "Google Calendar could not be reached to refresh its connection; try again shortly"
+                    ) from exc
+            else:
+                self._credentials = credentials
+                self._credentials_dirty = True
+                return
+            sleep(RETRY_DELAY_SECONDS * (2 ** attempt))
 
     def _get_service(self) -> Any | None:
         """Lazily build the Google Calendar API client."""
+        credentials = self._get_credentials()
         if self._service is not None:
             return self._service
-        credentials = self._get_credentials()
         if credentials is None:
             return None
         try:
@@ -236,11 +332,9 @@ class CalendarService:
                 "calendar", "v3", credentials=credentials, cache_discovery=False
             )
         except RefreshError as exc:
-            raise CalendarReconnectRequiredError(
-                "Google Calendar authorization could not be refreshed; reconnect your calendar"
-            ) from exc
+            self._raise_refresh_failure(exc)
         except Exception as exc:
-            logger.warning("Google Calendar client could not be built", exc_info=True)
+            logger.warning("Google Calendar client could not be built (%s)", type(exc).__name__)
             raise CalendarError("Google Calendar client could not be created") from exc
         return self._service
 
@@ -254,26 +348,66 @@ class CalendarService:
     def _invalidate_cache(self) -> None:
         self._event_cache.clear()
 
-    def _execute(self, request: Any) -> Any:
-        """Execute one request after proactively refreshing cached credentials."""
+    def _execute(self, request: Any, *, retry_safe: bool = False) -> Any:
+        """Retry only opted-in reads/deletes, never an ambiguous event insertion."""
         credentials = self._get_credentials()
         if credentials is None:
             raise CalendarReconnectRequiredError(
                 "Google Calendar is not connected; reconnect your calendar"
             )
-        try:
-            return request.execute()
-        except RefreshError as exc:
-            self._credentials = None
-            self._service = None
-            raise CalendarReconnectRequiredError(
-                "Google Calendar authorization could not be refreshed; reconnect your calendar"
-            ) from exc
+        token_before = credentials.token
+        attempts = SAFE_REQUEST_ATTEMPTS if retry_safe else 1
+        for attempt in range(attempts):
+            try:
+                result = request.execute()
+            except RefreshError as exc:
+                self._raise_refresh_failure(exc)
+            except HttpError as exc:
+                if not _transient_http_error(exc) or attempt == attempts - 1:
+                    if not retry_safe and _http_status(exc) in {408, 500, 502, 503, 504}:
+                        self._invalidate_cache()
+                        raise CalendarWriteUncertainError(
+                            "Google Calendar did not confirm the change; it may have gone through, "
+                            "so check the calendar before retrying"
+                        ) from exc
+                    raise
+            except (TransportError, OSError, HttpLib2Error) as exc:
+                if attempt == attempts - 1:
+                    if not retry_safe:
+                        self._invalidate_cache()
+                    error_type = CalendarError if retry_safe else CalendarWriteUncertainError
+                    raise error_type(
+                        "Google Calendar could not be reached reliably; "
+                        + (
+                            "try again shortly"
+                            if retry_safe
+                            else "the change may have gone through, so check the calendar before retrying"
+                        )
+                    ) from exc
+            else:
+                if credentials.token != token_before:
+                    # AuthorizedHttp can refresh in response to a 401 even
+                    # after our proactive check. Retain that replacement too.
+                    self._credentials_dirty = True
+                    try:
+                        self._persist_credentials()
+                    except CalendarError:
+                        # The remote write already succeeded: failing it here
+                        # would provoke a duplicate write or local rollback.
+                        logger.warning("Refreshed Google authorization needs a storage retry")
+                return result
+            logger.warning("Retrying temporary Google Calendar failure (attempt %d)", attempt + 1)
+            sleep(RETRY_DELAY_SECONDS * (2 ** attempt))
 
     def _raise_if_reconnect_required(self, exc: HttpError) -> None:
-        if _http_status(exc) in (401, 403):
+        if _http_status(exc) == 401 or (
+            _http_status(exc) == 403
+            and _http_reasons(exc) & {"insufficientPermissions", "ACCESS_TOKEN_SCOPE_INSUFFICIENT"}
+        ):
             self._credentials = None
+            self._credentials_dirty = False
             self._service = None
+            self._invalidate_cache()
             raise CalendarReconnectRequiredError(
                 "Google Calendar authorization was rejected; reconnect your calendar"
             ) from exc
@@ -284,7 +418,7 @@ class CalendarService:
         page_token: str | None = None
         while True:
             response = self._execute(
-                service.calendarList().list(pageToken=page_token)
+                service.calendarList().list(pageToken=page_token), retry_safe=True
             )
             items = response.get("items", [])
             if isinstance(items, list):
@@ -321,6 +455,7 @@ class CalendarService:
             self._last_query_complete = True
             return deepcopy(cached[1])
 
+        self._last_query_complete = False
         service = self._get_service()
         if service is None:
             self._last_query_complete = False
@@ -340,7 +475,8 @@ class CalendarService:
                             singleEvents=True,
                             orderBy="startTime",
                             pageToken=page_token,
-                        )
+                        ),
+                        retry_safe=True,
                     )
                     for event in response.get("items", []):
                         if not isinstance(event, Mapping):
@@ -389,7 +525,7 @@ class CalendarService:
         except HttpError as exc:
             self._raise_if_reconnect_required(exc)
             complete = False
-            logger.warning("Google Calendar event query failed", exc_info=True)
+            logger.warning("Google Calendar event query failed (HTTP %s)", _http_status(exc))
         except (OSError, TypeError, ValueError):
             complete = False
             logger.warning("Google Calendar event query failed", exc_info=True)
@@ -437,7 +573,8 @@ class CalendarService:
         calendar_id = self._ensure_kalendra_calendar()
         try:
             event = self._execute(
-                service.events().get(calendarId=calendar_id, eventId=event_id)
+                service.events().get(calendarId=calendar_id, eventId=event_id),
+                retry_safe=True,
             )
         except HttpError as exc:
             if _is_not_found(exc):
@@ -472,7 +609,7 @@ class CalendarService:
             entries: list[CalendarRecord] = []
             while True:
                 response = self._execute(
-                    service.calendarList().list(pageToken=page_token)
+                    service.calendarList().list(pageToken=page_token), retry_safe=True
                 )
                 entries.extend(
                     entry for entry in response.get("items", []) if isinstance(entry, dict)
@@ -719,7 +856,8 @@ class CalendarService:
             current = self._execute(
                 service.events().get(
                     calendarId=calendar_id, eventId=gcal_event_id
-                )
+                ),
+                retry_safe=True,
             )
             if not self._is_owned_event(current):
                 raise CalendarError("Refusing to update an event not owned by Kalendra")
@@ -825,14 +963,16 @@ class CalendarService:
         calendar_id = self._ensure_kalendra_calendar()
         try:
             current = self._execute(
-                service.events().get(calendarId=calendar_id, eventId=gcal_event_id)
+                service.events().get(calendarId=calendar_id, eventId=gcal_event_id),
+                retry_safe=True,
             )
             if not self._is_owned_event(current):
                 raise CalendarError("Refusing to delete an event not owned by Kalendra")
             self._execute(
                 service.events().delete(
                     calendarId=calendar_id, eventId=gcal_event_id
-                )
+                ),
+                retry_safe=True,
             )
         except HttpError as exc:
             if _is_not_found(exc):
@@ -864,7 +1004,8 @@ class CalendarService:
                         timeMax=end_utc.isoformat(),
                         singleEvents=True,
                         pageToken=page_token,
-                    )
+                    ),
+                    retry_safe=True,
                 )
                 for event in response.get("items", []):
                     if event.get("id") and self._is_work_block(event):
@@ -876,7 +1017,8 @@ class CalendarService:
                 self._execute(
                     service.events().delete(
                         calendarId=calendar_id, eventId=event_id
-                    )
+                    ),
+                    retry_safe=True,
                 )
         except HttpError as exc:
             self._raise_if_reconnect_required(exc)
@@ -965,12 +1107,14 @@ class CalendarService:
         calendar_id = self._ensure_kalendra_calendar()
         try:
             current = self._execute(
-                service.events().get(calendarId=calendar_id, eventId=gcal_event_id)
+                service.events().get(calendarId=calendar_id, eventId=gcal_event_id),
+                retry_safe=True,
             )
             if not self._is_work_block(current):
                 raise CalendarError("Refusing to delete an event that is not a movable work block")
             self._execute(
-                service.events().delete(calendarId=calendar_id, eventId=gcal_event_id)
+                service.events().delete(calendarId=calendar_id, eventId=gcal_event_id),
+                retry_safe=True,
             )
         except HttpError as exc:
             if _is_not_found(exc):

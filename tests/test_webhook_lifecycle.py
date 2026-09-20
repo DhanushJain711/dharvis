@@ -40,6 +40,10 @@ async def test_runtime_initialization_is_once(monkeypatch) -> None:
         async def initialize(self) -> None:
             calls.append("store")
 
+        async def get_notification_times(self):
+            calls.append("times")
+            return {"morning": "08:00", "evening": "21:00"}
+
     async def bindings(*_args):
         calls.append("bindings")
         return {"add_task": object()}
@@ -59,7 +63,7 @@ async def test_runtime_initialization_is_once(monkeypatch) -> None:
     await telegram_handler.initialize_application_runtime(app)
     await telegram_handler.initialize_application_runtime(app)
 
-    assert calls == ["store", "bindings"]
+    assert calls == ["store", "times", "bindings"]
     assert app.bot_data["runtime_initialized"] is True
 
 

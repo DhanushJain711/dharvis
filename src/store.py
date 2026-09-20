@@ -22,6 +22,7 @@ from .migrate import run_migrations
 Record = dict[str, Any]
 TaskStatus = Literal["pending", "scheduled", "completed", "dropped"]
 ReminderStatus = Literal["pending", "delivered", "cancelled"]
+ActualMinutesSource = Literal["user", "debrief", "calendar", "inferred"]
 
 _TASK_FIELDS = {
     "title", "description", "deadline", "estimated_minutes", "category", "energy",
@@ -56,8 +57,9 @@ _DATETIME_FIELDS = {
     "period_start", "period_end", "cancelled_at", "expires_at", "claimed_at", "consumed_at",
     "remind_at", "updated_at", "delivered_at", "last_attempt_at", "next_attempt_at",
     "lease_expires_at",
+    "progress_updated_at", "reopened_at", "processed_at",
 }
-_JSON_FIELDS = {"facts_used", "tool_calls", "planned", "completed", "payload", "conflicts"}
+_JSON_FIELDS = {"facts_used", "tool_calls", "planned", "completed", "payload", "conflicts", "snapshot"}
 _BOOL_FIELDS = {"active", "surfaced_to_user", "scheduling_enabled"}
 _PLACEHOLDER_REASONING = {
     "", "because", "because reason", "because reasons", "dummy", "example", "n a",
@@ -268,6 +270,8 @@ class Store:
         self._uri = self._memory or supplied_text.startswith("file:")
         self._keeper: aiosqlite.Connection | None = None
         self._initialize_lock = asyncio.Lock()
+        # Serialize fixed-event tool writes sharing this runtime's store.
+        self.event_mutation_lock = asyncio.Lock()
 
     async def initialize(self) -> None:
         """Install or migrate the canonical schema."""
@@ -324,7 +328,11 @@ class Store:
             await db.close()
 
     async def add_tasks(self, tasks: list[Record]) -> list[Record]:
-        """Persist a batch of task payloads and return their records."""
+        """Persist tasks, reusing an exact active identity on creation replay.
+
+        Only full title (case/whitespace normalized), deadline, category and
+        goal identify a replay. Task-family similarity never merges tasks.
+        """
         if not isinstance(tasks, list) or not tasks:
             raise ValueError("tasks must be a non-empty list")
         allowed = _TASK_FIELDS - {
@@ -334,6 +342,7 @@ class Store:
         ids: list[int] = []
         async with self.connection() as db:
             try:
+                await db.execute("BEGIN IMMEDIATE")
                 for task in tasks:
                     unknown = set(task) - allowed
                     if unknown:
@@ -355,6 +364,19 @@ class Store:
                         )
                     if "deadline" in values:
                         values["deadline"] = _db_value("deadline", values["deadline"])
+                    candidates = await db.execute(
+                        """SELECT id, title FROM tasks WHERE status IN ('pending', 'scheduled')
+                           AND utc_epoch_us(deadline) IS utc_epoch_us(?)
+                           AND category = ? AND goal_id IS ? ORDER BY id""",
+                        (values.get("deadline"), values.get("category", "personal"),
+                         values.get("goal_id")),
+                    )
+                    title_key = " ".join(values["title"].casefold().split())
+                    existing = next((row for row in await candidates.fetchall()
+                                     if " ".join(row["title"].casefold().split()) == title_key), None)
+                    if existing is not None:
+                        ids.append(int(existing["id"]))
+                        continue
                     fields = list(values)
                     cursor = await db.execute(
                         f"INSERT INTO tasks ({', '.join(fields)}) VALUES ({', '.join('?' for _ in fields)})",
@@ -367,6 +389,79 @@ class Store:
                 raise
             rows = await self._fetch_ids(db, "tasks", ids)
         return rows
+
+    async def get_notification_times(self) -> dict[str, str]:
+        """Return persisted local HH:MM preferences with configured defaults."""
+        result = {"morning": config.DAILY_BRIEF_TIME, "evening": config.DAILY_DEBRIEF_TIME}
+        async with self.connection() as db:
+            cursor = await db.execute("SELECT key, value FROM app_settings")
+            result.update({row["key"]: row["value"] for row in await cursor.fetchall()})
+        return result
+
+    async def set_notification_times(
+        self, *, morning: str | None = None, evening: str | None = None
+    ) -> dict[str, str]:
+        """Persist supplied local clock preferences atomically; omitted values stay unchanged."""
+        values = {key: value for key, value in {"morning": morning, "evening": evening}.items()
+                  if value is not None}
+        for key, value in values.items():
+            if not isinstance(value, str) or not re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", value):
+                raise ValueError(f"{key} must be a local 24-hour HH:MM time")
+        async with self.connection() as db:
+            try:
+                await db.execute("BEGIN IMMEDIATE")
+                for key, value in values.items():
+                    await db.execute(
+                        "INSERT INTO app_settings (key, value) VALUES (?, ?) "
+                        "ON CONFLICT(key) DO UPDATE SET value = excluded.value", (key, value)
+                    )
+                await db.commit()
+            except Exception:
+                await db.rollback()
+                raise
+        return await self.get_notification_times()
+
+    async def has_processed_update(self, update_id: int) -> bool:
+        """Check a Telegram update receipt; message text is never used as identity."""
+        if type(update_id) is not int or update_id < 0:
+            raise ValueError("update_id must be a non-negative integer")
+        async with self.connection() as db:
+            cursor = await db.execute("SELECT 1 FROM processed_updates WHERE update_id = ?", (update_id,))
+            return await cursor.fetchone() is not None
+
+    async def mark_update_processed(self, update_id: int) -> None:
+        """Record successful processing after response delivery; retain 30 days of receipts."""
+        if type(update_id) is not int or update_id < 0:
+            raise ValueError("update_id must be a non-negative integer")
+        now = timeutil.now_utc()
+        async with self.connection() as db:
+            await db.execute(
+                "INSERT OR IGNORE INTO processed_updates (update_id, created_at) VALUES (?, ?)",
+                (update_id, _utc_text(now)),
+            )
+            await db.execute("DELETE FROM processed_updates WHERE created_at < ?",
+                             (_utc_text(now - timedelta(days=30)),))
+            await db.commit()
+
+    async def list_pending_calendar_cleanup(
+        self, limit: int = 50, *, task_id: int | None = None
+    ) -> list[Record]:
+        """Return owned work-block deletions still awaiting Google acknowledgement."""
+        if type(limit) is not int or limit <= 0:
+            raise ValueError("limit must be a positive integer")
+        async with self.connection() as db:
+            cursor = await db.execute(
+                "SELECT * FROM calendar_cleanup WHERE (? IS NULL OR task_id = ?) "
+                "ORDER BY created_at, gcal_event_id LIMIT ?", (task_id, task_id, limit)
+            )
+            return _records(await cursor.fetchall())
+
+    async def ack_calendar_cleanup(self, gcal_event_id: str) -> None:
+        """Remove a repair entry only after deleting its owned Google work block."""
+        event_id = _require_nonempty_text(gcal_event_id, "gcal_event_id")
+        async with self.connection() as db:
+            await db.execute("DELETE FROM calendar_cleanup WHERE gcal_event_id = ?", (event_id,))
+            await db.commit()
 
     async def add_events(self, events: list[Record]) -> list[Record]:
         """Persist a batch of local event payloads and return their records."""
@@ -797,24 +892,60 @@ class Store:
         if "title" in assignments:
             assignments["title"] = _require_nonempty_text(assignments["title"], "title")
         async with self.connection() as db:
-            if await self._get(table, item_id, db) is None:
-                raise KeyError(f"{table[:-1].capitalize()} {item_id} does not exist")
-            if assignments:
-                sql = ", ".join(f"{field} = ?" for field in assignments)
-                try:
+            try:
+                await db.execute("BEGIN IMMEDIATE")
+                current = await self._get(table, item_id, db)
+                if current is None:
+                    raise KeyError(f"{table[:-1].capitalize()} {item_id} does not exist")
+                if (
+                    table == "tasks" and current["status"] == "completed"
+                    and assignments.get("status") == "pending"
+                ):
+                    assignments.update({
+                        "completed_at": None, "actual_minutes": None,
+                        "actual_minutes_source": None,
+                        "reopened_at": _utc_text(timeutil.now_utc()),
+                    })
+                    # Reverse only automatic credit, including credit for an
+                    # earlier goal if this correction also changes the goal.
+                    await db.execute(
+                        "DELETE FROM goal_progress WHERE task_id = ? AND source = 'task'",
+                        (item_id,),
+                    )
+                    logs = await (await db.execute(
+                        "SELECT id, completed FROM daily_log WHERE completed != '[]'"
+                    )).fetchall()
+                    for log in logs:
+                        completed = json.loads(log["completed"])
+                        kept = [entry for entry in completed if not (
+                            isinstance(entry, dict)
+                            and str(entry.get("task_id")) == str(item_id)
+                        )]
+                        if kept != completed:
+                            await db.execute(
+                                "UPDATE daily_log SET completed = ? WHERE id = ?",
+                                (json.dumps(kept), log["id"]),
+                            )
+                if assignments:
+                    sql = ", ".join(f"{field} = ?" for field in assignments)
                     await db.execute(
                         f"UPDATE {table} SET {sql} WHERE id = ?",
                         [*assignments.values(), item_id],
                     )
-                    await db.commit()
-                except Exception:
-                    await db.rollback()
-                    raise
-            updated = await self._get(table, item_id, db)
+                updated = await self._get(table, item_id, db)
+                await db.commit()
+            except Exception:
+                await db.rollback()
+                raise
         assert updated is not None
         return updated
 
     async def update_task(self, task_id: int, changes: Record) -> Record:
+        """Update fields; reopening atomically reverses automatic completion credit.
+
+        Partial progress, manual goal logs, and outstanding calendar cleanup
+        survive corrections. Old checklist outcomes are removed from daily logs.
+        """
         return await self._update(
             "tasks", task_id, changes, _TASK_UPDATE_FIELDS, _TASK_CLEARABLE
         )
@@ -830,7 +961,14 @@ class Store:
         task_id: int,
         actual_minutes: int | None = None,
         actual_minutes_source: Literal["user", "debrief", "calendar", "inferred"] | None = None,
+        *,
+        observed_at: datetime | None = None,
     ) -> Record:
+        """Atomically complete once, credit a linked goal and queue calendar cleanup.
+
+        Replayed completion preserves the original completion timestamp and
+        observed duration. A Google outage cannot discard local completion.
+        """
         if actual_minutes is not None and (
             not isinstance(actual_minutes, int) or isinstance(actual_minutes, bool) or actual_minutes < 0
         ):
@@ -838,21 +976,105 @@ class Store:
         if actual_minutes is None and actual_minutes_source is not None:
             raise ValueError("actual_minutes_source requires actual_minutes")
         source = (actual_minutes_source or "user") if actual_minutes is not None else None
+        if observed_at is not None:
+            observed_at = _utc_datetime(_utc_text(observed_at, "observed_at"))
         async with self.connection() as db:
-            if await self._get("tasks", task_id, db) is None:
-                raise KeyError(f"Task {task_id} does not exist")
-            await db.execute(
-                """UPDATE tasks SET status = 'completed', completed_at = ?,
-                   actual_minutes = ?, actual_minutes_source = ?,
-                   scheduled_start = NULL, scheduled_end = NULL,
-                   gcal_event_id = NULL WHERE id = ?""",
-                (
-                    _utc_text(timeutil.now_utc(), "completed_at"), actual_minutes,
-                    source, task_id,
-                ),
-            )
-            await db.commit()
-            result = await self._get("tasks", task_id, db)
+            try:
+                await db.execute("BEGIN IMMEDIATE")
+                current = await self._get("tasks", task_id, db)
+                if current is None:
+                    raise KeyError(f"Task {task_id} does not exist")
+                if (
+                    observed_at is not None and current.get("reopened_at") is not None
+                    and current["reopened_at"] >= observed_at
+                ):
+                    await db.commit()
+                    return current
+                if current["status"] == "completed":
+                    await db.commit()
+                    return current
+                if current["status"] == "dropped":
+                    raise ValueError("That task was dropped; restore it before completing it")
+                completed_at = _utc_text(timeutil.now_utc(), "completed_at")
+                if current.get("gcal_event_id"):
+                    await db.execute(
+                        "INSERT OR IGNORE INTO calendar_cleanup (gcal_event_id, task_id, created_at) "
+                        "VALUES (?, ?, ?)", (current["gcal_event_id"], task_id, completed_at)
+                    )
+                # Partial work is only a lower bound. Do not turn it into the
+                # final actual duration used for future duration inference.
+                await db.execute(
+                    """UPDATE tasks SET status = 'completed', completed_at = ?,
+                       actual_minutes = ?, actual_minutes_source = ?,
+                       scheduled_start = NULL, scheduled_end = NULL,
+                       gcal_event_id = NULL WHERE id = ?""",
+                    (completed_at, actual_minutes, source, task_id),
+                )
+                if current.get("goal_id"):
+                    goal = await self._get("goals", current["goal_id"], db)
+                    if goal is not None:
+                        minutes = actual_minutes if actual_minutes is not None else (
+                            current["progress_minutes"] or current.get("estimated_minutes")
+                        )
+                        amount = 1.0 if goal["target_unit"] == "sessions" else (minutes or 0) / 60
+                        if amount > 0:
+                            await db.execute(
+                                """INSERT OR IGNORE INTO goal_progress
+                                   (goal_id, logged_at, amount, source, task_id)
+                                   VALUES (?, ?, ?, 'task', ?)""",
+                                (goal["id"], completed_at, amount, task_id),
+                            )
+                result = await self._get("tasks", task_id, db)
+                await db.commit()
+            except Exception:
+                await db.rollback()
+                raise
+        assert result is not None
+        return result
+
+    async def log_task_progress(
+        self, task_id: int, total_minutes: int | None = None,
+        remaining_minutes: int | None = None, notes: str | None = None,
+    ) -> Record:
+        """Set cumulative observed work on the same unfinished task, retry-safely.
+
+        ``remaining_minutes`` is only the user's explicit remaining estimate;
+        it updates scheduling duration without guessing from elapsed work.
+        No completion or goal-session credit is produced by partial progress.
+        """
+        for name, value, minimum in (("total_minutes", total_minutes, 0),
+                                     ("remaining_minutes", remaining_minutes, 1)):
+            if value is not None and (type(value) is not int or value < minimum):
+                raise ValueError(f"{name} must be an integer >= {minimum} or None")
+        if notes is not None:
+            notes = _require_nonempty_text(notes, "notes")
+        async with self.connection() as db:
+            try:
+                await db.execute("BEGIN IMMEDIATE")
+                current = await self._get("tasks", task_id, db)
+                if current is None:
+                    raise KeyError(f"Task {task_id} does not exist")
+                if current["status"] not in {"pending", "scheduled"}:
+                    raise ValueError("Progress can only be recorded on an unfinished task")
+                changes: dict[str, Any] = {}
+                if total_minutes is not None and total_minutes != current["progress_minutes"]:
+                    changes["progress_minutes"] = total_minutes
+                if notes is not None and notes != current["progress_notes"]:
+                    changes["progress_notes"] = notes
+                if remaining_minutes is not None and remaining_minutes != current["estimated_minutes"]:
+                    changes["estimated_minutes"] = remaining_minutes
+                    changes["estimate_source"] = "user"
+                if changes:
+                    changes["progress_updated_at"] = _utc_text(timeutil.now_utc())
+                    await db.execute(
+                        f"UPDATE tasks SET {', '.join(f'{key} = ?' for key in changes)} WHERE id = ?",
+                        [*changes.values(), task_id],
+                    )
+                result = await self._get("tasks", task_id, db)
+                await db.commit()
+            except Exception:
+                await db.rollback()
+                raise
         assert result is not None
         return result
 
@@ -2155,6 +2377,94 @@ class Store:
             result = _record(await cursor.fetchone())
         assert result is not None
         return result
+
+    async def save_debrief_learning(
+        self, local_date: date, changes: Record, snapshot: Record,
+    ) -> Record:
+        """Atomically save a debrief and immutable evidence for background learning.
+
+        The daily-log portion always comes from the committed row; callers
+        provide conversation, decisions, and metadata captured for this attempt.
+        """
+        if type(local_date) is not date:
+            raise TypeError("local_date must be a date")
+        if not isinstance(snapshot, dict):
+            raise TypeError("snapshot must be a record")
+        unknown = set(changes) - _DAILY_LOG_FIELDS
+        if unknown:
+            raise ValueError(f"Unsupported daily-log fields: {sorted(unknown)}")
+        values = {key: _db_value(key, value) for key, value in changes.items()}
+        async with self.connection() as db:
+            try:
+                await db.execute("BEGIN IMMEDIATE")
+                await db.execute(
+                    "INSERT OR IGNORE INTO daily_log (date) VALUES (?)",
+                    (local_date.isoformat(),),
+                )
+                if isinstance(changes.get("completed"), list):
+                    completed = []
+                    for entry in changes["completed"]:
+                        task_id = entry.get("task_id") if isinstance(entry, dict) else None
+                        task = await self._get("tasks", int(task_id), db) if (
+                            str(task_id).isdigit()
+                        ) else None
+                        if task and task.get("reopened_at") and task["status"] != "completed":
+                            continue
+                        completed.append(entry)
+                    values["completed"] = _db_value("completed", completed)
+                if values:
+                    await db.execute(
+                        f"UPDATE daily_log SET {', '.join(f'{field} = ?' for field in values)} WHERE date = ?",
+                        [*values.values(), local_date.isoformat()],
+                    )
+                persisted = _record(await (await db.execute(
+                    "SELECT * FROM daily_log WHERE date = ?", (local_date.isoformat(),)
+                )).fetchone())
+                evidence = {**snapshot, "daily_log": persisted}
+                encoded = json.dumps(
+                    evidence, default=_utc_text, separators=(",", ":"), ensure_ascii=False
+                )
+                cursor = await db.execute(
+                    "INSERT INTO debrief_learning_attempts (local_date, snapshot, created_at) "
+                    "VALUES (?, ?, ?)",
+                    (local_date.isoformat(), encoded, _utc_text(timeutil.now_utc())),
+                )
+                result = await self._get("debrief_learning_attempts", int(cursor.lastrowid), db)
+                await db.commit()
+            except Exception:
+                await db.rollback()
+                raise
+        assert result is not None
+        return result
+
+    async def get_pending_debrief_learning(
+        self, local_date: date | None = None, limit: int = 50,
+    ) -> list[Record]:
+        """Read unacknowledged immutable attempts in creation order."""
+        if local_date is not None and type(local_date) is not date:
+            raise TypeError("local_date must be a date or None")
+        if type(limit) is not int or limit <= 0:
+            raise ValueError("limit must be a positive integer")
+        day = local_date.isoformat() if local_date is not None else None
+        async with self.connection() as db:
+            cursor = await db.execute(
+                "SELECT * FROM debrief_learning_attempts WHERE processed_at IS NULL "
+                "AND (? IS NULL OR local_date = ?) ORDER BY id LIMIT ?",
+                (day, day, limit),
+            )
+            return _records(await cursor.fetchall())
+
+    async def ack_debrief_learning(self, attempt_id: int) -> None:
+        """Acknowledge a completed attempt without changing its original evidence."""
+        if type(attempt_id) is not int or attempt_id <= 0:
+            raise ValueError("attempt_id must be a positive integer")
+        async with self.connection() as db:
+            await db.execute(
+                "UPDATE debrief_learning_attempts SET processed_at = ? "
+                "WHERE id = ? AND processed_at IS NULL",
+                (_utc_text(timeutil.now_utc()), attempt_id),
+            )
+            await db.commit()
 
     async def record_usage(
         self,

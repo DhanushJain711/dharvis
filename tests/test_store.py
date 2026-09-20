@@ -29,17 +29,19 @@ async def store() -> AsyncIterator[Store]:
 async def test_find_task_by_description_ranks_math_and_biases_pending_recent(
     store: Store,
 ) -> None:
+    [completed_math] = await store.add_tasks(
+        [{"title": "Finish the math worksheet", "category": "school"}]
+    )
+    await store.complete_task(completed_math["id"])
     created = await store.add_tasks(
         [
-            {"title": "Finish the math worksheet", "category": "school"},
             {"title": "Finish the math worksheet", "category": "school"},
             {"title": "Read the history chapter", "category": "school"},
             {"title": "Buy groceries", "category": "errand"},
             {"title": "Call the dentist", "category": "personal"},
         ]
     )
-    pending_math, completed_math = created[:2]
-    await store.complete_task(completed_math["id"])
+    pending_math = created[0]
 
     now = datetime(2026, 8, 26, 18, tzinfo=UTC)
     async with store.connection() as db:

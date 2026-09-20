@@ -9,7 +9,7 @@ import re
 import tempfile
 from pathlib import Path
 
-from scripts.eval_agent import RecordingTools
+from scripts.eval_agent import EVAL_NOW, RecordingTools, evaluation_time
 from src.agent import Agent
 from src.config import config
 from src.history import History
@@ -19,6 +19,14 @@ ROOT = Path(__file__).resolve().parents[1]
 BANNED = (
     "certainly!", "i've gone ahead and", "let me know if you need anything else",
     "reasoning:", "as an ai", "i'd be happy to",
+    "behavior signal", "behaviour signal", "planning behavior", "planning behaviour",
+    "fixed events set the shape", "fixed events setting the shape",
+    "behavior pattern emerging", "patterns emerging from checkins",
+    "patterns emerging from check-ins", "strongest learned behavioral pattern",
+)
+RAW_TIME = re.compile(
+    r"\b\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}|\b\d{1,2}:\d{2}(?::\d{2})?\s*(?:UTC|GMT|Z)\b",
+    re.IGNORECASE,
 )
 CAUSAL = re.compile(r"—|\bbecause\b|\bsince\b|\bonly\b|\bdeadline\b|\byou never\b", re.IGNORECASE)
 
@@ -37,23 +45,30 @@ CASES = [
     ("logged one gym session", [["assistant", "goal 5 is the gym goal"]]),
     ("actually make task 12 due Saturday", []),
     ("move it to 4", [["assistant", "event 21 is the dentist tomorrow at 2"]]),
-    ("add a fact that I do deep work before lunch", []),
+    ("what's tomorrow looking like? keep it easy to scan", []),
     ("show my goals and pending tasks", []),
     ("cancel the dentist appointment", []),
     ("schedule task 12 in the open block from 3 to 5 tomorrow", []),
-    ("I skipped the 6am gym again", []),
-    ("what changed today?", []),
+    ("I skipped the 6am gym again — can we find a time I'll actually go?", []),
+    ("what did you notice this week? don't turn it into a performance review", [
+        ["user", "I made the gym Tuesday and Thursday evenings, but missed Monday morning"],
+        ["assistant", "got it"],
+    ]),
 ]
 
 
 def violations(text: str, scheduling: bool) -> list[str]:
     lower = text.lower()
     found = [phrase for phrase in BANNED if phrase in lower]
-    bullet_lines = [line for line in text.splitlines() if re.match(r"\s*[-*•]", line)]
+    bullet_lines = [line for line in text.splitlines() if re.match(r"\s*[-*•]\s+", line)]
     if 0 < len(bullet_lines) < 3:
         found.append("short bullet list")
     if scheduling and not CAUSAL.search(text):
         found.append("schedule rationale is not a natural causal aside")
+    if RAW_TIME.search(text):
+        found.append("raw timestamp instead of a local human time")
+    if getattr(text, "failed", False):
+        found.append("agent turn failed")
     return found
 
 
@@ -73,7 +88,8 @@ async def main_async(report: Path) -> int:
             session, _ = await history.resolve_session(conversation)
             for role, content in prior:
                 await history.append(session, role, content)
-            output = await agent.run_tool_loop(message, conversation)
+            with evaluation_time():
+                output = await agent.run_tool_loop(message, conversation)
             scheduling = "schedule_task" in tools.calls
             issues = violations(output, scheduling)
             results.append({
@@ -83,7 +99,10 @@ async def main_async(report: Path) -> int:
             print(f"\n{index:02d} USER: {message}\n   BOT: {output}", flush=True)
     summary = {"passed": sum(item["passed"] for item in results), "total": len(results)}
     report.parent.mkdir(parents=True, exist_ok=True)
-    report.write_text(json.dumps({"summary": summary, "results": results}, indent=2), encoding="utf-8")
+    report.write_text(json.dumps({
+        "reference_time": EVAL_NOW.isoformat(), "timezone": config.USER_TIMEZONE,
+        "summary": summary, "results": results,
+    }, indent=2), encoding="utf-8")
     print(json.dumps(summary, indent=2))
     return 0 if summary["passed"] == summary["total"] else 1
 

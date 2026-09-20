@@ -621,7 +621,7 @@ async def test_concurrent_confirmation_claims_only_one_proposal(tmp_path):
         handlers["confirm_event_change"](proposal_id=proposal["proposal_id"]),
     )
     assert sum("events" in result for result in (one, two)) == 1
-    assert sum(result.get("reason") == "proposal_unavailable" for result in (one, two)) == 1
+    assert sum(result.get("reason") in {"proposal_unavailable", "proposal_already_used"} for result in (one, two)) == 1
 
 
 @pytest.mark.asyncio
@@ -702,7 +702,7 @@ async def test_missing_task_estimate_uses_default_and_explicit_estimate_wins(tmp
         "priority": "medium", "goal_id": None, "series_key": None,
     }])
     [explicit] = await handlers["add_task"](tasks=[{
-        "title": "outline", "description": None, "deadline": None,
+        "title": "second outline", "description": None, "deadline": None,
         "estimated_minutes": 47, "category": "school", "energy": "deep_focus",
         "priority": "medium", "goal_id": None, "series_key": None,
     }])

@@ -31,6 +31,19 @@ _ADDITIVE_COLUMNS: dict[str, dict[str, str]] = {
         ),
     },
     "tasks": {
+        "reopened_at": (
+            "TEXT CHECK (reopened_at IS NULL OR "
+            "((substr(reopened_at, -1) = 'Z' OR substr(reopened_at, -6) = '+00:00') AND "
+            "julianday(reopened_at) IS NOT NULL AND instr(reopened_at, 'T') = 11))"
+        ),
+        "progress_minutes": "INTEGER NOT NULL DEFAULT 0 CHECK (progress_minutes >= 0)",
+        "progress_notes": "TEXT",
+        "progress_updated_at": (
+            "TEXT CHECK (progress_updated_at IS NULL OR "
+            "((substr(progress_updated_at, -1) = 'Z' OR "
+            "substr(progress_updated_at, -6) = '+00:00') AND "
+            "julianday(progress_updated_at) IS NOT NULL AND instr(progress_updated_at, 'T') = 11))"
+        ),
         "series_key": "TEXT",
         "estimate_source": (
             "TEXT CHECK (estimate_source IS NULL OR "
@@ -226,7 +239,7 @@ async def run_migrations(db_path: str | Path | None = None) -> None:
             if conversations_legacy:
                 await _copy_legacy_conversations(db)
                 await db.execute("DROP TABLE conversation_context")
-            await db.execute("PRAGMA user_version = 5")
+            await db.execute("PRAGMA user_version = 6")
             violations = await (await db.execute("PRAGMA foreign_key_check")).fetchall()
             if violations:
                 raise RuntimeError(f"foreign key violations after migration: {violations!r}")

@@ -29,6 +29,35 @@ SUMMARY_MODEL = "gpt-5.6-luna"
 MAX_MODEL_CALLS = 8
 HISTORY_LIMIT = 20
 PROMPT_CACHE_KEY = "dharvis-agent-core-v1"
+READ_ONLY_TOOLS = frozenset({
+    "resolve_date", "query_schedule", "query_tasks", "query_reminders",
+    "find_free_blocks", "query_facts", "query_goals", "explain_schedule",
+})
+UNCERTAIN_CHANGES = (
+    "Some changes may already be saved. Check what's there before trying again."
+)
+
+
+class AgentTurnResult(str):
+    """Reply text with per-turn delivery/retry information.
+
+    This remains a string for existing callers. Transport code can distinguish
+    a safely retryable failure from a reply following a possible write without
+    inspecting human wording or consulting shared mutable agent state.
+    """
+
+    failed: bool
+    mutation_attempted: bool
+    retry_safe: bool
+
+    def __new__(
+        cls, text: str, *, failed: bool = False, mutation_attempted: bool = False
+    ) -> AgentTurnResult:
+        result = super().__new__(cls, text)
+        result.failed = failed
+        result.mutation_attempted = mutation_attempted
+        result.retry_safe = failed and not mutation_attempted
+        return result
 
 
 def _read_system_prompt() -> str:
@@ -246,7 +275,9 @@ class Agent:
             return await result
         return result
 
-    async def _execute_call(self, call: Any) -> tuple[str, str]:
+    async def _execute_call(
+        self, call: Any, *, on_dispatch: Callable[[str], None] | None = None
+    ) -> tuple[str, str]:
         name = str(_field(call, "name", ""))
         call_id = str(_field(call, "call_id", ""))
         raw_arguments = _field(call, "arguments", "{}")
@@ -267,6 +298,9 @@ class Agent:
             if not isinstance(arguments, dict):
                 raise TypeError("tool arguments must decode to a JSON object")
             logged_args = arguments
+            if name in TOOLS_BY_NAME and self.tool_handlers.get(name) is not None:
+                if on_dispatch is not None:
+                    on_dispatch(name)
             result = await self.execute_tool(name, arguments)
             output = _json_text(result)
             ok = True
@@ -333,10 +367,24 @@ class Agent:
             logger.exception("usage_persistence_failed")
 
     @staticmethod
-    def _friendly_failure(exc: Exception) -> str:
+    def _friendly_failure(
+        exc: Exception, *, changes_may_have_happened: bool = False
+    ) -> str:
         module = type(exc).__module__.lower()
         name = type(exc).__name__.lower()
         message = str(exc).lower()
+        if changes_may_have_happened:
+            if "openai" in module or any(
+                token in name for token in ("ratelimit", "apiconnection", "apitimeout")
+            ):
+                problem = "I lost the connection to OpenAI before I could finish."
+            elif "locked" in message or "sqlite" in module:
+                problem = "My saved data is busy, so I couldn't finish checking that."
+            elif "calendar" in module or "google" in module:
+                problem = "I lost the calendar connection before I could finish."
+            else:
+                problem = "Something broke before I could finish that."
+            return f"{problem} {UNCERTAIN_CHANGES}"
         if "openai" in module or any(
             token in name for token in ("ratelimit", "apiconnection", "apitimeout")
         ):
@@ -412,6 +460,14 @@ class Agent:
             cost_total: float | None = 0.0
             iterations = 0
             tool_call_count = 0
+            mutation_attempted = False
+
+            def record_dispatch(name: str) -> None:
+                nonlocal mutation_attempted
+                # Mark the attempt, not just success: a handler can commit a
+                # write and then fail while reconciling or returning its result.
+                if name not in READ_ONLY_TOOLS:
+                    mutation_attempted = True
             # A conflicting event proposal requires a new user message.  This
             # guards against a model attempting to approve its own warning in a
             # later tool-loop iteration of the same turn.
@@ -510,9 +566,13 @@ class Agent:
                         _terminal_failure_text(response, partial_text=output_text)
                         if noncompleted_terminal
                         else output_text
-                        if calls or output_text
+                        if calls or output_text.strip()
                         else _terminal_failure_text(response)
                     )
+                    if not calls and mutation_attempted and (
+                        noncompleted_terminal or not output_text.strip()
+                    ):
+                        terminal_text = f"{terminal_text} {UNCERTAIN_CHANGES}"
                     if self.history is not None:
                         if noncompleted_terminal:
                             if serialized_output:
@@ -536,7 +596,11 @@ class Agent:
                     input_items.extend(serialized_output)
 
                     if not calls:
-                        return terminal_text
+                        return AgentTurnResult(
+                            terminal_text,
+                            failed=noncompleted_terminal or not output_text.strip(),
+                            mutation_attempted=mutation_attempted,
+                        )
 
                     tool_call_count += len(calls)
                     async def execute_with_confirmation_guard(call: Any) -> tuple[str, str]:
@@ -554,7 +618,7 @@ class Agent:
                                 call_id,
                                 "Tool error (ValueError): event changes require an explicit affirmative confirmation in a later user message",
                             )
-                        return await self._execute_call(call)
+                        return await self._execute_call(call, on_dispatch=record_dispatch)
 
                     results = await asyncio.gather(
                         *(execute_with_confirmation_guard(call) for call in calls)
@@ -579,17 +643,27 @@ class Agent:
                 final_text = (
                     "I hit the tool-call limit before I could finish that cleanly."
                 )
+                if mutation_attempted:
+                    final_text = f"{final_text} {UNCERTAIN_CHANGES}"
                 if self.history is not None:
                     await self.history.append(
                         physical_session, "assistant", final_text
                     )
-                return final_text
+                return AgentTurnResult(
+                    final_text, failed=True, mutation_attempted=mutation_attempted
+                )
             except Exception as exc:
                 logger.exception(
                     "agent_turn_failed",
                     extra={"failure_type": type(exc).__name__, "conversation_id": session_id},
                 )
-                return self._friendly_failure(exc)
+                return AgentTurnResult(
+                    self._friendly_failure(
+                        exc, changes_may_have_happened=mutation_attempted
+                    ),
+                    failed=True,
+                    mutation_attempted=mutation_attempted,
+                )
             finally:
                 self._log_turn(
                     conversation_id=session_id,

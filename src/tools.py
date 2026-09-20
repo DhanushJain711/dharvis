@@ -99,7 +99,7 @@ _reminder_input = _object(
 TOOLS: list[ToolSchema] = [
     _tool(
         "add_task",
-        "Create one or more actionable tasks. Use this for work the user must complete, not for fixed-time appointments. Send all tasks from one user message in one call.",
+        "Create one or more new actionable tasks. Use this for new work the user must complete, not fixed appointments or progress on existing work. Query existing tasks before creating a possible duplicate; partial work, corrections, or a changed estimate update the original task with log_task_progress or update_task. Send genuinely new tasks from one message in one call. Exact active repeats return the existing task without changing it.",
         {"tasks": {"type": "array", "description": "Every task to create.", "items": _task_input, "minItems": 1}},
     ),
     _tool(
@@ -168,10 +168,20 @@ TOOLS: list[ToolSchema] = [
     ),
     _tool(
         "complete_task",
-        "Mark an existing task completed and optionally record how long it actually took. Do not use update_task for normal completion.",
+        "Mark an existing task completed only when the user says it is finished, optionally recording total actual minutes. Identify the existing task from recent context or query_tasks first. Partial work or 'not finished' uses log_task_progress, never this tool or a new follow-up task. Completion is retry-safe; if calendar_sync_pending is true, completion saved but calendar cleanup is still pending. Do not use update_task for normal completion.",
         {
             "task_id": {"type": "integer", "minimum": 1, "description": "Exact task id to complete."},
             "actual_minutes": _nullable("integer", "Observed minutes spent, or null when unknown.", minimum=0),
+        },
+    ),
+    _tool(
+        "log_task_progress",
+        "Record unfinished work on an existing task, keeping its identity and unfinished status. Use for 'worked on it', 'did an hour but not done', and progress corrections. Identify the existing task from context or query_tasks first; never create a second task for the remaining work. total_minutes is cumulative work so far, not an increment: query current progress_minutes before adding newly reported minutes, and repeat the same total on retry. remaining_minutes changes the scheduling estimate only when the user explicitly says how much remains; never subtract elapsed time to guess. This does not complete the task or earn goal-session credit.",
+        {
+            "task_id": {"type": "integer", "minimum": 1, "description": "Exact existing unfinished task id."},
+            "total_minutes": _nullable("integer", "Cumulative actual minutes spent on this task so far, or null when unknown; not minutes to add.", minimum=0),
+            "remaining_minutes": _nullable("integer", "User's explicit estimate of minutes still needed, or null to preserve the current estimate.", minimum=1),
+            "notes": _nullable("string", "Latest concise progress context, or null to keep existing notes.", minLength=1),
         },
     ),
     _tool("delete_task", "Drop an existing task the user no longer intends to do. Query first if the id is uncertain.", {"task_id": {"type": "integer", "minimum": 1, "description": "Exact task id to drop."}}),

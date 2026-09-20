@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
+import json
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
-from google.auth.exceptions import RefreshError
+from google.auth.exceptions import RefreshError, TransportError
 from googleapiclient.errors import HttpError
 
 from src.calendar_service import (
@@ -17,6 +18,7 @@ from src.calendar_service import (
     CATEGORY_COLOR_IDS,
     CalendarError,
     CalendarReconnectRequiredError,
+    CalendarWriteUncertainError,
     CalendarService,
     FIXED_EVENT_KIND,
     GOAL_SESSION_KIND,
@@ -802,8 +804,11 @@ def test_expired_token_refreshes_transparently_and_is_persisted_private(tmp_path
     assert token.stat().st_mode & 0o777 == 0o600
 
 
-@pytest.mark.parametrize("failure", [RefreshError("bad refresh"), OSError("offline")])
-def test_refresh_failure_raises_typed_reconnect_error(tmp_path: Path, failure: Exception):
+@pytest.mark.parametrize("failure", [
+    RefreshError("invalid_grant: Token has been expired or revoked."),
+    RefreshError("refresh failed", {"error": "invalid_grant"}),
+])
+def test_revoked_refresh_raises_typed_reconnect_error(tmp_path: Path, failure: Exception):
     token = tmp_path / "token.json"
     token.write_text("old", encoding="utf-8")
     service = CalendarService(token_path=token)
@@ -816,6 +821,9 @@ def test_refresh_failure_raises_typed_reconnect_error(tmp_path: Path, failure: E
 
     with pytest.raises(CalendarReconnectRequiredError, match="reconnect"):
         service._get_credentials()
+    credentials.refresh.assert_called_once()
+    assert token.read_text() == "old"
+    assert service._credentials is None
 
 
 @pytest.mark.asyncio
@@ -1311,3 +1319,200 @@ async def test_create_requires_nonblank_reasoning_before_google_insert(tmp_path:
             "   ",
         )
     events.insert.assert_not_called()
+
+
+def http_failure(status: int, reason: str) -> HttpError:
+    return HttpError(
+        resp=SimpleNamespace(status=status, reason="API failure"),
+        content=json.dumps({"error": {"errors": [{"reason": reason}]}}).encode(),
+    )
+
+
+@pytest.mark.parametrize("failure, attempts", [
+    (TransportError("offline"), 3),
+    (OSError("offline"), 3),
+    (RefreshError("temporary", {"error": "temporarily_unavailable"}), 3),
+    (RefreshError("unknown refresh failure"), 1),
+])
+def test_refresh_outage_preserves_authorization_and_never_requests_reconnect(
+    tmp_path: Path, failure: Exception, attempts: int,
+):
+    service = connected_service(tmp_path, MagicMock())
+    credentials = service._credentials
+    credentials.expired = True
+    credentials.valid = False
+    credentials.refresh_token = "fake-refresh-token"
+    credentials.refresh.side_effect = failure
+    original_client = service._service
+    with patch("src.calendar_service.sleep"), pytest.raises(CalendarError) as caught:
+        service._get_credentials()
+    assert not isinstance(caught.value, CalendarReconnectRequiredError)
+    assert "reconnect" not in str(caught.value)
+    assert service._credentials is credentials
+    assert service._service is original_client
+    assert credentials.refresh.call_count == attempts
+
+
+def test_cached_client_refreshes_then_retries_failed_token_persistence(tmp_path: Path):
+    google = MagicMock()
+    service = connected_service(tmp_path, google)
+    service.token_path.write_text("old-token")
+    credentials = service._credentials
+    credentials.expired = True
+    credentials.refresh_token = "fake-refresh-token"
+    credentials.to_json.return_value = "new-token"
+
+    def refreshed(_):
+        credentials.expired = False
+        credentials.valid = True
+
+    credentials.refresh.side_effect = refreshed
+    with patch("src.calendar_service.os.replace", side_effect=OSError("disk unavailable")):
+        with pytest.raises(CalendarError, match="could not be saved") as caught:
+            service._get_service()
+    assert not isinstance(caught.value, CalendarReconnectRequiredError)
+    assert service._credentials is credentials
+    assert service.token_path.read_text() == "old-token"
+    assert list(tmp_path.glob(".token.json.*")) == []
+    assert service._get_service() is google
+    assert service.token_path.read_text() == "new-token"
+    assert service.token_path.stat().st_mode & 0o777 == 0o600
+    credentials.refresh.assert_called_once()
+
+
+def test_refresh_while_executing_persists_replacement_without_losing_success(tmp_path: Path):
+    service = connected_service(tmp_path, MagicMock())
+    service.token_path.write_text("old-token")
+    credentials = service._credentials
+    credentials.token = "old-access-token"
+    credentials.to_json.return_value = "refreshed-token"
+    request = MagicMock()
+
+    def completed():
+        credentials.token = "new-access-token"
+        return {"id": "created-event"}
+
+    request.execute.side_effect = completed
+    with patch("src.calendar_service.os.replace", side_effect=OSError("disk unavailable")):
+        assert service._execute(request) == {"id": "created-event"}
+    assert service._credentials_dirty is True
+    assert service.token_path.read_text() == "old-token"
+    assert service._get_credentials() is credentials
+    assert service.token_path.read_text() == "refreshed-token"
+    request.execute.assert_called_once()
+
+
+@pytest.mark.parametrize("reason, attempts", [
+    ("userRateLimitExceeded", 3),
+    ("rateLimitExceeded", 3),
+    ("quotaExceeded", 1),
+    ("forbidden", 1),
+    ("forbiddenForNonOrganizer", 1),
+    ("accessNotConfigured", 1),
+])
+@pytest.mark.asyncio
+async def test_non_auth_403_keeps_connection_and_marks_calendar_incomplete(
+    tmp_path: Path, reason: str, attempts: int,
+):
+    google = MagicMock()
+    calendar_list(google, {None: {"items": [{"id": "primary"}]}})
+    events = event_resource(google)
+    request = MagicMock()
+    request.execute.side_effect = http_failure(403, reason)
+    events.list.return_value = request
+    service = connected_service(tmp_path, google)
+    credentials = service._credentials
+    with patch("src.calendar_service.sleep"):
+        assert await service.list_events(RANGE_START, RANGE_END) == []
+    assert service._last_query_complete is False
+    assert service._event_cache == {}
+    assert service._credentials is credentials
+    assert service._service is google
+    assert request.execute.call_count == attempts
+
+
+@pytest.mark.asyncio
+async def test_missing_oauth_scope_requires_reconnect(tmp_path: Path):
+    google = MagicMock()
+    calendar_list(google, {None: {"items": [{"id": "primary"}]}})
+    events = event_resource(google)
+    events.list.return_value = Request(error=http_failure(403, "insufficientPermissions"))
+    service = connected_service(tmp_path, google)
+    with pytest.raises(CalendarReconnectRequiredError):
+        await service.list_events(RANGE_START, RANGE_END)
+    assert service._service is None
+    assert service._last_query_complete is False
+
+
+@pytest.mark.parametrize("failure", [
+    http_failure(403, "userRateLimitExceeded"),
+    http_failure(503, "backendError"),
+    TransportError("temporary network failure"),
+])
+@pytest.mark.asyncio
+async def test_calendar_read_recovers_from_transient_failure(tmp_path: Path, failure: Exception):
+    google = MagicMock()
+    calendar_list(google, {None: {"items": [{"id": "primary"}]}})
+    events = event_resource(google)
+    request = MagicMock()
+    request.execute.side_effect = [failure, {"items": [google_event("visible", "Meeting")]}]
+    events.list.return_value = request
+    service = connected_service(tmp_path, google)
+    with patch("src.calendar_service.sleep"):
+        result = await service.list_events(RANGE_START, RANGE_END)
+    assert [item["id"] for item in result] == ["visible"]
+    assert service._last_query_complete is True
+    assert request.execute.call_count == 2
+
+
+@pytest.mark.parametrize("failure", [
+    http_failure(503, "backendError"), OSError("connection lost after send"),
+])
+@pytest.mark.asyncio
+async def test_ambiguous_insert_is_never_retried(tmp_path: Path, failure: Exception):
+    google = MagicMock()
+    calendar_list(google, {None: {"items": [owned_calendar()]}})
+    events = event_resource(google)
+    request = MagicMock()
+    request.execute.side_effect = failure
+    events.insert.return_value = request
+    service = connected_service(tmp_path, google)
+    with pytest.raises(CalendarWriteUncertainError, match="may have gone through") as caught:
+        await service.create_event(
+            {"title": "Dinner", "start_time": RANGE_START, "end_time": RANGE_END},
+            "the user requested this fixed-time event",
+        )
+    assert not isinstance(caught.value, CalendarReconnectRequiredError)
+    request.execute.assert_called_once()
+    events.insert.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_ambiguous_patch_is_not_replayed_and_exposes_uncertainty(tmp_path: Path):
+    google = MagicMock()
+    calendar_list(google, {None: {"items": [owned_calendar()]}})
+    events = event_resource(google)
+    events.get.return_value = Request(google_event("owned", "Work", marked=True))
+    request = MagicMock()
+    request.execute.side_effect = TransportError("response lost after applying patch")
+    events.patch.return_value = request
+    service = connected_service(tmp_path, google)
+    with pytest.raises(CalendarWriteUncertainError):
+        await service.update_event("owned", {"title": "Renamed work"})
+    request.execute.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_delete_retry_that_finds_already_deleted_finalizes_successfully(tmp_path: Path):
+    google = MagicMock()
+    calendar_list(google, {None: {"items": [owned_calendar()]}})
+    events = event_resource(google)
+    events.get.return_value = Request(google_event("owned", "Work", marked=True))
+    request = MagicMock()
+    request.execute.side_effect = [TransportError("response lost"), http_failure(404, "notFound")]
+    events.delete.return_value = request
+    service = connected_service(tmp_path, google)
+    with patch("src.calendar_service.sleep"):
+        await service.delete_work_block("owned")
+    assert request.execute.call_count == 2
+    assert service._service is google

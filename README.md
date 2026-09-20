@@ -12,13 +12,14 @@ canonical database schema.
 ## Features
 
 - **Natural Language Processing**: Add tasks, events, and query your schedule using conversational text
-- **Task Management**: Create, complete, delete, and modify tasks with deadlines and priorities
+- **Task Management**: Create, complete, reopen, and modify tasks; record partial work on the same task without duplicating the remaining work
 - **One-time Reminders**: Store quick nudges separately and send them through Telegram at the requested time without occupying Google Calendar
 - **Safe Event Management**: Conflicting fixed events are warned about first and require an explicit later confirmation before they are created or changed
 - **Goal Sessions**: Scheduling-enabled weekly/monthly goals materialize paced, task-backed work sessions and reschedule missed automatic sessions
 - **Google Calendar Integration**: Reads visible calendars for availability and briefs; writes only owned `Kalendra` events with consistent category/kind colors and optional event-specific colors
 - **Daily Briefings**: Get summaries of local commitments, external Google events, due tasks, scheduled work, goal pace, and pending reminders through the next two local days
 - **Learning From Outcomes**: Reuse observed durations only for matching completed task families; explicit estimates always take precedence
+- **Check-in Controls**: Save morning/evening times in Telegram; debrief outcomes persist while optional learning retries in the background
 
 ## Quick Start
 
@@ -137,15 +138,41 @@ am I free saturday afternoon?
 ### Modifications
 ```
 mark essay as done
+worked on the essay for an hour, still not done
+the essay needs another 45 minutes
+actually the essay isn't finished; reopen it
 cancel the meeting
 move coffee with Jake to 4pm
 push the deadline to next week
 ```
 
+Partial work stays on the original task. Reported time is recorded as cumulative
+progress; only an explicit remaining-time estimate changes its duration estimate.
+Progress does not automatically resize or move an existing calendar block.
+Completion and linked goal credit are saved together. If Google is unavailable,
+the task remains done and its calendar block is queued for cleanup. Reopening
+reverses automatic completion credit while retaining partial progress and manual
+goal entries.
+
 ### Commands
+
 - `/start` - Welcome message
 - `/help` - Usage guide
 - `/cost` - Today's and month-to-date agent/background cost and cache rate
+- `/times` - Show morning and evening check-in times
+- `/times morning 08:30` - Set the morning brief time
+- `/times evening 21:00` - Set the evening debrief time
+
+`/times` uses local 24-hour `HH:MM` in `USER_TIMEZONE` and rejects choices during
+quiet hours. Saved preferences override the environment defaults, take effect
+immediately, and survive restarts. Planning runs 15 minutes before the morning
+brief. Changing a clock does not resend an already delivered check-in that day.
+
+Debrief outcomes and their evidence are saved before background learning. A
+separate job retries the exact saved day snapshot every five minutes and after
+restart, with a 30-second extraction timeout. Follow-up answers add evidence
+without counting one day as multiple observations of a habit. Weekly reviews
+show saved completion counts, goal totals, and still-open planned tasks.
 
 ## Google Calendar Setup (Optional)
 
@@ -153,14 +180,15 @@ push the deadline to next week
 2. Create a new project
 3. Enable the Google Calendar API
 4. Create OAuth 2.0 credentials (Desktop application)
-5. Download `credentials.json` to the project root
+5. Download `credentials.json` to `DATA_DIR` (default `./data`), or set `GOOGLE_CALENDAR_CREDENTIALS_PATH` to its location
 6. Run the setup script:
 
 ```bash
 python scripts/setup_gcal_auth.py
 ```
 
-This will open a browser for authentication and save `token.json`.
+This opens a browser for authentication and saves `token.json` at the configured
+token path, with private file permissions.
 
 By default, credentials, the refreshed OAuth token, SQLite database, APScheduler
 store, and backups live under `DATA_DIR` (`./data`). Keep them together by setting
@@ -174,11 +202,48 @@ Exam and interview events are treated as fixed commitments. They do not
 automatically create study or preparation work; ask the bot to add or schedule
 prep tasks when you want them.
 
+### OAuth troubleshooting
+
+An `invalid_grant` refresh response means the existing grant can no longer be
+used. Run `python scripts/setup_gcal_auth.py` locally, confirm replacing the old
+token when prompted, and complete Google sign-in and consent in the browser.
+For a hosted bot, securely replace the token at its configured persistent token
+path and restart the process so it loads the new authorization. Do not paste
+tokens into chat, logs, or source control. Restarting alone cannot repair a
+rejected grant.
+
+For an external OAuth app whose publishing status is **Testing**, Google issues
+refresh tokens that expire after seven days unless the requested scopes are
+limited to basic identity information. Dharvis requests Calendar access, so
+that exception does not apply. Check the consent screen's publishing status if
+reauthorization keeps recurring; a seven-day interval is a possible cause, not
+proof of why a specific token failed. See Google's
+[refresh-token expiration documentation](https://developers.google.com/identity/protocols/oauth2#expiration).
+
+Temporary network failures, rate limits, and token-storage errors are reported
+separately from reconnect-required errors. Safe reads and deletes have bounded
+retries. If a calendar change is reported as uncertain, check the calendar
+before repeating it: Google may have accepted the write without returning a
+confirmation.
+
 ## Running Tests
 
 ```bash
-pytest tests/ -v
+pytest -q
+python -m compileall -q src scripts tests
+python -m src.main --check
+git diff --check
 ```
+
+Offline tests use temporary databases and fake Calendar/Telegram/model clients;
+they do not verify live Google Calendar access, Telegram delivery, or paid model
+behavior. `scripts/eval_agent.py`, `scripts/audit_scheduler.py`, and
+`scripts/audit_tone.py` use paid OpenAI calls; report their results separately.
+
+Telegram update receipts suppress already answered replays across restarts,
+but cannot guarantee exactly-once side effects if the process crashes between a
+tool write, response delivery, and saving its receipt. Exact active task repeats
+reuse the same record; migration leaves existing duplicate tasks intact.
 
 ## Project Structure
 

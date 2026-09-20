@@ -7,19 +7,22 @@ import logging
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import asdict, is_dataclass
 from datetime import UTC, datetime, timedelta
+from functools import wraps
 from typing import Any
 
 from . import timeutil
 from .calendar_service import (
     FIXED_EVENT_KIND,
+    CalendarError,
     CalendarService,
+    CalendarWriteUncertainError,
     normalize_event_color_id,
 )
 from .config import config
 from .facts_engine import FactsEngine
 from .freebusy import ScheduleBlock, find_free_blocks, overlapping_blocks, query_schedule
 from .scheduler_engine import SchedulerEngine
-from .store import Store
+from .store import ActualMinutesSource, Record, Store
 
 ToolHandler = Callable[..., Awaitable[Any]]
 logger = logging.getLogger(__name__)
@@ -73,6 +76,66 @@ def _words(value: str) -> set[str]:
     }
 
 
+async def drain_calendar_cleanup(
+    store: Store, calendar: CalendarService | None, *, limit: int = 50
+) -> int:
+    """Retry durable owned work-block deletions, acknowledging only successful writes."""
+    if calendar is None:
+        return 0
+    repaired = 0
+    for pending in await store.list_pending_calendar_cleanup(limit):
+        try:
+            await calendar.delete_work_block(pending["gcal_event_id"])
+            await store.ack_calendar_cleanup(pending["gcal_event_id"])
+        except Exception as exc:
+            logger.warning("calendar_cleanup_deferred", extra={
+                "task_id": pending["task_id"], "error_type": type(exc).__name__,
+            })
+        else:
+            repaired += 1
+    return repaired
+
+
+async def complete_task_with_calendar(
+    store: Store, calendar: CalendarService | None, task_id: int,
+    actual_minutes: int | None = None, *,
+    actual_minutes_source: ActualMinutesSource | None = None,
+    observed_at: datetime | None = None,
+) -> Record:
+    """Save completion before Google cleanup; an outage leaves a durable retry."""
+    result = await store.complete_task(
+        task_id, actual_minutes, actual_minutes_source, observed_at=observed_at
+    )
+    if result["status"] != "completed":
+        return result
+    try:
+        pending = await store.list_pending_calendar_cleanup(task_id=task_id)
+    except Exception as exc:
+        logger.warning("completion_cleanup_lookup_deferred", extra={
+            "task_id": task_id, "error_type": type(exc).__name__,
+        })
+        result["calendar_sync_pending"] = True
+        result["warning"] = "Marked done. I’ll check its calendar block again shortly."
+        return result
+    outstanding = False
+    for item in pending:
+        try:
+            if calendar is None:
+                outstanding = True
+                continue
+            await calendar.delete_work_block(item["gcal_event_id"])
+            await store.ack_calendar_cleanup(item["gcal_event_id"])
+        except Exception as exc:
+            outstanding = True
+            logger.warning("completion_calendar_cleanup_deferred", extra={
+                "task_id": task_id, "error_type": type(exc).__name__,
+            })
+    result["calendar_sync_pending"] = outstanding
+    if outstanding:
+        result["warning"] = "Marked done. I’ll remove its calendar block when Google is available again."
+    return result
+
+
 async def build_tool_handlers(
     store: Store,
     calendar: CalendarService,
@@ -80,6 +143,13 @@ async def build_tool_handlers(
     facts_engine: FactsEngine,
 ) -> dict[str, ToolHandler]:
     """Bind every schema in ``src.tools`` to real application services."""
+
+    def _serialize_event_write(handler: ToolHandler) -> ToolHandler:
+        @wraps(handler)
+        async def serialized(*args: Any, **kwargs: Any) -> Any:
+            async with store.event_mutation_lock:
+                return await handler(*args, **kwargs)
+        return serialized
 
     async def add_task(tasks: list[dict[str, Any]]) -> Any:
         payloads: list[dict[str, Any]] = []
@@ -174,7 +244,7 @@ async def build_tool_handlers(
                 local_events.append(local)
             records = await store.add_events(local_events)
         except Exception as exc:
-            compensated = True
+            compensated = not isinstance(exc, CalendarWriteUncertainError)
             for created in created_remote:
                 try:
                     await calendar.delete_event(str(created["gcal_event_id"]))
@@ -183,7 +253,11 @@ async def build_tool_handlers(
                     # never hide the original failure by replacing it here.
                     compensated = False
             raise _EventApplyError(
-                "event creation failed", compensated=compensated
+                (str(exc) if isinstance(exc, CalendarWriteUncertainError)
+                 else (str(exc) if isinstance(exc, CalendarError) else "I couldn’t finish adding the event.")
+                 + (" Nothing was kept." if compensated else
+                    " Some calendar changes may still be present; check the calendar before retrying.")),
+                compensated=compensated,
             ) from exc
         schedule_changes: list[Any] = []
         reconciliation_pending = False
@@ -240,7 +314,33 @@ async def build_tool_handlers(
     async def add_event(events: list[dict[str, Any]]) -> Any:
         validated: list[dict[str, Any]] = []
         for event in events:
-            validated.append(_validate_event(event))
+            item = _validate_event(event)
+            if item not in validated:
+                validated.append(item)
+        if not validated:
+            raise ValueError("events must be a non-empty list")
+        existing: list[Record] = []
+        new_events: list[dict[str, Any]] = []
+        for item in validated:
+            candidates = await store.query_events(item["start"], item["end"])
+            match = next((record for record in candidates if (
+                record["source"] == "bot" and record.get("gcal_event_id")
+                and " ".join(record["title"].casefold().split()) == " ".join(item["title"].casefold().split())
+                and record["start_time"] == item["start"] and record["end_time"] == item["end"]
+            )), None)
+            if match is not None:
+                # Verify the saved remote identity still exists and has not
+                # moved by hand before calling a repeated creation successful.
+                remote = await calendar.get_owned_event(match["gcal_event_id"])
+                if (_aware(remote.get("start_time"), "start_time") != item["start"]
+                        or _aware(remote.get("end_time"), "end_time") != item["end"]):
+                    raise ValueError("That event was moved in Google Calendar; update the existing event instead")
+                existing.append(match)
+            else:
+                new_events.append(item)
+        if not new_events:
+            return jsonable({"events": existing, "schedule_changes": [], "already_exists": True})
+        validated = new_events
         conflicts = await _conflicts_for(validated)
         if conflicts:
             return jsonable(await _proposal("create", {"events": validated}, conflicts))
@@ -248,9 +348,13 @@ async def build_tool_handlers(
         conflicts = await _conflicts_for(validated)
         if conflicts:
             return jsonable(await _proposal("create", {"events": validated}, conflicts))
-        return jsonable(await _apply_event_create(validated))
+        result = await _apply_event_create(validated)
+        result["events"] = existing + result["events"]
+        return jsonable(result)
 
     async def update_task(task_id: int, clear_fields: list[str], **changes: Any) -> Any:
+        if changes.get("status") == "completed":
+            raise ValueError("Use complete_task to finish a task so its calendar block and goal progress stay in sync")
         current = await store.get_task(task_id)
         if current is None:
             raise KeyError(f"Task {task_id} does not exist")
@@ -440,6 +544,10 @@ async def build_tool_handlers(
         now = timeutil.now_utc()
         if proposal["consumed_at"] is not None:
             return {"applied": False, "reason": "proposal_already_used"}
+        if proposal["claimed_at"] is not None:
+            # An uncertain remote write keeps its claim. Do not turn its new
+            # remote event into a fresh overlap proposal and duplicate it.
+            return {"applied": False, "reason": "proposal_unavailable"}
         if proposal["expires_at"] <= now:
             return {"applied": False, "reason": "proposal_expired"}
         payload = proposal["payload"]
@@ -493,13 +601,13 @@ async def build_tool_handlers(
         return jsonable(result)
 
     async def complete_task(task_id: int, actual_minutes: int | None) -> Any:
-        current = await store.get_task(task_id)
-        if current is None:
-            raise KeyError(f"Task {task_id} does not exist")
-        gcal_id = str(current.get("gcal_event_id") or "")
-        if gcal_id:
-            await calendar.delete_work_block(gcal_id)
-        return jsonable(await store.complete_task(task_id, actual_minutes))
+        return jsonable(await complete_task_with_calendar(store, calendar, task_id, actual_minutes))
+
+    async def log_task_progress(
+        task_id: int, total_minutes: int | None, remaining_minutes: int | None,
+        notes: str | None,
+    ) -> Any:
+        return jsonable(await store.log_task_progress(task_id, total_minutes, remaining_minutes, notes))
 
     async def delete_task(task_id: int) -> Any:
         current = await store.get_task(task_id)
@@ -657,13 +765,14 @@ async def build_tool_handlers(
 
     handlers: dict[str, ToolHandler] = {
         "add_task": add_task,
-        "add_event": add_event,
+        "add_event": _serialize_event_write(add_event),
         "update_task": update_task,
-        "update_event": update_event,
-        "confirm_event_change": confirm_event_change,
+        "update_event": _serialize_event_write(update_event),
+        "confirm_event_change": _serialize_event_write(confirm_event_change),
         "complete_task": complete_task,
+        "log_task_progress": log_task_progress,
         "delete_task": delete_task,
-        "delete_event": delete_event,
+        "delete_event": _serialize_event_write(delete_event),
         "query_schedule": query_schedule_tool,
         "query_tasks": query_tasks,
         "add_reminder": add_reminder,

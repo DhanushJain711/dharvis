@@ -68,6 +68,8 @@ The following are non-negotiable:
 
 When moving multiple tasks, maintain rollback/reconciliation behavior. Never broadly clear a calendar range when selective mutation can preserve fixed and unknown blocks.
 
+Partial work belongs on its existing task through `log_task_progress`. Record cumulative observed minutes, preserve the unfinished status, and change remaining duration only from an explicit user estimate. Do not automatically replan or resize a scheduled block from progress alone. Completion must use `Store.complete_task()` for atomic completion, goal credit, and durable calendar-cleanup enqueueing, then the integration adapter for remote cleanup. A Google outage must not undo saved completion. Reopening reverses automatic completion credit and stale daily-log outcomes while preserving manual logs and partial work; checklist completion must respect `observed_at`/`reopened_at`. Exact creation replay may reuse an active identity, but do not destructively merge existing duplicate tasks.
+
 ## Memory and learning rules
 
 - Explicit user facts may be active immediately.
@@ -78,7 +80,7 @@ When moving multiple tasks, maintain rollback/reconciliation behavior. Never bro
 - The scheduler consumes active facts and goal progress. It must not infer private history that was not supplied in its payload.
 - Do not claim the bot predicts task duration automatically. Work-block length comes from `estimated_minutes` unless that explicit field is updated.
 
-Debrief learning must pass the persisted daily log, same-day conversation records, and same-day schedule decisions to `FactsEngine.extract_from_day()`. Keep the exact path from `jobs.handle_debrief_submission()` integration-tested; mock-only signature compatibility is insufficient. Historical duration inference may use only completed tasks with matching normalized series key, category, and energy, and must retain its observed task IDs; it is deterministic and must not introduce a vector store or implicit duration prediction.
+Debrief submission must atomically queue the persisted daily log, same-day conversation records, and same-day schedule decisions as immutable evidence without waiting for facts-model extraction. Background retries pass that saved bundle to `FactsEngine.extract_from_day()` with a bounded timeout and acknowledge it separately; never rebuild a retry from later conversation. Same-day reflections may add evidence but cannot count as multiple independent habit observations. Keep the exact path from `jobs.handle_debrief_submission()` through the queued retry integration-tested; mock-only signature compatibility is insufficient. Historical duration inference may use only completed tasks with matching normalized series key, category, and energy, and must retain its observed task IDs; partial minutes are not final actual duration. It is deterministic and must not introduce a vector store or implicit duration prediction.
 
 ## Calendar and OAuth rules
 
@@ -86,7 +88,7 @@ Google OAuth uses the full Calendar read/write scope, but the application delibe
 
 Fixed-event writes first check the fully merged, freshly read schedule. An overlap must create an expiring warning proposal, and an explicit affirmative later user turn must claim it atomically before the external write; finalize only after success and release only after compensated failure. Do not infer confirmation from the proposing turn. Google event colors are deterministic category/kind palette values unless the user deliberately selected another valid color.
 
-Do not print secret values in logs, tests, tool output, or review notes. Tests should use fake calendar clients and temporary databases. If an existing token lacks the required scope or cannot refresh, surface a reconnect-required error rather than weakening authorization checks.
+Do not print secret values in logs, tests, tool output, or review notes; keep all `Config` field values out of its representation. Tests should use fake calendar clients and temporary databases. Missing scope, rejected authorization, or a revoked/expired refresh grant requires reconnection. Distinguish those from transient transport, rate-limit, and credential-storage failures. Retry only safe reads/deletes at the Calendar boundary; an uncertain insert/update must surface `CalendarWriteUncertainError`, preserve any confirmation claim, and never be described as compensated rollback.
 
 ## Agent behavior
 
@@ -100,6 +102,8 @@ static system prompt → durable facts → current time context
 
 The loop is capped at eight model calls. Tool failures are model-visible results and must not crash the process. Keep static prompt content ahead of dynamic content so prompt caching remains effective.
 
+Preserve `AgentTurnResult` string-compatible `failed`, `mutation_attempted`, and `retry_safe` metadata through transport. Use it for Telegram receipt decisions rather than matching response wording. Receipts follow delivered replies and suppress update-ID replays; pre-mutation failures remain retryable. Do not claim exactly-once execution across process crashes.
+
 Tone changes belong in `src/prompts/system.md` and its few-shot examples. Avoid corporate helpdesk phrasing, unnecessary restatement, and detached “Reasoning:” paragraphs. Scheduling confirmations include one natural causal aside.
 
 ## Proactive-job rules
@@ -112,6 +116,8 @@ Tone changes belong in `src/prompts/system.md` and its few-shot examples. Avoid 
 - APScheduler job IDs must remain stable and use coalescing plus single-instance guards.
 - Explicit reminder delivery bypasses quiet hours and active-conversation deferral. Claim a durable per-reminder lease before sending, acknowledge only after Telegram accepts the message, and release failures for retry; the contract is at least once.
 - Morning briefs may read overdue and near-term reminders, but must not claim, acknowledge, or otherwise suppress their due-time delivery.
+- Saved `/times` morning/evening clocks override environment defaults, reject quiet-hour choices, update the live scheduler, and load before job registration on restart. Preserve occurrence markers and stable job IDs when clocks change.
+- Briefs use readable local times and short causal asides; weekly reviews report concrete recorded outcomes without inventing behavioral patterns.
 
 ## Testing expectations
 

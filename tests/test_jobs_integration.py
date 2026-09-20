@@ -105,6 +105,8 @@ async def test_debrief_extracts_real_facts_engine_with_bounded_evidence_and_late
     }
 
     await handle_debrief_submission(store, facts, object(), event, "day")
+    assert not responses.calls
+    await jobs_module._retry_debrief_learning(store, facts, local_date)
 
     first_payload = json.loads(responses.calls[0]["input"])
     assert first_payload["daily_log"]["date"] == local_date.isoformat()
@@ -116,6 +118,7 @@ async def test_debrief_extracts_real_facts_engine_with_bounded_evidence_and_late
     await handle_debrief_submission(
         store, facts, object(), {**event, "response": "The afternoon worked well."}, "day"
     )
+    await jobs_module._retry_debrief_learning(store, facts, local_date)
 
     assert len(responses.calls) == 2
     second_payload = json.loads(responses.calls[1]["input"])
@@ -166,7 +169,7 @@ async def test_morning_brief_includes_complete_external_calendar_view_without_mi
     text, _ = await _render_brief(store, local_date, calendar=Calendar())
 
     assert "Events:" in text
-    assert "all day Holiday" in text
+    assert "all day · Holiday" in text
     assert text.count("Local meeting") == 1
     assert "+2 more" in text
 
@@ -240,7 +243,7 @@ async def test_debrief_deletes_owned_block_and_accepts_only_stored_checklist_tas
 
 
 @pytest.mark.asyncio
-async def test_debrief_keeps_scheduled_task_retryable_when_block_delete_fails(
+async def test_debrief_saves_completion_and_queues_cleanup_when_calendar_fails(
     tmp_path, monkeypatch,
 ):
     store = Store(tmp_path / "delete-failure.sqlite")
@@ -264,13 +267,16 @@ async def test_debrief_keeps_scheduled_task_retryable_when_block_delete_fails(
         jobs_module, "_runtime",
         SimpleNamespace(engine=SimpleNamespace(calendar=FailingCalendar())),
     )
-    with pytest.raises(RuntimeError, match="calendar outage"):
-        await handle_debrief_submission(store, _FactsSpy(), object(), {
-            "callback_prefix": f"daily-debrief:{local_date.isoformat()}",
-            "checklist_id": "delete-failure",
-            "items": [{"checked": True, "value": {"task_id": task["id"]}}],
-        })
+    await handle_debrief_submission(store, _FactsSpy(), object(), {
+        "callback_prefix": f"daily-debrief:{local_date.isoformat()}",
+        "checklist_id": "delete-failure",
+        "items": [{"checked": True, "value": {"task_id": task["id"]}}],
+    })
 
     retained = await store.get_task(task["id"])
-    assert retained["status"] == "scheduled"
-    assert retained["gcal_event_id"] == "owned-block"
+    assert retained["status"] == "completed"
+    assert retained["gcal_event_id"] is None
+    pending = await store.list_pending_calendar_cleanup()
+    assert [row["gcal_event_id"] for row in pending] == ["owned-block"]
+    log = await store.get_daily_log(local_date)
+    assert "[debrief-checklist:delete-failure]" in log["notes"]

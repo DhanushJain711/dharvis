@@ -17,16 +17,16 @@
   {"id":"relative_two_weeks","category":"relative_dates","message":"portfolio draft due two weeks from today","expected":["resolve_date","add_task"]},
   {"id":"relative_month_end","category":"relative_dates","message":"renew the lease by the end of the month","expected":["resolve_date","add_task"]},
   {"id":"relative_next_week","category":"relative_dates","message":"schedule a planning meeting next week Tuesday at 10 for an hour","expected":["resolve_date","add_event"]},
-  {"id":"relative_monday_evening","category":"relative_dates","message":"call grandma Monday evening","expected":["resolve_date","add_task"]},
+  {"id":"relative_monday_evening","category":"relative_dates","message":"call grandma Monday evening","expected":["resolve_date","add_reminder"],"fixture_note":"A quick one-time call at a requested instant is a Telegram nudge under the reminder policy, with no work-block duration or completion tracking requested."},
   {"id":"relative_midnight","category":"relative_dates","message":"the upload is due tomorrow at midnight","expected":["resolve_date","add_task"]},
-  {"id":"relative_later_today","category":"relative_dates","message":"remind me to stretch later today","expected":["resolve_date","add_reminder"]},
+  {"id":"relative_later_today","category":"relative_dates","message":"remind me to stretch later today","expected":["resolve_date","add_reminder"],"allow_time_clarification":true,"fixture_note":"The production parser may reject 'later today'; asking a specific time question after that parse failure is valid only without mutations. Successful resolution and reminder creation remain valid."},
 
   {"id":"ambiguous_it","category":"ambiguous_references","message":"move it to 4","expected":[]},
   {"id":"ambiguous_delete","category":"ambiguous_references","message":"delete that thing","expected":[]},
   {"id":"ambiguous_task_name","category":"ambiguous_references","message":"mark the report done","expected":["query_tasks","complete_task"]},
   {"id":"ambiguous_event_name","category":"ambiguous_references","message":"cancel the dentist appointment","expected":["query_schedule","delete_event"]},
   {"id":"ambiguous_why","category":"ambiguous_references","message":"why is the pset there?","expected":["query_tasks","explain_schedule"]},
-  {"id":"ambiguous_fact","category":"ambiguous_references","message":"that gym preference is wrong","expected":["query_facts"]},
+  {"id":"ambiguous_fact","category":"ambiguous_references","message":"that gym preference is wrong","expected":["query_facts"],"requires_clarification":true,"fixture_note":"The fixture supplies two distinct active gym preferences, so this reference requires clarification before either fact is changed."},
   {"id":"ambiguous_goal","category":"ambiguous_references","message":"log one session toward my gym goal","expected":["query_goals","log_goal_progress"]},
 
   {"id":"correct_task_deadline","category":"corrections","message":"actually make it due Saturday","prior":[["user","add the report due Friday"],["assistant","added the report as task 12, due Friday"]],"expected":["resolve_date","update_task"]},
@@ -40,7 +40,7 @@
   {"id":"context_complete_task","category":"multi_turn_context","message":"done with it, took 40 minutes","prior":[["user","what's due next?"],["assistant","task 12, the pset, is next"]],"expected":["complete_task"]},
   {"id":"context_delete_event","category":"multi_turn_context","message":"delete that one","prior":[["user","show dinner tomorrow"],["assistant","event 21 is dinner tomorrow at 7"]],"expected":["delete_event"]},
   {"id":"context_goal_progress","category":"multi_turn_context","message":"log another session","prior":[["assistant","goal 5 is your three gym sessions per week goal"]],"expected":["log_goal_progress"]},
-  {"id":"context_schedule","category":"multi_turn_context","message":"put it in that gap","prior":[["assistant","task 12 is the pset; the open block is 2026-08-27T20:00:00Z to 2026-08-27T22:00:00Z"]],"expected":["schedule_task"]},
+  {"id":"context_schedule","category":"multi_turn_context","message":"put it in that gap","prior":[["assistant","task 12 is the pset; the open block is 2026-09-21T20:00:00Z to 2026-09-21T22:00:00Z"]],"expected":["schedule_task"]},
   {"id":"context_why","category":"multi_turn_context","message":"why there?","prior":[["assistant","I put task 12, the pset, at 3pm"]],"expected":["explain_schedule"]},
 
   {"id":"query_day","category":"cross_domain_queries","message":"what's on my schedule and due tomorrow?","expected":["query_schedule","query_tasks"],"unordered":true},
@@ -54,5 +54,12 @@
   {"id":"color_match_reference","category":"event_colors","message":"add office hours Friday at 11 for an hour, same color as my CS311 lecture","expected":["resolve_date","query_schedule","add_event"],"unordered":true},
   {"id":"color_inherited_reference","category":"event_colors","message":"make event 21 the same color as my CS311 lecture","prior":[["assistant","event 21 is your dentist appointment"]],"expected":["query_schedule"]},
   {"id":"color_conflicting_references","category":"event_colors","message":"make event 21 the same color as my CS311 events","prior":[["assistant","event 21 is your dentist appointment"]],"expected":["query_schedule"]},
-  {"id":"color_external_refusal","category":"event_colors","message":"make my Canvas lecture purple","expected":["query_schedule"]}
+  {"id":"color_external_refusal","category":"event_colors","message":"make my Canvas lecture purple","expected":["query_schedule"]},
+
+  {"id":"progress_first_hour","category":"task_consistency","message":"worked on the math pset for an hour but didn't finish","expected":["query_tasks","log_task_progress"],"expected_arguments":[{"name":"log_task_progress","arguments":{"task_id":12,"total_minutes":60,"remaining_minutes":null}}]},
+  {"id":"progress_additional","category":"task_consistency","message":"another 30 minutes on the pset, still not done","prior":[["assistant","task 12 is your math pset; you've logged 60 minutes so far"]],"expected":["log_task_progress"],"expected_arguments":[{"name":"log_task_progress","arguments":{"task_id":12,"total_minutes":90,"remaining_minutes":null}}]},
+  {"id":"progress_remaining","category":"task_consistency","message":"did another 15 minutes on task 12, need 30 more minutes to finish","prior":[["assistant","task 12 is your math pset; you've logged 30 minutes so far"]],"expected":["log_task_progress"],"expected_arguments":[{"name":"log_task_progress","arguments":{"task_id":12,"total_minutes":45,"remaining_minutes":30}}]},
+  {"id":"progress_no_duration","category":"task_consistency","message":"made some progress on task 12, got through the first two problems but still not done","prior":[["assistant","task 12 is your math pset"]],"expected":["log_task_progress"],"expected_arguments":[{"name":"log_task_progress","arguments":{"task_id":12,"total_minutes":null,"remaining_minutes":null}}]},
+  {"id":"completion_retry","category":"task_consistency","message":"check the math pset — if it isn't already done, mark it done; don't create anything","expected":["query_tasks"],"optional_tools":["complete_task"],"expected_arguments":[{"name":"complete_task","optional":true,"arguments":{"task_id":12}}]},
+  {"id":"completion_correction","category":"task_consistency","message":"actually task 12 isn't finished, put it back to pending, don't add a new task","prior":[["assistant","marked the math pset, task 12, done"]],"expected":["update_task"],"expected_arguments":[{"name":"update_task","arguments":{"task_id":12,"status":"pending"}}]}
 ]

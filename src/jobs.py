@@ -14,8 +14,8 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import json
 import logging
-import math
 import os
 import re
 import sqlite3
@@ -27,7 +27,6 @@ from types import MethodType
 from typing import Any, Awaitable, Callable
 from zoneinfo import ZoneInfo
 
-from . import scheduler_engine as scheduler_module
 from . import timeutil
 from .config import config
 from .facts_engine import FactsEngine
@@ -59,6 +58,9 @@ _occurrence_locks: dict[str, asyncio.Lock] = {}
 _startup_tasks: set[asyncio.Task[None]] = set()
 _persistent_jobstore_enabled = False
 _managed_scheduler: Any | None = None
+_notification_times: dict[str, str] = {}
+_notification_lock = asyncio.Lock()
+FACTS_RETRY_JOB_ID = "proactive-debrief-facts-retry"
 
 
 @dataclass(slots=True)
@@ -99,23 +101,118 @@ def _clock_setting(env_name: str, fallback: str) -> tuple[int, int]:
     return hour, minute
 
 
+def _notification_clock(kind: str) -> tuple[int, int]:
+    """Use the saved user choice, falling back to the deployment setting."""
+    value = _notification_times.get(kind)
+    if value is not None:
+        hour, minute = value.split(":")
+        return int(hour), int(minute)
+    name = "DAILY_BRIEF_TIME" if kind == "morning" else "DAILY_DEBRIEF_TIME"
+    return _clock_setting(name, getattr(config, name))
+
+
+async def load_notification_times(store: Store) -> None:
+    """Load durable local notification clocks before registering cron jobs."""
+    global _notification_times
+    _notification_times = dict(await store.get_notification_times())
+
+
+def _register_daily_clocks(scheduler: Any) -> None:
+    """Replace only the three clock-dependent jobs, preserving stable IDs."""
+    from apscheduler.triggers.cron import CronTrigger
+
+    morning_h, morning_m = _notification_clock("morning")
+    evening_h, evening_m = _notification_clock("evening")
+    planning_minutes = (morning_h * 60 + morning_m - 15) % (24 * 60)
+    for callback, job_id, hour, minute in (
+        (_scheduled_planning, PLANNING_JOB_ID, *divmod(planning_minutes, 60)),
+        (_scheduled_morning, MORNING_JOB_ID, morning_h, morning_m),
+        (_scheduled_debrief, DEBRIEF_JOB_ID, evening_h, evening_m),
+    ):
+        scheduler.add_job(
+            callback,
+            CronTrigger(hour=hour, minute=minute, timezone=_zone()),
+            id=job_id,
+            **_job_defaults(),
+        )
+
+
+async def update_notification_times(
+    store: Store, *, morning: str | None = None, evening: str | None = None
+) -> dict[str, str]:
+    """Save local HH:MM choices and refresh cron jobs without resending today.
+
+    Times inside quiet hours are rejected rather than silently shifted. Daily
+    delivery markers remain authoritative after edits and process restarts.
+    """
+    global _notification_times
+    for value in (morning, evening):
+        if value is None:
+            continue
+        if not isinstance(value, str) or re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", value) is None:
+            raise ValueError("Use a local time like 08:30 or 20:00.")
+        hour, minute = map(int, value.split(":"))
+        probe = datetime.combine(timeutil.now_local().date(), time(hour, minute), _zone())
+        if _is_quiet(probe):
+            raise ValueError(
+                f"{value} is during your quiet hours "
+                f"({config.QUIET_HOURS_START}–{config.QUIET_HOURS_END}). Choose a time outside them."
+            )
+    async with _notification_lock:
+        saved = await store.set_notification_times(morning=morning, evening=evening)
+        _notification_times = dict(saved)
+        if _runtime is not None and getattr(_runtime, "store", None) is store:
+            _register_daily_clocks(_runtime.scheduler)
+            # A previously deferred clock occurrence must not ignore the new
+            # preference. Successful deliveries retain their durable markers.
+            for job_id in (MORNING_JOB_ID, DEBRIEF_JOB_ID, PLANNING_JOB_ID):
+                deferred = f"{job_id}-deferred"
+                if _runtime.scheduler.get_job(deferred) is not None:
+                    _runtime.scheduler.remove_job(deferred)
+        return saved
+
+
 def _day_bounds(local_date: date) -> tuple[datetime, datetime]:
     return timeutil.day_bounds(local_date)
 
 
 def _format_clock(value: datetime) -> str:
-    rendered = value.astimezone(_zone()).strftime("%I:%M").lstrip("0")
-    return rendered or "12:00"
+    local = timeutil.to_local(value)
+    rendered = local.strftime("%I:%M%p").lstrip("0").lower()
+    return rendered.replace(":00", "")
 
 
 def _format_span(start: datetime, end: datetime) -> str:
-    return f"{_format_clock(start)}–{_format_clock(end)}"
+    local_start, local_end = timeutil.to_local(start), timeutil.to_local(end)
+    end_label = _format_clock(end)
+    if local_end.date() != local_start.date():
+        end_label = f"{local_end.strftime('%a')} {end_label}"
+    if local_start.utcoffset() != local_end.utcoffset():
+        return f"{_format_clock(start)} {local_start.tzname()}–{end_label} {local_end.tzname()}"
+    return f"{_format_clock(start)}–{end_label}"
+
+
+_ISO_IN_TEXT = re.compile(
+    r"\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:?\d{2})"
+)
+
+
+def _humanize_timestamps(text: str) -> str:
+    """Render aware ISO timestamps embedded in saved prose using local dates."""
+    def render(match: re.Match[str]) -> str:
+        try:
+            value = timeutil.to_local(datetime.fromisoformat(match[0].replace("Z", "+00:00")))
+        except ValueError:
+            return "the saved time"
+        return f"{value.strftime('%a %b')} {value.day} at {_format_clock(value)}"
+
+    return _ISO_IN_TEXT.sub(render, text)
 
 
 def _one_clause(value: Any, limit: int = 105) -> str:
-    text = re.sub(r"\s+", " ", str(value or "")).strip(" .;—-")
+    text = re.sub(r"\s+", " ", _humanize_timestamps(str(value or ""))).strip(" .;—-")
     if not text:
-        return "to keep the day realistic"
+        return ""
     first = re.split(r"(?<=[.!?])\s+", text, maxsplit=1)[0].strip(" .")
     if len(first) > limit:
         first = first[: limit - 1].rsplit(" ", 1)[0].rstrip(" ,;:") + "…"
@@ -123,7 +220,7 @@ def _one_clause(value: Any, limit: int = 105) -> str:
 
 
 def _short_text(value: Any, limit: int = 48) -> str:
-    text = re.sub(r"\s+", " ", str(value or "")).strip()
+    text = re.sub(r"\s+", " ", _humanize_timestamps(str(value or ""))).strip()
     if len(text) <= limit:
         return text
     shortened = text[: limit - 1].rsplit(" ", 1)[0].rstrip(" ,;:")
@@ -351,31 +448,35 @@ def _goal_is_behind(goal: Record, local_date: date) -> bool:
 
 
 async def _format_decision(decision: Record, task: Record) -> str:
-    formatter = getattr(scheduler_module, "format_change_summary", None)
-    if callable(formatter):
-        for call in (
-            lambda: formatter(decision),
-            lambda: formatter(decision, task),
-            lambda: formatter(decision=decision, task=task),
+    """Return just the saved cause, never a second assignment confirmation."""
+    reason = _humanize_timestamps(str(decision.get("reasoning") or "")).strip()
+    # Scheduling summaries already include the title and placement. Using
+    # their output after a brief's title/time repeats the entire assignment.
+    # Legacy stored reasons can also contain that phrasing; retain its actual
+    # causal aside when present instead of inventing one.
+    for separator in (" — ", " – ", " because ", " since "):
+        if separator in reason and re.match(
+            r"(?i)\s*(?:i\s+)?(?:put|moved|scheduled|placed|rescheduled)\b", reason
         ):
-            try:
-                rendered = await _maybe_await(call())
-                if rendered:
-                    return _one_clause(rendered)
-            except TypeError:
-                continue
-            except Exception:
-                LOGGER.warning(
-                    "Could not format schedule decision %s",
-                    decision.get("id"),
-                    exc_info=True,
-                )
-                break
-    LOGGER.debug(
-        "format_change_summary is unavailable; using stored reasoning for decision %s",
-        decision.get("id"),
-    )
-    return _one_clause(decision.get("reasoning"))
+            reason = reason.split(separator, 1)[1]
+            break
+    limit = 240 if config.REASONING_VERBOSITY == "full" else 120
+    return _one_clause(reason, limit)
+
+
+async def _format_change(decision: Record, task: Record) -> str:
+    """Keep the actual move visible alongside its saved causal aside."""
+    reason = await _format_decision(decision, task)
+    if decision.get("action") == "unscheduled":
+        change = "taken off the calendar"
+    else:
+        start, end = decision.get("start"), decision.get("end")
+        if not isinstance(start, datetime) or not isinstance(end, datetime):
+            return reason
+        day = timeutil.to_local(start).strftime("%a")
+        verb = "moved to" if decision.get("action") == "moved" else "now"
+        change = f"{verb} {day} {_format_span(start, end)}"
+    return change + (f" — {reason}" if reason else "")
 
 
 async def _brief_data(
@@ -506,57 +607,64 @@ async def _render_brief(
 
     lines = [f"Today · {local_date.strftime('%a %b')} {local_date.day}"]
     if events:
-        rendered = _compact_items(
-            events,
-            lambda item: (
-                f"{'all day' if item.get('all_day') else _format_clock(item['start_time'])} "
-                f"{_short_text(item['title'])}"
-            ),
-            5,
-        )
-        lines.append(f"Events: {rendered}")
+        lines.append("\nEvents:")
+        for item in events[:5]:
+            span = "all day" if item.get("all_day") else _format_span(item["start_time"], item["end_time"])
+            lines.append(f"{span} · {_short_text(item['title'], 64)}")
+        if len(events) > 5:
+            lines.append(f"+{len(events) - 5} more events")
     if due:
         lines.append(
-            "Due: " + _compact_items(due, lambda item: _short_text(item["title"]), 5)
+            "\nDue today: " + _compact_items(due, lambda item: _short_text(item["title"]), 5)
         )
     if reminders:
         lines.append(
-            "Reminders: "
-            + _compact_items(
-                reminders,
-                lambda item: _render_brief_reminder(item, local_date),
-                5,
-            )
+            "\nReminders:\n" + "\n".join(
+                _render_brief_reminder(item, local_date) for item in reminders[:5]
+            ) + (f"\n+{len(reminders) - 5} more reminders" if len(reminders) > 5 else "")
         )
 
     included: list[int] = []
     represented: set[int] = set()
     if blocks:
-        lines.append("Work:")
+        lines.append("\nWork:")
         rendered_blocks = 0
         for task in blocks:
             if rendered_blocks >= 5:
                 break
             block_decision = by_task.get(int(task["id"]))
+            if block_decision is not None and (
+                block_decision.get("action") == "unscheduled"
+                or block_decision.get("start") != task["scheduled_start"]
+                or block_decision.get("end") != task["scheduled_end"]
+            ):
+                block_decision = None
+            if block_decision is None:
+                # Reasons already surfaced still describe today's placement;
+                # they must not be replaced with a generic fabricated reason.
+                history = await store.get_schedule_decisions(int(task["id"]))
+                block_decision = next((item for item in reversed(history)
+                    if item.get("action") != "unscheduled"
+                    and item.get("start") == task["scheduled_start"]
+                    and item.get("end") == task["scheduled_end"]), None)
             why = (
                 await _format_decision(block_decision, task)
-                if block_decision else "to protect focused progress"
+                if block_decision else ""
             )
             candidate = (
-                f"• {_format_span(task['scheduled_start'], task['scheduled_end'])} "
-                f"{'Goal: ' if task.get('goal_id') else ''}"
-                f"{_short_text(task['title'])} — {why}"
+                f"{_format_span(task['scheduled_start'], task['scheduled_end'])} · "
+                f"{_short_text(task['title'])}" + (f" — {why}" if why else "")
             )
-            if len("\n".join([*lines, candidate])) > _MAX_BRIEF_CHARS - 650:
+            if len("\n".join([*lines, candidate])) > _MAX_BRIEF_CHARS - 250:
                 break
             lines.append(candidate)
             rendered_blocks += 1
-            if block_decision is not None:
+            if block_decision is not None and not block_decision.get("surfaced_to_user"):
                 decision_id = int(block_decision["id"])
                 included.append(decision_id)
                 represented.add(decision_id)
         if len(blocks) > rendered_blocks:
-            lines.append(f"• +{len(blocks) - rendered_blocks} more work blocks")
+            lines.append(f"+{len(blocks) - rendered_blocks} more work blocks")
     if goals:
         goal_bits = []
         for goal in goals[:3]:
@@ -568,7 +676,7 @@ async def _render_brief(
             )
         if len(goals) > len(goal_bits):
             goal_bits.append(f"+{len(goals) - len(goal_bits)} more")
-        lines.append("Behind pace: " + ", ".join(goal_bits))
+        lines.append("\nGoals to catch up on: " + ", ".join(goal_bits))
 
     unmatched = [
         decision for decision in decisions if int(decision["id"]) not in represented
@@ -580,7 +688,7 @@ async def _render_brief(
         changed_task = await store.get_task(int(decision["task_id"]))
         if changed_task is None:
             continue
-        summary = await _format_decision(decision, changed_task)
+        summary = await _format_change(decision, changed_task)
         rendered_changes.append(
             f"{_short_text(changed_task['title'], 34)} — {summary}"
         )
@@ -589,20 +697,7 @@ async def _render_brief(
         remaining = len(unmatched) - len(rendered_changes)
         if remaining:
             rendered_changes.append(f"+{remaining} more changes")
-        lines.append("Changes: " + "; ".join(rendered_changes))
-
-    framing: list[str] = []
-    if due and events:
-        framing.append("The crunch is fitting the due work around fixed events.")
-    elif due:
-        framing.append("The due work is today’s pressure point.")
-    elif goals:
-        framing.append("The main risk is letting the behind-pace goal slip another day.")
-    elif events:
-        framing.append("The fixed events set the shape of the day.")
-    if blocks:
-        framing.append(f"Protect the {_format_clock(blocks[0]['scheduled_start'])} block first.")
-    lines.extend(framing[:2])
+        lines.append("\nChanges:\n" + "\n".join(rendered_changes))
     return "\n".join(lines).rstrip(), included
 
 
@@ -827,7 +922,7 @@ async def _send_daily_debrief_once(
         LOGGER.info("Evening debrief entered quiet hours while preparing; holding it")
         return
     if not checklist_tasks:
-        await _send_text(telegram, "Nothing was planned today — no checklist needed.")
+        await _send_text(telegram, "Nothing to check off today. How did the day go?")
     else:
         prefix = f"{_CHECKLIST_PREFIX}:{local_date.isoformat()}"
         if await _checklist_is_active(telegram, prefix):
@@ -843,8 +938,8 @@ async def _send_daily_debrief_once(
         if overflow:
             await _send_text(
                 telegram,
-                f"The buttons cover {_CHECKLIST_LIMIT} items; +{overflow} more planned "
-                "items are recorded in today’s log, not shown as buttons.",
+                f"Showing the first {_CHECKLIST_LIMIT} tasks here. There are {overflow} "
+                "more — you can tell me about those in a message.",
             )
         if _is_quiet():
             LOGGER.info("Debrief checklist reached quiet hours after overflow notice")
@@ -947,132 +1042,21 @@ async def _deliver_pending_followup(
             await store.upsert_daily_log(local_date, {"notes": reverted})
             _schedule_followup(local_date)
             return
-        await _send_text(telegram, _followup_question(kind))
+        try:
+            await _send_text(telegram, _followup_question(kind))
+        except Exception:
+            latest = await store.get_daily_log(local_date) or {}
+            await store.upsert_daily_log(local_date, {"notes": str(latest.get("notes") or "").replace(
+                claimed_marker, pending_marker
+            )})
+            _schedule_followup(local_date)
+            raise
         latest = await store.get_daily_log(local_date) or {}
         sent = str(latest.get("notes") or "").replace(
             claimed_marker,
             f"[debrief-followup:{identity}:{kind}:sent]",
         )
         await store.upsert_daily_log(local_date, {"notes": sent})
-
-
-def _progress_markers(
-    checklist_id: Any, local_date: date, task_id: int
-) -> tuple[str, str, str]:
-    identity = _progress_identity(checklist_id, local_date)
-    stem = f"goal-progress:{identity}:{task_id}"
-    return (
-        f"[{stem}:pending]",
-        f"[{stem}:retryable]",
-        f"[{stem}:applied]",
-    )
-
-
-def _progress_identity(checklist_id: Any, local_date: date) -> str:
-    checklist = re.sub(r"[^A-Za-z0-9_-]", "", str(checklist_id))[:48]
-    return checklist or local_date.isoformat()
-
-
-def _epoch_microseconds(value: datetime) -> int:
-    utc = value.astimezone(UTC)
-    delta = utc - datetime(1970, 1, 1, tzinfo=UTC)
-    return (
-        delta.days * 86_400_000_000
-        + delta.seconds * 1_000_000
-        + delta.microseconds
-    )
-
-
-def _attempt_marker(
-    checklist_id: Any,
-    local_date: date,
-    task_id: int,
-    goal_id: int,
-    baseline_id: int,
-    logged_at: datetime,
-    amount: float,
-) -> str:
-    identity = _progress_identity(checklist_id, local_date)
-    return (
-        f"[goal-attempt:{identity}:{task_id}:{goal_id}:{baseline_id}:"
-        f"{_epoch_microseconds(logged_at)}:{amount:.17g}]"
-    )
-
-
-def _attempt_pattern(checklist_id: Any, local_date: date, task_id: int) -> re.Pattern[str]:
-    identity = re.escape(_progress_identity(checklist_id, local_date))
-    return re.compile(
-        rf"\[goal-attempt:{identity}:{task_id}:(\d+):(\d+):(\d+):([^\]]+)\]"
-    )
-
-
-def _attempt_details(
-    notes: str, checklist_id: Any, local_date: date, task_id: int
-) -> tuple[int, int, datetime, float] | None:
-    match = _attempt_pattern(checklist_id, local_date, task_id).search(notes)
-    if match is None:
-        return None
-    goal_id, baseline_id, epoch_us = map(int, match.group(1, 2, 3))
-    logged_at = datetime(1970, 1, 1, tzinfo=UTC) + timedelta(
-        microseconds=epoch_us
-    )
-    try:
-        amount = float(match.group(4))
-    except ValueError:
-        return None
-    return goal_id, baseline_id, logged_at, amount
-
-
-def _without_attempt(
-    notes: str, checklist_id: Any, local_date: date, task_id: int
-) -> str:
-    return _attempt_pattern(checklist_id, local_date, task_id).sub("", notes).strip()
-
-
-async def _goal_progress_baseline(store: Store, goal_id: int) -> int | None:
-    try:
-        async with store.connection() as db:
-            cursor = await db.execute(
-                "SELECT COALESCE(MAX(id), 0) AS baseline FROM goal_progress "
-                "WHERE goal_id = ?",
-                (goal_id,),
-            )
-            row = await cursor.fetchone()
-        if row is None:
-            return None
-        return int(row["baseline"] if hasattr(row, "keys") else row[0])
-    except Exception:
-        LOGGER.exception("Could not capture goal-progress baseline for goal %s", goal_id)
-        return None
-
-
-async def _goal_progress_attempt_visible(
-    store: Store,
-    goal_id: int,
-    amount: float,
-    logged_at: datetime,
-    baseline_id: int,
-) -> bool | None:
-    utc_text = logged_at.astimezone(UTC).isoformat(timespec="microseconds").replace(
-        "+00:00", "Z"
-    )
-    try:
-        async with store.connection() as db:
-            cursor = await db.execute(
-                "SELECT amount FROM goal_progress WHERE goal_id = ? AND id > ? "
-                "AND source = 'task' AND logged_at = ?",
-                (goal_id, baseline_id, utc_text),
-            )
-            rows = await cursor.fetchall()
-    except Exception:
-        LOGGER.exception(
-            "Could not reconcile goal-progress attempt for goal %s", goal_id
-        )
-        return None
-    return any(
-        math.isclose(float(row["amount"]), amount, rel_tol=1e-12, abs_tol=1e-12)
-        for row in rows
-    )
 
 
 def _event_unplanned_minutes(event: Record) -> int:
@@ -1132,26 +1116,87 @@ async def _extract_day(
         )
         return
     raise RuntimeError(
-        "FactsEngine.extract_from_day is required for debrief completion; "
-        "the daily log was retained and the checklist will remain retryable"
+        "FactsEngine.extract_from_day is unavailable; saved debrief learning will retry"
     )
 
 
-async def _delete_completed_work_block(task: Record) -> None:
-    """Delete an owned work block before its local id is cleared on completion."""
-    gcal_event_id = str(task.get("gcal_event_id") or "").strip()
-    if not gcal_event_id:
+async def _save_debrief_learning(
+    store: Store, local_date: date, changes: Record, metadata: Record,
+) -> None:
+    """Save outcomes and the exact producing evidence before acknowledging Done."""
+    conversation, decisions = await _day_learning_evidence(store, local_date)
+    await store.save_debrief_learning(local_date, changes, {
+        "metadata": metadata,
+        "conversation": conversation,
+        "decisions": decisions,
+    })
+
+
+async def _retry_debrief_learning(store: Store, facts_engine: Any, local_date: date) -> None:
+    """Retry immutable snapshots; newly arriving conversation cannot alter a retry."""
+    for attempt in await store.get_pending_debrief_learning(local_date):
+        try:
+            snapshot = attempt["snapshot"]
+            persisted = snapshot["daily_log"]
+            invalidated = False
+            for completed in persisted.get("completed") or []:
+                if not isinstance(completed, dict) or type(completed.get("task_id")) is not int:
+                    continue
+                task = await store.get_task(completed["task_id"])
+                if (task and task.get("reopened_at")
+                        and task["reopened_at"] > attempt["created_at"]):
+                    invalidated = True
+                    break
+            if invalidated:
+                # An explicit undo invalidates this observation. Do not rewrite
+                # its snapshot and accidentally turn a retry into new evidence.
+                await store.ack_debrief_learning(attempt["id"])
+                continue
+            notes = str(persisted.get("notes") or "")
+            # Delivery markers are not user observations. Sanitization only
+            # uses immutable queued data, including on an acknowledgement retry.
+            reflections = [line.removeprefix("Debrief response: ")
+                for line in notes.splitlines() if line.startswith("Debrief response: ")]
+            learning_log = {**persisted, **snapshot.get("metadata", {}),
+                "date": local_date, "planned": persisted.get("planned") or [],
+                "actual": persisted.get("completed") or [],
+                "notes": "\n".join(reflections) or None}
+            planned_ids = {item["task_id"] for item in learning_log["planned"]
+                if isinstance(item, dict) and type(item.get("task_id")) is int}
+            checkable_ids = {item["task_id"] for item in learning_log["planned"]
+                if isinstance(item, dict) and type(item.get("task_id")) is int
+                and item.get("checklist_included", True)}
+            completed_ids = {item["task_id"] for item in learning_log["actual"]
+                if isinstance(item, dict) and type(item.get("task_id")) is int}
+            # The atomic save may remove a concurrently reopened completion;
+            # rates must describe the persisted snapshot, not pre-save guesses.
+            learning_log["completion_rate"] = (
+                len(planned_ids & completed_ids) / len(planned_ids) if planned_ids else 1.0
+            )
+            learning_log["checklist_completion_rate"] = (
+                len(checkable_ids & completed_ids) / len(checkable_ids) if checkable_ids else 1.0
+            )
+            await asyncio.wait_for(_extract_day(
+                facts_engine, learning_log, snapshot["conversation"], snapshot["decisions"],
+            ), timeout=30)
+            await store.ack_debrief_learning(attempt["id"])
+        except Exception:
+            LOGGER.exception("debrief_learning_deferred date=%s", local_date.isoformat())
+            break
+
+
+async def _scheduled_debrief_learning() -> None:
+    """Recover pending learning after restarts, including days older than a week."""
+    runtime = _runtime_required()
+    pending_attempts = getattr(runtime.store, "get_pending_debrief_learning", None)
+    if not callable(pending_attempts):
         return
-    calendar = getattr(getattr(_runtime, "engine", None), "calendar", None)
-    delete_work_block = getattr(calendar, "delete_work_block", None)
-    if not callable(delete_work_block):
-        raise RuntimeError(
-            "Cannot safely complete a scheduled task while its Kalendra work block "
-            "cannot be deleted; the debrief remains retryable"
-        )
-    # CalendarService refuses non-owned or non-movable Google events.  This
-    # must precede Store.complete_task(), which deliberately clears this id.
-    await delete_work_block(gcal_event_id)
+    pending = await pending_attempts()
+    for day in dict.fromkeys(str(row["local_date"]) for row in pending):
+        local_date = date.fromisoformat(day)
+        # Model work must never hold the checklist's save/acknowledgement lock.
+        async with _occurrence_lock("debrief-learning", local_date):
+            await _retry_debrief_learning(runtime.store, runtime.facts_engine, local_date)
 
 
 async def handle_debrief_submission(
@@ -1161,7 +1206,20 @@ async def handle_debrief_submission(
     event: Record,
     session_id: str | None = None,
 ) -> None:
-    """Apply a completed checklist idempotently and feed the learning system."""
+    """Save checklist outcomes; retry optional learning and cleanup separately."""
+    async with _occurrence_lock("debrief-processing", _event_date(event)):
+        await _handle_debrief_submission(store, facts_engine, telegram, event, session_id)
+
+
+async def _handle_debrief_submission(
+    store: Store,
+    facts_engine: Any,
+    telegram: Any,
+    event: Record,
+    session_id: str | None,
+) -> None:
+    from .integration import complete_task_with_calendar
+
     local_date = _event_date(event)
     log = await store.get_daily_log(local_date) or {}
     marker = _processed_marker(event.get("checklist_id"))
@@ -1181,25 +1239,12 @@ async def handle_debrief_submission(
             return
         reflection_line = f"Debrief response: {user_reflection}"
         notes = str(log.get("notes") or "").strip()
-        if reflection_line not in notes:
-            notes = _append_note(notes, reflection_line)
-            log = await store.upsert_daily_log(local_date, {"notes": notes})
-        learning_log = dict(log)
-        learning_log.update(
-            {
-                "date": local_date,
-                "checklist_id": event.get("checklist_id"),
-                "planned": log.get("planned") or [],
-                "actual": log.get("completed") or [],
-                "notes": user_reflection,
-                "session_id": session_id,
-            }
-        )
-        if _nightly_facts_marker(local_date) in notes:
-            LOGGER.info("Skipping duplicate debrief evidence after nightly fallback")
+        if reflection_line in notes:
             return
-        conversation, decisions = await _day_learning_evidence(store, local_date)
-        await _extract_day(facts_engine, learning_log, conversation, decisions)
+        notes = _append_note(notes, reflection_line)
+        await _save_debrief_learning(store, local_date, {"notes": notes}, {
+            "checklist_id": event.get("checklist_id"), "session_id": session_id,
+        })
         return
 
     prior_completed = log.get("completed") or []
@@ -1209,7 +1254,6 @@ async def handle_debrief_submission(
         if isinstance(item, dict) and str(item.get("task_id", "")).isdigit()
     }
     completed = list(prior_completed)
-    newly_completed: list[Record] = []
     planned = log.get("planned") or []
     checklist_task_ids = {
         int(item["task_id"])
@@ -1220,9 +1264,17 @@ async def handle_debrief_submission(
     }
     raw_items = event.get("items")
     items: list[Any] = raw_items if isinstance(raw_items, list) else []
-    goals_cache: list[Record] | None = None
     notes = str(log.get("notes") or "").strip()
-    uncertain_progress: list[int] = []
+    issued_at = event.get("created_at") or log.get("debrief_sent_at")
+    if isinstance(issued_at, str):
+        try:
+            issued_at = datetime.fromisoformat(issued_at.replace("Z", "+00:00"))
+        except ValueError:
+            issued_at = None
+    if not isinstance(issued_at, datetime) or issued_at.utcoffset() is None:
+        # Older callbacks lack creation time; never use a later bound that
+        # could resurrect a same-day task the user explicitly reopened.
+        issued_at = _day_bounds(local_date)[0]
     for item in items:
         if not isinstance(item, dict) or not item.get("checked"):
             continue
@@ -1242,19 +1294,31 @@ async def handle_debrief_submission(
         if task_id in known_ids:
             continue
         task = await store.get_task(task_id)
-        if task is None:
+        if task is None or task.get("status") == "dropped":
+            continue
+        if task.get("reopened_at") and task["reopened_at"] >= issued_at:
             continue
         raw_minutes = value.get("actual_minutes")
         minutes = (
             int(raw_minutes)
-            if isinstance(raw_minutes, (int, float)) and raw_minutes >= 0
-            else _scheduled_minutes(task)
+            if isinstance(raw_minutes, (int, float)) and not isinstance(raw_minutes, bool)
+            and raw_minutes >= 0
+            else None if task.get("progress_updated_at") else _scheduled_minutes(task)
         )
-        if task.get("status") != "completed":
-            await _delete_completed_work_block(task)
-            task = await store.complete_task(
-                task_id, minutes, actual_minutes_source="debrief"
+        calendar = getattr(getattr(_runtime, "engine", None), "calendar", None)
+        try:
+            task = await complete_task_with_calendar(
+                store, calendar, task_id, minutes,
+                actual_minutes_source="debrief" if minutes is not None else None,
+                observed_at=issued_at,
             )
+        except (KeyError, ValueError):
+            latest = await store.get_task(task_id)
+            if latest is None or latest.get("status") == "dropped":
+                continue
+            raise
+        if task.get("status") != "completed":
+            continue
         actual = {
             "task_id": task_id,
             "title": task.get("title"),
@@ -1265,154 +1329,7 @@ async def handle_debrief_submission(
             "goal_id": task.get("goal_id"),
         }
         completed.append(actual)
-        newly_completed.append(actual)
         known_ids.add(task_id)
-
-        goal_id = task.get("goal_id")
-        if goal_id:
-            if goals_cache is None:
-                goals_cache = await store.query_goals(active=None)
-            goal = next(
-                (g for g in goals_cache if int(g["id"]) == int(goal_id)), None
-            )
-            if goal is not None:
-                actual_minutes = int(actual["actual_minutes"] or 0)
-                amount = (
-                    1.0
-                    if goal.get("target_unit") == "sessions"
-                    else actual_minutes / 60
-                )
-                if amount > 0:
-                    pending, retryable, applied = _progress_markers(
-                        event.get("checklist_id"), local_date, task_id
-                    )
-                    if applied in notes:
-                        continue
-                    if pending in notes:
-                        details = _attempt_details(
-                            notes,
-                            event.get("checklist_id"),
-                            local_date,
-                            task_id,
-                        )
-                        if details is None:
-                            visible = None
-                        else:
-                            (
-                                attempted_goal,
-                                captured_baseline,
-                                attempted_at,
-                                attempted_amount,
-                            ) = details
-                            visible = await _goal_progress_attempt_visible(
-                                store,
-                                attempted_goal,
-                                attempted_amount,
-                                attempted_at,
-                                captured_baseline,
-                            )
-                        if visible is True:
-                            notes = _without_attempt(
-                                notes,
-                                event.get("checklist_id"),
-                                local_date,
-                                task_id,
-                            ).replace(pending, applied)
-                            await store.upsert_daily_log(
-                                local_date, {"notes": notes}
-                            )
-                            continue
-                        if visible is None:
-                            # No exact reconciliation is possible. Preserve the
-                            # in-flight claim and choose at-most-once rather than
-                            # risk duplicating committed progress.
-                            uncertain_progress.append(task_id)
-                            LOGGER.warning(
-                                "Goal progress for task %s remains ambiguous; "
-                                "not inserting a duplicate",
-                                task_id,
-                            )
-                            continue
-                        notes = _without_attempt(
-                            notes,
-                            event.get("checklist_id"),
-                            local_date,
-                            task_id,
-                        ).replace(pending, retryable)
-                        await store.upsert_daily_log(
-                            local_date, {"notes": notes}
-                        )
-
-                    baseline_id = await _goal_progress_baseline(
-                        store, int(goal_id)
-                    )
-                    if baseline_id is None:
-                        if retryable not in notes:
-                            notes = _append_note(notes, retryable)
-                        await store.upsert_daily_log(
-                            local_date, {"notes": notes}
-                        )
-                        raise RuntimeError(
-                            "Could not establish a safe goal-progress baseline; "
-                            "the checklist remains retryable"
-                        )
-                    attempted_at = timeutil.now_utc()
-                    attempt = _attempt_marker(
-                        event.get("checklist_id"),
-                        local_date,
-                        task_id,
-                        int(goal_id),
-                        baseline_id,
-                        attempted_at,
-                        amount,
-                    )
-                    if retryable in notes:
-                        notes = notes.replace(retryable, pending)
-                    else:
-                        notes = _append_note(notes, pending)
-                    notes = _append_note(notes, attempt)
-                    await store.upsert_daily_log(local_date, {"notes": notes})
-                    try:
-                        await store.log_goal_progress(
-                            int(goal_id), amount, "task", attempted_at, task_id=task_id
-                        )
-                    except Exception:
-                        visible = await _goal_progress_attempt_visible(
-                            store,
-                            int(goal_id),
-                            amount,
-                            attempted_at,
-                            baseline_id,
-                        )
-                        if visible is True:
-                            notes = _without_attempt(
-                                notes,
-                                event.get("checklist_id"),
-                                local_date,
-                                task_id,
-                            ).replace(pending, applied)
-                            await store.upsert_daily_log(
-                                local_date, {"notes": notes}
-                            )
-                            continue
-                        if visible is False:
-                            notes = _without_attempt(
-                                notes,
-                                event.get("checklist_id"),
-                                local_date,
-                                task_id,
-                            ).replace(pending, retryable)
-                        await store.upsert_daily_log(
-                            local_date, {"notes": notes}
-                        )
-                        raise
-                    notes = _without_attempt(
-                        notes,
-                        event.get("checklist_id"),
-                        local_date,
-                        task_id,
-                    ).replace(pending, applied)
-                    await store.upsert_daily_log(local_date, {"notes": notes})
 
     planned_ids = {
         int(item["task_id"])
@@ -1442,24 +1359,14 @@ async def handle_debrief_submission(
     followup_kind: str | None = None
     if notable:
         followup_kind = "unexpected" if unplanned_minutes else "miss"
-    # Commit task outcomes before extraction so a retried callback cannot
-    # duplicate goal progress. The processed marker is deliberately written
-    # only after extraction succeeds, ensuring training data is never skipped.
+    # The UI acknowledgement and learning retry state are separate: a model
+    # outage must never turn a saved completion into a failed checklist.
     if user_reflection:
         reflection_line = f"Debrief response: {user_reflection}"
         if reflection_line not in notes:
             notes = _append_note(notes, reflection_line)
-    await store.upsert_daily_log(
-        local_date,
-        {"planned": planned, "completed": completed, "notes": notes or None},
-    )
-
     day_payload: Record = {
-        "date": local_date,
         "checklist_id": event.get("checklist_id"),
-        "planned": planned,
-        "actual": completed,
-        "newly_completed": newly_completed,
         "completion_rate": (
             len(planned_ids & completed_ids) / len(planned_ids)
             if planned_ids else 1.0
@@ -1470,18 +1377,8 @@ async def handle_debrief_submission(
         "checklist_item_count": len(checkable_ids),
         "overflow_count": max(0, len(planned) - len(checkable_ids)),
         "unplanned_minutes": unplanned_minutes,
-        "goal_progress_uncertain": uncertain_progress,
-        "notes": user_reflection or None,
         "session_id": session_id,
     }
-    persisted_log = await store.get_daily_log(local_date) or {}
-    learning_log = dict(persisted_log)
-    learning_log.update(day_payload)
-    if _nightly_facts_marker(local_date) in str(persisted_log.get("notes") or ""):
-        LOGGER.info("Skipping duplicate debrief evidence after nightly fallback")
-    else:
-        conversation, decisions = await _day_learning_evidence(store, local_date)
-        await _extract_day(facts_engine, learning_log, conversation, decisions)
     if marker:
         notes = _append_note(notes, marker)
     if followup_kind:
@@ -1490,11 +1387,10 @@ async def handle_debrief_submission(
         )
         if not _FOLLOWUP_RE.search(notes):
             notes = _append_note(notes, pending_followup)
-    if marker or followup_kind:
-        await store.upsert_daily_log(
-            local_date,
-            {"notes": notes},
-        )
+    await _save_debrief_learning(
+        store, local_date,
+        {"planned": planned, "completed": completed, "notes": notes or None}, day_payload,
+    )
     if _runtime is not None:
         try:
             await _goal_hook(
@@ -1505,7 +1401,10 @@ async def handle_debrief_submission(
             # a planner outage must not make a completed checklist retry.
             LOGGER.exception("missed_goal_replan_after_debrief_failed")
     if followup_kind:
-        await _deliver_pending_followup(store, telegram, local_date)
+        try:
+            await _deliver_pending_followup(store, telegram, local_date)
+        except Exception:
+            LOGGER.exception("debrief_followup_deferred")
 
 
 async def _week_logs(store: Store, sunday: date) -> list[Record]:
@@ -1525,34 +1424,6 @@ def _sentence(text: Any) -> str:
     return re.sub(r"[.!?]+", ",", normalized).strip(" ,") + "."
 
 
-def _safe_behavior_pattern(facts: list[Record]) -> str:
-    """Aggregate fact metadata without exposing private fact content."""
-    buckets: dict[str, int] = {}
-    for fact in facts:
-        category = str(fact.get("category", "")).casefold()
-        if any(
-            token in category
-            for token in ("time", "timing", "schedul", "calendar")
-        ):
-            label = "timing"
-        elif any(token in category for token in ("energy", "focus", "sleep")):
-            label = "energy management"
-        elif any(token in category for token in ("work", "product", "task")):
-            label = "work rhythm"
-        elif any(token in category for token in ("habit", "routine", "behavior")):
-            label = "routine"
-        else:
-            label = "planning behavior"
-        buckets[label] = buckets.get(label, 0) + max(
-            1, int(fact.get("evidence_count", 1))
-        )
-    if not buckets:
-        return "Your behavioral pattern is still emerging from the weekly check-ins"
-    label, signals = max(buckets.items(), key=lambda item: (item[1], item[0]))
-    unit = "check-in" if signals == 1 else "check-ins"
-    return f"Your strongest behavioral signal was {label}, backed by {signals} {unit}"
-
-
 async def send_weekly_review(store: Store, telegram: Any, local_date: date) -> None:
     """Serialize and send one Sunday review occurrence."""
     async with _occurrence_lock("weekly", local_date):
@@ -1562,7 +1433,7 @@ async def send_weekly_review(store: Store, telegram: Any, local_date: date) -> N
 async def _send_weekly_review_once(
     store: Store, telegram: Any, local_date: date
 ) -> None:
-    """Send a restart-safe, exactly-three-sentence Sunday review."""
+    """Send a short weekly check-in grounded in recorded outcomes and goals."""
     if local_date.weekday() != 6:
         return
     log = await store.get_daily_log(local_date) or {}
@@ -1587,28 +1458,30 @@ async def _send_weekly_review_once(
         ]
         if len(goals) > len(pieces):
             pieces.append(f"+{len(goals) - len(pieces)} more active goals")
-        goal_sentence = "Goals this week: " + "; ".join(pieces)
+        goal_sentence = "This week: " + "; ".join(pieces)
     else:
-        goal_sentence = "No active goal target was on the board this week"
+        goal_sentence = "No goals to check on this week"
     logs = await _week_logs(store, local_date)
-    planned = sum(len(item.get("planned") or []) for item in logs)
-    completed = sum(len(item.get("completed") or []) for item in logs)
+    planned_ids = {int(task["task_id"]) for item in logs for task in item.get("planned") or []
+        if isinstance(task, dict) and str(task.get("task_id", "")).isdigit()}
+    completed_ids = {int(task["task_id"]) for item in logs for task in item.get("completed") or []
+        if isinstance(task, dict) and str(task.get("task_id", "")).isdigit()}
+    planned, completed = len(planned_ids), len(planned_ids & completed_ids)
     rate = round(100 * completed / planned) if planned else 100
     completion_sentence = (
-        f"You completed {completed} of {planned} planned items ({rate}%)"
-        if planned else "You had no checklist items planned this week"
+        f"You checked off {completed} of {planned} planned tasks ({rate}%)"
+        if planned else "No task check-ins saved this week"
     )
-    week_start, _ = _day_bounds(local_date - timedelta(days=6))
-    week_end, _ = _day_bounds(local_date + timedelta(days=1))
-    facts = [
-        fact for fact in await store.query_facts(active=True)
-        if isinstance(fact.get("last_confirmed_at"), datetime)
-        and week_start <= fact["last_confirmed_at"] < week_end
-    ]
-    pattern_sentence = _safe_behavior_pattern(facts)
-    message = " ".join(
-        (_sentence(goal_sentence), _sentence(completion_sentence), _sentence(pattern_sentence))
-    )
+    unfinished: list[str] = []
+    for task_id in sorted(planned_ids - completed_ids):
+        task = await store.get_task(task_id)
+        if task and task.get("status") not in {"completed", "dropped"}:
+            unfinished.append(_short_text(task["title"], 50))
+    lines = [_sentence(completion_sentence), _sentence(goal_sentence)]
+    if unfinished:
+        lines.append("Still open: " + ", ".join(unfinished[:3]) +
+            (f" (+{len(unfinished) - 3} more)" if len(unfinished) > 3 else "") + ".")
+    message = "\n".join(lines)
     if _is_quiet():
         LOGGER.info("Weekly review entered quiet hours while preparing; holding it")
         return
@@ -1626,6 +1499,9 @@ async def run_daily_planning(engine: SchedulerEngine, local_date: date) -> None:
 
 async def reconcile_calendar(engine: SchedulerEngine) -> None:
     """Resolve conflicts, coalescing or alerting according to brief proximity."""
+    if _runtime is not None and getattr(_runtime, "store", None) is not None:
+        from .integration import drain_calendar_cleanup
+        await drain_calendar_cleanup(_runtime.store, getattr(engine, "calendar", None))
     start = timeutil.now_utc()
     end = start + timedelta(days=max(1, config.SCHEDULER_LOOKAHEAD_DAYS))
     await _goal_hook(engine, "replan_missed_goal_sessions", start)
@@ -1671,7 +1547,7 @@ async def _send_change_alert(runtime: _Runtime) -> None:
                 continue
             rendered.append(
                 f"{_short_text(task['title'], 34)} — "
-                f"{await _format_decision(decision, task)}"
+                f"{await _format_change(decision, task)}"
             )
             represented.append(int(decision["id"]))
         if not rendered:
@@ -1697,7 +1573,7 @@ async def _send_change_alert(runtime: _Runtime) -> None:
 
 def _inside_brief_coalesce_window(now: datetime | None = None) -> bool:
     local_now = (now or timeutil.now_local()).astimezone(_zone())
-    hour, minute = _clock_setting("DAILY_BRIEF_TIME", "08:00")
+    hour, minute = _notification_clock("morning")
     brief = datetime.combine(local_now.date(), time(hour, minute), _zone())
     window = max(0, int(os.getenv("BRIEF_COALESCE_MINUTES", "30")))
     return -timedelta(minutes=window) <= brief - local_now <= timedelta(minutes=window)
@@ -1905,7 +1781,9 @@ async def _scheduled_weekly_for(local_date: date) -> None:
 
 async def _scheduled_planning() -> None:
     runtime = _runtime_required()
-    await run_daily_planning(runtime.engine, timeutil.now_local().date())
+    # A brief just after midnight has its planning occurrence the prior day.
+    local_date = (timeutil.now_local() + timedelta(minutes=15)).date()
+    await run_daily_planning(runtime.engine, local_date)
 
 
 async def _scheduled_reconcile() -> None:
@@ -2010,7 +1888,7 @@ def configure_jobs(
     if not callable(getattr(learning, "extract_from_day", None)):
         LOGGER.error(
             "Proactive jobs configured without FactsEngine.extract_from_day; "
-            "debrief submissions will remain retryable instead of discarding training data"
+            "debriefs will save normally and retain pending learning"
         )
     _register_completion_handler(_runtime)
 
@@ -2021,33 +1899,9 @@ def configure_jobs(
         raise RuntimeError("Install requirements.txt to enable proactive jobs") from exc
 
     zone = _zone()
-    morning_h, morning_m = _clock_setting("DAILY_BRIEF_TIME", "08:00")
-    debrief_h, debrief_m = _clock_setting("DAILY_DEBRIEF_TIME", "21:30")
     weekly_h, weekly_m = _clock_setting("WEEKLY_REVIEW_TIME", "20:30")
-    planning_at = datetime.combine(
-        date.today(), time(morning_h, morning_m)
-    ) - timedelta(minutes=15)
     defaults = _job_defaults()
-    scheduler.add_job(
-        _scheduled_planning,
-        CronTrigger(
-            hour=planning_at.hour, minute=planning_at.minute, timezone=zone
-        ),
-        id=PLANNING_JOB_ID,
-        **defaults,
-    )
-    scheduler.add_job(
-        _scheduled_morning,
-        CronTrigger(hour=morning_h, minute=morning_m, timezone=zone),
-        id=MORNING_JOB_ID,
-        **defaults,
-    )
-    scheduler.add_job(
-        _scheduled_debrief,
-        CronTrigger(hour=debrief_h, minute=debrief_m, timezone=zone),
-        id=DEBRIEF_JOB_ID,
-        **defaults,
-    )
+    _register_daily_clocks(scheduler)
     scheduler.add_job(
         _scheduled_weekly,
         CronTrigger(
@@ -2078,6 +1932,12 @@ def configure_jobs(
         _scheduled_nightly_facts,
         CronTrigger(hour=23, minute=30, timezone=zone),
         id=NIGHTLY_FACTS_JOB_ID,
+        **defaults,
+    )
+    scheduler.add_job(
+        _scheduled_debrief_learning,
+        IntervalTrigger(minutes=5, timezone=zone),
+        id=FACTS_RETRY_JOB_ID,
         **defaults,
     )
 
@@ -2143,10 +2003,14 @@ async def run_startup_catchup() -> None:
     """Backfill the latest durable daily and weekly occurrences after restart."""
     runtime = _runtime_required()
     await _scheduled_reminders()
+    await _scheduled_debrief_learning()
+    if hasattr(runtime.store, "list_pending_calendar_cleanup"):
+        from .integration import drain_calendar_cleanup
+        await drain_calendar_cleanup(runtime.store, getattr(runtime.engine, "calendar", None))
     now, today = timeutil.now_local(), timeutil.now_local().date()
     await _goal_hook(runtime.engine, "replan_missed_goal_sessions", now)
-    morning_h, morning_m = _clock_setting("DAILY_BRIEF_TIME", "08:00")
-    debrief_h, debrief_m = _clock_setting("DAILY_DEBRIEF_TIME", "21:30")
+    morning_h, morning_m = _notification_clock("morning")
+    debrief_h, debrief_m = _notification_clock("evening")
     weekly_h, weekly_m = _clock_setting("WEEKLY_REVIEW_TIME", "20:30")
 
     for offset in range(0, 8):

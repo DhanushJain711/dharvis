@@ -56,6 +56,18 @@ CREATE TABLE IF NOT EXISTS tasks (
         actual_minutes_source IS NULL
         OR actual_minutes_source IN ('user', 'debrief', 'calendar', 'inferred')
     ),
+    progress_minutes INTEGER NOT NULL DEFAULT 0 CHECK (progress_minutes >= 0),
+    progress_notes TEXT,
+    progress_updated_at TEXT CHECK (
+        progress_updated_at IS NULL OR
+        ((substr(progress_updated_at, -1) = 'Z' OR substr(progress_updated_at, -6) = '+00:00')
+         AND julianday(progress_updated_at) IS NOT NULL AND instr(progress_updated_at, 'T') = 11)
+    ),
+    reopened_at TEXT CHECK (
+        reopened_at IS NULL OR
+        ((substr(reopened_at, -1) = 'Z' OR substr(reopened_at, -6) = '+00:00')
+         AND julianday(reopened_at) IS NOT NULL AND instr(reopened_at, 'T') = 11)
+    ),
     CHECK (
         (scheduled_start IS NULL AND scheduled_end IS NULL)
         OR (scheduled_start IS NOT NULL AND scheduled_end IS NOT NULL
@@ -89,6 +101,30 @@ CREATE TABLE IF NOT EXISTS events (
     CHECK (julianday(start_time) IS NOT NULL AND instr(start_time, 'T') = 11),
     CHECK (julianday(end_time) IS NOT NULL AND instr(end_time, 'T') = 11),
     CHECK (julianday(created_at) IS NOT NULL AND instr(created_at, 'T') = 11)
+);
+
+CREATE TABLE IF NOT EXISTS app_settings (
+    key TEXT PRIMARY KEY CHECK (key IN ('morning', 'evening')),
+    value TEXT NOT NULL CHECK (
+        value GLOB '[0-2][0-9]:[0-5][0-9]' AND substr(value, 1, 2) < '24'
+    )
+);
+
+CREATE TABLE IF NOT EXISTS calendar_cleanup (
+    gcal_event_id TEXT PRIMARY KEY CHECK (length(trim(gcal_event_id)) > 0),
+    task_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE RESTRICT,
+    created_at TEXT NOT NULL CHECK (
+        (substr(created_at, -1) = 'Z' OR substr(created_at, -6) = '+00:00')
+        AND julianday(created_at) IS NOT NULL AND instr(created_at, 'T') = 11
+    )
+);
+
+CREATE TABLE IF NOT EXISTS processed_updates (
+    update_id INTEGER PRIMARY KEY CHECK (update_id >= 0),
+    created_at TEXT NOT NULL CHECK (
+        (substr(created_at, -1) = 'Z' OR substr(created_at, -6) = '+00:00')
+        AND julianday(created_at) IS NOT NULL AND instr(created_at, 'T') = 11
+    )
 );
 
 CREATE TABLE IF NOT EXISTS schedule_decisions (
@@ -238,6 +274,23 @@ CREATE TABLE IF NOT EXISTS daily_log (
     CHECK (brief_sent_at IS NULL OR (julianday(brief_sent_at) IS NOT NULL AND instr(brief_sent_at, 'T') = 11)),
     CHECK (debrief_sent_at IS NULL OR (julianday(debrief_sent_at) IS NOT NULL AND instr(debrief_sent_at, 'T') = 11))
 );
+
+CREATE TABLE IF NOT EXISTS debrief_learning_attempts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    local_date TEXT NOT NULL REFERENCES daily_log(date) ON DELETE RESTRICT,
+    snapshot TEXT NOT NULL CHECK (json_valid(snapshot) AND json_type(snapshot) = 'object'),
+    created_at TEXT NOT NULL CHECK (
+        (substr(created_at, -1) = 'Z' OR substr(created_at, -6) = '+00:00')
+        AND julianday(created_at) IS NOT NULL AND instr(created_at, 'T') = 11
+    ),
+    processed_at TEXT CHECK (
+        processed_at IS NULL OR
+        ((substr(processed_at, -1) = 'Z' OR substr(processed_at, -6) = '+00:00')
+         AND julianday(processed_at) IS NOT NULL AND instr(processed_at, 'T') = 11)
+    )
+);
+CREATE INDEX IF NOT EXISTS idx_debrief_learning_pending
+    ON debrief_learning_attempts(local_date, id) WHERE processed_at IS NULL;
 
 CREATE TABLE IF NOT EXISTS reminders (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -450,4 +503,4 @@ BEGIN
     SELECT RAISE(ABORT, 'fact is referenced by a schedule decision');
 END;
 
-PRAGMA user_version = 5;
+PRAGMA user_version = 6;

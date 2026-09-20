@@ -6,7 +6,7 @@ Dharvis is a stateful Telegram personal assistant for one authorized user. It tu
 
 - An **event** is a fixed-time commitment such as a meeting or appointment. Bot-owned events may carry a Google event-level color override.
 - A **reminder** is a quick, one-time Telegram nudge at a requested instant. It is SQLite-only and never reserves calendar time.
-- A **task** is flexible work with a deadline, estimated duration, category, energy mode, and priority.
+- A **task** is flexible work with a deadline, estimated duration, category, energy mode, priority, and cumulative partial-progress notes/minutes.
 - A **work block** is a task's scheduled interval on the dedicated Google Calendar named `Kalendra`.
 - A **schedule decision** is the immutable audit record explaining why a task was placed, moved, shortened, extended, or left unscheduled.
 - A **fact** is a durable preference or observed behavior, such as “deep work usually happens before lunch.”
@@ -29,6 +29,8 @@ production uses `src/main.py`; webhook production uses FastAPI in `src/web.py`:
    startup and clean shutdown.
 
 For each Telegram message, `Agent.run_tool_loop()` loads active facts, local time context, and the last 20 messages from the current session. It calls the OpenAI Responses API, executes all returned tool calls concurrently, appends tool results, and repeats until the model returns text or reaches the eight-call limit. Tool failures are returned to the model as data so it can recover without exposing a stack trace.
+
+Replies remain strings and carry `AgentTurnResult` failure/mutation/retry metadata. Telegram serializes repeated update IDs in process and saves 30-day receipts after a qualifying reply reaches the user. A failed turn before any mutation stays eligible for retry; a failure after a possible mutation warns about uncertain changes, and its delivered reply suppresses automatic replay. Receipts do not provide exactly-once tool execution if the process crashes between effects, delivery, and persistence.
 
 Sessions roll over after four hours of silence. The previous session is summarized with the inexpensive summary model and carried into the next session. Messages, assistant output items, and tool results are persisted in SQLite.
 
@@ -59,23 +61,32 @@ Memory has several layers:
 - `reminders`: one-time Telegram delivery state, attempts, and durable leases; it is not calendar state.
 - `schedule_decisions`: placement history, causal reasoning, and cited fact IDs.
 - `daily_log`: planned versus completed work, brief/debrief markers, and retry state.
+- `debrief_learning_attempts`: immutable daily-log, conversation, and decision snapshots awaiting background extraction acknowledgement.
+- `calendar_cleanup`: owned work-block deletions awaiting Google acknowledgement after local task completion.
+- `app_settings` and `processed_updates`: saved notification clocks and Telegram update receipts.
 - `facts`: durable natural-language preferences with confidence, evidence count, source, and active state.
 - `facts_engine_evidence`: the observations, confirmations, and contradictions behind each learned fact.
 
 Explicit and seeded facts are trusted immediately. Extracted behavioral facts start inactive and require three supporting observations before they can influence scheduling. Contradictory evidence lowers confidence and can deactivate a fact. Manual calendar moves are recorded as user-request decisions and emitted as structured learning signals. Historical task duration reuse is deterministic: matching completed tasks must share a normalized task family (`series_key`), category, and energy; recent recorded actual minutes are robustly medianed, with evidence task IDs retained. An explicit estimate always wins, and no vector database or duration-prediction model is used.
 
-The evening debrief records completed tasks and actual minutes, removes the owned work block before clearing its local ID, and updates linked goal progress idempotently. It gathers the local day's persisted messages and schedule decisions, then calls `FactsEngine.extract_from_day(daily_log, conversation, decisions)` with that complete evidence bundle. A later debrief follow-up answer is retained as additional day-scoped evidence without replaying completion or goal progress. A notably missed plan or at least 60 minutes of unexpected work triggers one short follow-up question.
+Task completion atomically saves the result, clears local placement, credits its linked goal once, and queues the old owned calendar block for deletion. Calendar outages leave completion intact and return a pending-cleanup warning; startup and reconciliation retry deletion. Replayed completion preserves the original timestamp and duration. Reopening a completed task reverses automatic goal credit and old daily-log completion entries while preserving partial progress, manual goal logs, and queued cleanup. A stale checklist cannot complete it again across the recorded `reopened_at` boundary.
+
+Unfinished work stays on the same task through `log_task_progress`: observed minutes are cumulative, and an explicit remaining-time estimate may change `estimated_minutes`. Partial work earns no goal credit, does not become a final observed duration, and does not automatically resize or move an existing calendar block. Exact active task creation repeats reuse the existing identity; existing duplicate data is not destructively merged.
+
+The evening debrief saves outcomes with an immutable snapshot of the committed daily log, same-day conversation, and schedule decisions. Facts-model extraction runs separately every five minutes and on startup with a 30-second timeout, passing that exact evidence to `FactsEngine.extract_from_day(daily_log, conversation, decisions)`. Failures retain the snapshot for retry. An explicit reopen invalidates an older queued completion observation. A later debrief follow-up answer becomes a new evidence snapshot without replaying completion or goal progress, and same-day evidence cannot inflate a fact's independent observation count. A notably missed plan or at least 60 minutes of unexpected work triggers one short follow-up question.
 
 ## Proactive jobs
 
 - Daily planning runs 15 minutes before the configured morning brief.
 - A durable dispatcher checks every 30 seconds for due reminders. It claims records with short leases, acknowledges only after Telegram accepts the message, and retries failures with bounded exponential backoff. Startup catch-up delivers reminders missed while the process was down.
-- The morning brief shows local commitments first, then nonduplicated external Google events, tasks due today, scheduled work blocks with reasons, behind-pace goals, pending reminders overdue through the next two local days, and unsurfaced schedule changes. Reading reminders for the brief does not mark them delivered or suppress the later due-time text. It retries rather than silently omit events when Google returns an incomplete view.
+- The morning brief shows local commitments first, then nonduplicated external Google events, tasks due today, scheduled work blocks with short causal asides, behind-pace goals, pending reminders overdue through the next two local days, and unsurfaced schedule changes. Times use readable local clocks. Reading reminders for the brief does not mark them delivered or suppress the later due-time text. It retries rather than silently omit events when Google returns an incomplete view.
 - The evening debrief sends a checklist for scheduled or due tasks and records actual completion.
-- The Sunday review summarizes completion, goal progress, and the strongest learned behavioral pattern.
+- The Sunday review summarizes recorded completion counts, concrete goal totals, and still-open planned tasks.
 - Calendar reconciliation checks the configured lookahead window every 15 minutes.
 
 Jobs use the user's IANA timezone, respect quiet hours, coalesce missed executions, and persist their job store and daily occurrence markers so restarts do not normally duplicate messages. An explicitly timed reminder is the exception to proactive-message deferral: it is sent during quiet hours or an active conversation because the user requested that exact instant. Reminder delivery is at least once; a crash after Telegram accepts a message but before SQLite acknowledgement can rarely produce a duplicate, which is preferable to silently losing the reminder.
+
+`/times` shows daily check-in clocks; `/times morning HH:MM` and `/times evening HH:MM` save strict local 24-hour preferences. Saved values override environment defaults, update the live scheduler, and survive restarts. Quiet-hour choices are rejected. Planning follows the morning time by running 15 minutes earlier, and delivery markers prevent clock changes from resending an already delivered check-in.
 
 The scheduler also creates a SQLite backup at 03:00 local time under
 `DATA_DIR/backups` and retains dated backups for 14 days. Its nightly facts
@@ -103,6 +114,7 @@ override is intentionally configured. Azure App Service uses `DATA_DIR=/home/dat
 - Scheduling-enabled goals materialize idempotent task-backed sessions for their outstanding weekly or monthly quota. Sessions are paced across remaining days, missed automatic sessions are rescheduled, and manual goal-session placements are preserved.
 - Calendar ownership is explicit (`kalendra_owned=v1`) and event kind is canonical hyphenated metadata: `fixed-event`, `task-block`, or `goal-session`. Deterministic category/kind Google event colors distinguish these entries while preserving a user-selected nondefault color. Event-level `color_id` and source-calendar `calendar_color_id` belong to different Google palettes: only a non-null event-level override can be copied exactly. A null reference color means the event inherits an external calendar color that Kalendra may not reproduce exactly, so the assistant asks for a named event color instead of copying the calendar ID.
 - The scheduler sees durable facts and goal progress, not raw chat history. Interactive agent behavior sees recent conversation history separately.
+- Google authorization failures such as `invalid_grant`, rejected credentials, or insufficient scope request reconnection. Transient transport/rate-limit failures and token-storage errors remain distinct. Safe reads and deletes have bounded retries; an uncertain insert/update raises `CalendarWriteUncertainError` and must be checked before another write or a claim of rollback.
 
 ## Sources of truth
 
@@ -139,6 +151,8 @@ python scripts/setup_gcal_auth.py
 ```
 
 Never commit `.env`, `credentials.json`, `token.json`, SQLite databases, or other secret material.
+
+`Config` omits all field values from its representation. Rejected refresh authorization requires browser consent through the setup script; restarting cannot renew a revoked grant. See [README OAuth troubleshooting](README.md#oauth-troubleshooting) for reconnect and Google Testing-mode token-expiration guidance.
 
 ## Non-negotiable invariants
 

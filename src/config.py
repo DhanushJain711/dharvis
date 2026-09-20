@@ -87,7 +87,7 @@ def _materialize_google_token() -> None:
         raise ValueError("GOOGLE_CALENDAR_TOKEN_BASE64 is invalid or cannot be written") from exc
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, repr=False)
 class Config:
     """Immutable settings loaded once from environment variables."""
 

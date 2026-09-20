@@ -11,8 +11,25 @@ import tempfile
 
 import pytest
 
-from src.config import config
+from src.config import Config, config
 from src.store import Store
+
+
+def test_config_repr_does_not_expose_secret_fields() -> None:
+    secrets = {
+        "TELEGRAM_BOT_TOKEN": "123:fake-bot-token-for-repr",
+        "OPENAI_API_KEY": "fake-openai-key-for-repr",
+        "ANTHROPIC_API_KEY": "fake-anthropic-key-for-repr",
+        "GOOGLE_CALENDAR_TOKEN_BASE64": "fake-google-token-for-repr",
+        "TELEGRAM_WEBHOOK_PATH": "fake-webhook-path-for-repr",
+        "TELEGRAM_WEBHOOK_SECRET": "fake-webhook-secret-for-repr",
+    }
+    settings = Config(**secrets)
+
+    for render in (repr, str):
+        text = render(settings)
+        assert "Config" in text
+        assert all(secret not in text for secret in secrets.values())
 
 
 def _config_paths_from_clean_process(environment: dict[str, str]) -> list[str]:
